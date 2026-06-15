@@ -471,11 +471,12 @@ class WanShiftWindow2DInferProcessor:
         cfg_wh, cfg_ww = self.window_hw
         wh, ww = min(cfg_wh, H), min(cfg_ww, W)
 
-        do_shift = False
-        if hasattr(attn, "_do_shift"):
-            do_shift = bool(attn._do_shift)
-        elif self.shift_every_other_layer and hasattr(attn, "_layer_id"):
-            do_shift = (int(attn._layer_id) % 2 == 1)
+        # Do NOT derive the window shift from a Python integer module attribute
+        # such as attn._layer_id here. torch.compile treats integer attributes on
+        # nn.Module as static guards, so different layer ids trigger repeated
+        # recompilation. Instead, _do_shift is assigned once per block in
+        # enable_shifted_window_self_attention().
+        do_shift = bool(getattr(attn, "_do_shift", False))
         prefer_front = not do_shift
 
         meta = _WindowRuntimeMetaCache.get(
@@ -662,12 +663,23 @@ class WanTransformerBlock(nn.Module):
 # --------------------------------------------------------------------------- #
 
 def enable_shifted_window_self_attention(model, window_hw=(16, 16)):
-    """Fuse QKV projections and install the shifted-window self-attn processor."""
+    """Fuse QKV projections and install the shifted-window self-attn processor.
+
+    Important for torch.compile:
+    The shifted-window parity is stored as a boolean _do_shift on each self-attn
+    module. Do not use per-layer integer attributes such as _layer_id inside the
+    compiled attention processor, because they become static guards and cause
+    repeated recompilation across transformer blocks.
+    """
     proc = WanShiftWindow2DInferProcessor(window_hw=window_hw)
+
     for i, blk in enumerate(getattr(model, "blocks", [])):
         underlying = getattr(blk, "_orig_mod", blk)
         if hasattr(underlying, "attn1"):
-            underlying.attn1._layer_id = i
+            underlying.attn1._do_shift = bool(i % 2 == 1)
+            if hasattr(underlying.attn1, "_layer_id"):
+                delattr(underlying.attn1, "_layer_id")
+
     for _, m in model.named_modules():
         if isinstance(m, WanAttention):
             m.fuse_projections()
@@ -708,7 +720,7 @@ class WanTransformer3DModel(
                  num_layers=40, cross_attn_norm=True, qk_norm="rms_norm_across_heads", eps=1e-6,
                  image_dim=None, added_kv_proj_dim=None, rope_max_seq_len=1024,
                  pos_embed_seq_len=None, enable_swa=True, self_attn_window_hw=(16, 16),
-                 use_torch_compile=True, compile_mode="default"):
+                 use_torch_compile=False, compile_mode="default"):
         super().__init__()
 
         inner_dim = num_attention_heads * attention_head_dim
@@ -731,7 +743,7 @@ class WanTransformer3DModel(
         self._enable_swa = enable_swa
         self._self_attn_window_hw = self_attn_window_hw
 
-    def prepare_for_inference(self, attention_backend="auto", use_torch_compile=True, compile_mode="default"):
+    def prepare_for_inference(self, attention_backend="auto", use_torch_compile=False, compile_mode="default"):
         backend = set_attention_backend(attention_backend)
         logger.info(f"Using attention backend: {backend} "
                     f"(available: {list_available_attention_backends()})")
@@ -783,11 +795,10 @@ class WanTransformer3DModel(
         _WindowRuntimeMetaCache.get(ppf, pph, ppw, min(cfg_wh, pph), min(cfg_ww, ppw),
                                     do_shift=True, prefer_front=False, device=dev)
 
-        for i, blk in enumerate(self.blocks):
+        for blk in self.blocks:
             underlying = getattr(blk, "_orig_mod", blk)
             if hasattr(underlying, "attn1"):
                 underlying.attn1._thw = thw_global
-                underlying.attn1._layer_id = i
 
         for blk in self.blocks:
             hidden_states = blk(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
