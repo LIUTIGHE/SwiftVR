@@ -63,6 +63,33 @@ class PromptFreePipelineTest(unittest.TestCase):
         self.assertIs(pipe.transformer, transformer)
         self.assertIsNone(pipe.prompt_emb)
 
+    @patch.object(SwiftVRPromptFreePipeline, "to", autospec=True)
+    @patch("swiftvr.pipeline_prompt_free.WanTransformer3DModelPromptFree")
+    @patch("swiftvr.pipeline_prompt_free.ReAE")
+    def test_from_pretrained_loads_transformer_directly_in_requested_dtype(
+        self,
+        reae_cls,
+        transformer_cls,
+        pipe_to,
+    ):
+        reae_cls.return_value = _DummyModule()
+        transformer_cls.from_pretrained.return_value = _DummyModule()
+        pipe_to.return_value = None
+
+        checkpoint = Path("/tmp/prompt_free_checkpoint")
+        pipe = SwiftVRPromptFreePipeline.from_pretrained(
+            checkpoint,
+            device="cuda",
+            dtype="float16",
+        )
+
+        transformer_cls.from_pretrained.assert_called_once_with(
+            str(checkpoint),
+            subfolder="transformer",
+            torch_dtype=torch.float16,
+        )
+        pipe_to.assert_called_once_with(pipe, "cuda", dtype="float16")
+
     def test_runner_adapter_discards_prompt_for_regular_chunk(self):
         transformer = MagicMock()
         stream = _RunnerCompatiblePromptFreeDiT(transformer)
