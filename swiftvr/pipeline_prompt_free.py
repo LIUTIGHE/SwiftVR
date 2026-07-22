@@ -14,7 +14,7 @@ import torch
 
 from .models import ReAE
 from .models.transformer_prompt_free import WanTransformer3DModelPromptFree
-from .pipeline import SwiftVRPipeline
+from .pipeline import SwiftVRPipeline, _as_dtype
 from .streaming.dit_prompt_free import StreamingDiTPromptFree
 
 
@@ -93,14 +93,20 @@ class SwiftVRPromptFreePipeline(SwiftVRPipeline):
                 ├── config.json
                 └── diffusion_pytorch_model.safetensors
 
-        No prompt embedding file is read.
+        No prompt embedding file is read. When ``dtype`` is supplied, it is
+        forwarded to the Diffusers loader so the multi-billion-parameter DiT
+        is not first materialized in float32 and cast only afterward.
         """
 
         root = Path(checkpoint_dir)
         reae = ReAE(str(root / reae_filename))
+
+        transformer_load_kwargs = {"subfolder": transformer_subfolder}
+        if dtype is not None:
+            transformer_load_kwargs["torch_dtype"] = _as_dtype(dtype)
         transformer = WanTransformer3DModelPromptFree.from_pretrained(
             str(root),
-            subfolder=transformer_subfolder,
+            **transformer_load_kwargs,
         )
 
         pipe = cls(reae, transformer, upscale_mode=upscale_mode)
