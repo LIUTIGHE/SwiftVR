@@ -42,6 +42,28 @@ def _release(model) -> None:
         torch.cuda.synchronize()
 
 
+def _prepare_model_for_runtime(model, device: torch.device, dtype: torch.dtype):
+    """Mirror ``SwiftVRPipeline.to`` for a fair mixed-precision comparison.
+
+    Diffusers may keep modules listed in ``_keep_in_fp32_modules`` in float32
+    while loading a float16 checkpoint. SwiftVR's pipeline subsequently calls
+    ``model.to(device, dtype)``, which makes the complete inference model use the
+    requested runtime dtype. The validator must do the same; moving only to the
+    device leaves a float32 time MLP feeding a float16 projection and causes a
+    Linear dtype mismatch before the comparison begins.
+    """
+
+    return model.to(device=device, dtype=dtype).eval()
+
+
+def _parameter_dtype_summary(model) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for parameter in model.parameters():
+        key = str(parameter.dtype).removeprefix("torch.")
+        summary[key] = summary.get(key, 0) + parameter.numel()
+    return summary
+
+
 def validate(
     source_root: Path,
     folded_root: Path,
@@ -85,8 +107,10 @@ def validate(
         str(source_root),
         subfolder=transformer_subfolder,
         torch_dtype=dtype,
-    ).to(device_obj).eval()
+    )
+    source = _prepare_model_for_runtime(source, device_obj, dtype)
     source_parameter_count = sum(parameter.numel() for parameter in source.parameters())
+    source_dtype_summary = _parameter_dtype_summary(source)
     timestep = torch.tensor([1000.0], device=device_obj, dtype=torch.float32)
     with torch.inference_mode():
         source_output = source(latent.clone(), timestep).sample.float().cpu()
@@ -96,8 +120,10 @@ def validate(
         str(folded_root),
         subfolder=transformer_subfolder,
         torch_dtype=dtype,
-    ).to(device_obj).eval()
+    )
+    folded = _prepare_model_for_runtime(folded, device_obj, dtype)
     folded_parameter_count = sum(parameter.numel() for parameter in folded.parameters())
+    folded_dtype_summary = _parameter_dtype_summary(folded)
     folded_names = tuple(name for name, _ in folded.named_parameters())
     with torch.inference_mode():
         folded_output = folded(latent.clone()).sample.float().cpu()
@@ -118,6 +144,8 @@ def validate(
         "source_parameter_count": source_parameter_count,
         "folded_parameter_count": folded_parameter_count,
         "removed_parameter_count": source_parameter_count - folded_parameter_count,
+        "source_parameter_dtypes": source_dtype_summary,
+        "folded_parameter_dtypes": folded_dtype_summary,
         "folded_has_condition_embedder": any(
             "condition_embedder" in name for name in folded_names
         ),
