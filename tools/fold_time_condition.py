@@ -6,12 +6,17 @@ The output retains ReAE and prompt-free adapters, removes every
 ``condition_embedder`` tensor, and adds the fixed timestep modulation to each
 block and to the final output ``scale_shift_table``.
 
+The original model computes the time module in float32 but casts its outputs to
+the hidden-state dtype before modulation. ``--runtime-dtype`` reproduces that
+quantization before folding. Use the same dtype for folding and inference.
+
 Example:
 
     python tools/fold_time_condition.py \
         --source checkpoints_prompt_free \
         --output checkpoints_prompt_free_no_time \
-        --timestep 1000
+        --timestep 1000 \
+        --runtime-dtype float16
 """
 
 from __future__ import annotations
@@ -33,6 +38,31 @@ WEIGHT_FILENAME = "diffusion_pytorch_model.safetensors"
 CONFIG_FILENAME = "config.json"
 REPORT_FILENAME = "time_folding_report.json"
 TIME_PREFIX = "condition_embedder."
+_RUNTIME_DTYPES = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def _as_runtime_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported runtime dtype: {dtype}")
+        return dtype
+    key = str(dtype).lower()
+    if key not in _RUNTIME_DTYPES:
+        raise ValueError(
+            f"Unsupported runtime dtype {dtype!r}; choose float16, bfloat16, or float32"
+        )
+    return _RUNTIME_DTYPES[key]
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
 
 
 def _model_dimensions(config: Mapping[str, object]) -> tuple[int, int, int]:
@@ -76,9 +106,11 @@ def compute_fixed_time_condition(
     config: Mapping[str, object],
     *,
     timestep: float,
+    runtime_dtype: str | torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``temb[C]`` and ``time_proj[6,C]`` in float32."""
+    """Return runtime-quantized ``temb[C]`` and ``time_proj[6,C]`` as FP32."""
 
+    runtime_dtype = _as_runtime_dtype(runtime_dtype)
     _, inner_dim, freq_dim = _model_dimensions(config)
     module = WanTimeEmbedding(
         dim=inner_dim,
@@ -90,9 +122,14 @@ def compute_fixed_time_condition(
     with torch.no_grad():
         temb, timestep_proj = module(
             torch.tensor([float(timestep)], dtype=torch.float32),
-            output_dtype=torch.float32,
+            output_dtype=runtime_dtype,
         )
-    return temb[0].contiguous(), timestep_proj[0].reshape(6, inner_dim).contiguous()
+
+    # Runtime blocks convert the already-quantized condition back to float32
+    # when adding it to the FP32 modulation tables. Mirror that exact path.
+    temb = temb.float()[0].contiguous()
+    timestep_proj = timestep_proj.float()[0].reshape(6, inner_dim).contiguous()
+    return temb, timestep_proj
 
 
 def fold_state_dict(
@@ -100,14 +137,17 @@ def fold_state_dict(
     config: Mapping[str, object],
     *,
     timestep: float = 1000.0,
+    runtime_dtype: str | torch.dtype = torch.float16,
 ) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
     """Fold the fixed timestep and return no-time tensors plus a report."""
 
+    runtime_dtype = _as_runtime_dtype(runtime_dtype)
     num_layers, inner_dim, _ = _model_dimensions(config)
     temb, block_modulation = compute_fixed_time_condition(
         source_state,
         config,
         timestep=timestep,
+        runtime_dtype=runtime_dtype,
     )
 
     folded: dict[str, torch.Tensor] = {}
@@ -132,10 +172,8 @@ def fold_state_dict(
                 f"expected {expected_shape}"
             )
 
-        # The original runtime keeps both the time modules and modulation tables
-        # in float32, then casts their sum to the hidden-state dtype inside the
-        # block. Store the folded table in float32 as well to preserve that
-        # numerical path instead of prematurely quantizing the merged values.
+        # Keep merged tables in FP32. At runtime they are cast once to the
+        # hidden-state dtype, matching the unfurled model's modulation path.
         folded[key] = (
             source.float() + block_modulation.unsqueeze(0)
         ).contiguous()
@@ -158,6 +196,7 @@ def fold_state_dict(
 
     report: dict[str, object] = {
         "fixed_timestep": float(timestep),
+        "folded_runtime_dtype": _dtype_name(runtime_dtype),
         "num_layers": num_layers,
         "inner_dim": inner_dim,
         "source_tensor_count": len(source_state),
@@ -199,9 +238,11 @@ def fold_checkpoint(
     *,
     transformer_subfolder: str = "transformer",
     timestep: float = 1000.0,
+    runtime_dtype: str | torch.dtype = torch.float16,
     copy_reae: bool = True,
     overwrite: bool = False,
 ) -> dict[str, object]:
+    runtime_dtype = _as_runtime_dtype(runtime_dtype)
     source_root = source_root.resolve()
     output_root = output_root.resolve()
     if source_root == output_root:
@@ -223,6 +264,7 @@ def fold_checkpoint(
         source_state,
         config,
         timestep=timestep,
+        runtime_dtype=runtime_dtype,
     )
 
     _prepare_output_path(output_root, overwrite=overwrite)
@@ -244,6 +286,7 @@ def fold_checkpoint(
             "swiftvr_variant": "prompt_free_no_time",
             "time_condition_folded": "true",
             "folded_timestep": str(float(timestep)),
+            "folded_runtime_dtype": _dtype_name(runtime_dtype),
         }
     )
     save_file(
@@ -282,6 +325,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-subfolder", default="transformer")
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument(
+        "--runtime-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+        help="Inference dtype whose time-condition quantization should be folded",
+    )
+    parser.add_argument(
         "--copy-reae",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -297,11 +346,13 @@ def main() -> None:
         args.output,
         transformer_subfolder=args.transformer_subfolder,
         timestep=args.timestep,
+        runtime_dtype=args.runtime_dtype,
         copy_reae=args.copy_reae,
         overwrite=args.overwrite,
     )
     print(
         "Folded SwiftVR timestep condition: "
+        f"dtype={report['folded_runtime_dtype']} "
         f"dropped={report['dropped_tensor_count']} "
         f"folded={report['folded_tensor_count']} "
         f"output={report['output_root']}"
