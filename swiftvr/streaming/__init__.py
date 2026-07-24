@@ -4,3 +4,4 @@ from .chunk import ChunkType, ChunkSpec, build_chunk_specs
 from .tae import StreamingTAE, apply_parallel_with_boundary
 from .dit import StreamingDiT, INFERENCE_TIMESTEP, ROPE_EXTEND_MARGIN
 from .dit_prompt_free import StreamingDiTPromptFree
+from .dit_prompt_free_no_time import StreamingDiTPromptFreeNoTime
