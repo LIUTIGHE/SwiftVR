@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -64,6 +65,7 @@ def _build_folded_pair():
         config,
         timestep=1000.0,
         runtime_dtype=torch.float32,
+        compute_device="cpu",
     )
     folded = WanTransformer3DModelPromptFreeNoTime(
         **_model_kwargs(),
@@ -94,6 +96,8 @@ class TimeConditionFoldingTest(unittest.TestCase):
         self.assertFalse(any("time_embedder" in name for name in names))
         self.assertEqual(report["folded_tensor_count"], 3)
         self.assertEqual(report["folded_runtime_dtype"], "float32")
+        self.assertEqual(report["fold_compute_device"], "cpu")
+        self.assertEqual(report["fold_arithmetic"], "runtime_quantize_then_merge")
         self.assertGreater(report["dropped_tensor_count"], 0)
 
         hidden_states = torch.randn(1, 8, 2, 8, 8)
@@ -112,6 +116,67 @@ class TimeConditionFoldingTest(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
         self.assertEqual(stream._g_off, latent.shape[2])
+
+    def test_float16_folding_matches_runtime_operation_order(self):
+        config = {
+            "num_layers": 1,
+            "num_attention_heads": 1,
+            "attention_head_dim": 4,
+            "freq_dim": 4,
+        }
+        block_table = torch.tensor(
+            [[[0.10003, -0.20007, 0.30011, -0.40013]] * 6],
+            dtype=torch.float32,
+        ).reshape(1, 6, 4)
+        output_table = torch.tensor(
+            [[[0.01113, -0.02227, 0.03331, -0.04449]] * 2],
+            dtype=torch.float32,
+        ).reshape(1, 2, 4)
+        condition = torch.tensor(
+            [[0.00557, -0.00661, 0.00773, -0.00889]] * 6,
+            dtype=torch.float16,
+        )
+        temb = torch.tensor(
+            [0.00113, -0.00227, 0.00331, -0.00449],
+            dtype=torch.float16,
+        )
+        state = {
+            "blocks.0.scale_shift_table": block_table,
+            "scale_shift_table": output_table,
+            "condition_embedder.time_embedder.linear_1.weight": torch.zeros(1),
+            "condition_embedder.time_proj.weight": torch.zeros(1),
+        }
+
+        with patch.object(
+            _FOLDER,
+            "compute_fixed_time_condition",
+            return_value=(temb, condition),
+        ):
+            folded, _ = _FOLDER.fold_state_dict(
+                state,
+                config,
+                runtime_dtype=torch.float16,
+                compute_device="cpu",
+            )
+
+        expected_block = (
+            block_table.half().float() + condition.unsqueeze(0).float()
+        ).half().float()
+        expected_output = (
+            output_table.half() + temb.view(1, 1, 4)
+        ).half().float()
+        torch.testing.assert_close(
+            folded["blocks.0.scale_shift_table"],
+            expected_block,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            folded["scale_shift_table"],
+            expected_output,
+            rtol=0,
+            atol=0,
+        )
 
     def test_checkpoint_converter_writes_loadable_no_time_layout(self):
         source, _, _ = _build_folded_pair()
@@ -139,6 +204,7 @@ class TimeConditionFoldingTest(unittest.TestCase):
                 output_root,
                 timestep=1000.0,
                 runtime_dtype=torch.float32,
+                compute_device="cpu",
             )
 
             output_config = json.loads(
@@ -160,6 +226,7 @@ class TimeConditionFoldingTest(unittest.TestCase):
             )
             self.assertTrue(output_config["time_condition_folded"])
             self.assertEqual(output_config["folded_timestep"], 1000.0)
+            self.assertEqual(output_config["folded_runtime_dtype"], "float32")
             self.assertFalse(
                 any(key.startswith("condition_embedder.") for key in output_state)
             )
