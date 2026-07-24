@@ -131,9 +131,14 @@ def fold_state_dict(
                 f"Unexpected shape for {key}: {tuple(source.shape)}, "
                 f"expected {expected_shape}"
             )
+
+        # The original runtime keeps both the time modules and modulation tables
+        # in float32, then casts their sum to the hidden-state dtype inside the
+        # block. Store the folded table in float32 as well to preserve that
+        # numerical path instead of prematurely quantizing the merged values.
         folded[key] = (
             source.float() + block_modulation.unsqueeze(0)
-        ).to(dtype=source.dtype).contiguous()
+        ).contiguous()
         folded_keys.append(key)
 
     output_key = "scale_shift_table"
@@ -148,7 +153,7 @@ def fold_state_dict(
         )
     folded[output_key] = (
         output_table.float() + temb.view(1, 1, inner_dim)
-    ).to(dtype=output_table.dtype).contiguous()
+    ).contiguous()
     folded_keys.append(output_key)
 
     report: dict[str, object] = {
@@ -158,6 +163,7 @@ def fold_state_dict(
         "source_tensor_count": len(source_state),
         "dropped_tensor_count": len(dropped_keys),
         "folded_tensor_count": len(folded_keys),
+        "folded_tensor_dtype": "float32",
         "output_tensor_count": len(folded),
         "dropped_keys": sorted(dropped_keys),
         "folded_keys": sorted(folded_keys),
