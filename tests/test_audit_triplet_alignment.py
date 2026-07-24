@@ -48,12 +48,12 @@ class AuditTripletAlignmentTest(unittest.TestCase):
             frame = np.zeros((height, width, 3), dtype=np.uint8)
             frame[:, (index * 2) % width : ((index * 2) % width) + 2] = 255
             base[index] = frame
-        # HQ frame t corresponds to HR frame t+2.
-        hq = {index: base[index + 2] for index in range(2, 8)}
+        # Reference frame t corresponds to source frame t+2.
+        reference = {index: base[index + 2] for index in range(2, 8)}
         anchors = list(range(2, 8))
         best, scores = _TOOL.find_best_offset_from_sequences(
             base,
-            hq,
+            reference,
             anchors,
             range(-3, 4),
             max_side=64,
@@ -88,7 +88,10 @@ class AuditTripletAlignmentTest(unittest.TestCase):
         results = [
             {
                 "status": "pass",
-                "temporal_alignment": {"best_hr_offset_relative_to_hq": 0},
+                "temporal_alignment": {
+                    "best_hr_offset_relative_to_hq": 0,
+                    "best_hq_offset_relative_to_lr": 0,
+                },
                 "metrics": {
                     "hr_downsample_vs_hq": {"psnr": 40.0},
                     "hq_vs_lr": {"psnr": 25.0},
@@ -96,7 +99,10 @@ class AuditTripletAlignmentTest(unittest.TestCase):
             },
             {
                 "status": "fail",
-                "temporal_alignment": {"best_hr_offset_relative_to_hq": 2},
+                "temporal_alignment": {
+                    "best_hr_offset_relative_to_hq": 2,
+                    "best_hq_offset_relative_to_lr": -1,
+                },
                 "metrics": {
                     "hr_downsample_vs_hq": {"psnr": 38.0},
                     "hq_vs_lr": {"psnr": 24.0},
@@ -106,7 +112,8 @@ class AuditTripletAlignmentTest(unittest.TestCase):
         summary = _TOOL.summarize_results(results)
         self.assertEqual(summary["status_counts"]["pass"], 1)
         self.assertEqual(summary["status_counts"]["fail"], 1)
-        self.assertEqual(summary["best_offset_counts"], {"0": 1, "2": 1})
+        self.assertEqual(summary["best_hr_hq_offset_counts"], {"0": 1, "2": 1})
+        self.assertEqual(summary["best_hq_lr_offset_counts"], {"0": 1, "-1": 1})
         self.assertEqual(summary["mean_metrics"]["hr_downsample_vs_hq_psnr"], 39.0)
 
     def test_help_executes(self):
