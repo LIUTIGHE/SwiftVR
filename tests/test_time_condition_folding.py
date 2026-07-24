@@ -63,6 +63,7 @@ def _build_folded_pair():
         source.state_dict(),
         config,
         timestep=1000.0,
+        runtime_dtype=torch.float32,
     )
     folded = WanTransformer3DModelPromptFreeNoTime(
         **_model_kwargs(),
@@ -92,6 +93,7 @@ class TimeConditionFoldingTest(unittest.TestCase):
         self.assertFalse(any("condition_embedder" in name for name in names))
         self.assertFalse(any("time_embedder" in name for name in names))
         self.assertEqual(report["folded_tensor_count"], 3)
+        self.assertEqual(report["folded_runtime_dtype"], "float32")
         self.assertGreater(report["dropped_tensor_count"], 0)
 
         hidden_states = torch.randn(1, 8, 2, 8, 8)
@@ -136,6 +138,7 @@ class TimeConditionFoldingTest(unittest.TestCase):
                 source_root,
                 output_root,
                 timestep=1000.0,
+                runtime_dtype=torch.float32,
             )
 
             output_config = json.loads(
@@ -162,6 +165,7 @@ class TimeConditionFoldingTest(unittest.TestCase):
             )
             self.assertTrue((output_root / "reae.safetensors").is_file())
             self.assertEqual(report["fixed_timestep"], 1000.0)
+            self.assertEqual(report["folded_runtime_dtype"], "float32")
 
 
 if __name__ == "__main__":
