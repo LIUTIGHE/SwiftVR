@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +16,9 @@ _TOOL_PATH = _REPO_ROOT / "tools" / "build_triplet_manifest.py"
 _SPEC = importlib.util.spec_from_file_location("build_triplet_manifest", _TOOL_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _TOOL = importlib.util.module_from_spec(_SPEC)
+# dataclasses resolves postponed annotations through sys.modules while the
+# class decorator runs. Register the dynamically imported module first.
+sys.modules[_SPEC.name] = _TOOL
 _SPEC.loader.exec_module(_TOOL)
 
 
@@ -28,6 +33,17 @@ class BuildTripletManifestTest(unittest.TestCase):
     def _touch(path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"video")
+
+    def test_cli_help_executes(self):
+        completed = subprocess.run(
+            [sys.executable, str(_TOOL_PATH), "--help"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--hr-root", completed.stdout)
 
     def test_relative_stem_matches_nested_triplets(self):
         with tempfile.TemporaryDirectory() as tmp:
