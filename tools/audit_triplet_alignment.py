@@ -7,7 +7,7 @@ This tool never modifies source videos. It combines container metadata from
 
 * compare frame counts, FPS, durations, dimensions, and color metadata;
 * inspect early frame timestamps for variable-frame-rate behavior;
-* search a small temporal offset between downsampled HR and HQ;
+* search small temporal offsets for both HR<->HQ and HQ<->LR;
 * report MAE, RMSE, PSNR, and global grayscale SSIM for HR->HQ and HQ->LR.
 
 Example::
@@ -21,8 +21,8 @@ Example::
         --offset-radius 5
 
 Dependencies: ffprobe on PATH and the repository's existing decord, numpy,
-Pillow, and torch packages. Decord is imported lazily so ``--help`` and the
-pure CPU unit tests do not require video decoding support.
+and Pillow packages. Decord is imported lazily so ``--help`` and the pure CPU
+unit tests do not require video decoding support.
 """
 
 from __future__ import annotations
@@ -345,8 +345,8 @@ def evenly_spaced_indices(frame_count: int, count: int, *, margin: int = 0) -> l
 
 
 def find_best_offset_from_sequences(
-    hr_frames: Mapping[int, np.ndarray],
-    hq_frames: Mapping[int, np.ndarray],
+    source_frames: Mapping[int, np.ndarray],
+    reference_frames: Mapping[int, np.ndarray],
     anchors: Sequence[int],
     offsets: Iterable[int],
     *,
@@ -356,14 +356,14 @@ def find_best_offset_from_sequences(
     for offset in offsets:
         errors: list[float] = []
         for anchor in anchors:
-            hr_index = int(anchor) + int(offset)
-            if hr_index not in hr_frames or int(anchor) not in hq_frames:
+            source_index = int(anchor) + int(offset)
+            if source_index not in source_frames or int(anchor) not in reference_frames:
                 continue
-            hq = hq_frames[int(anchor)]
-            hr = resize_rgb(hr_frames[hr_index], hq.shape[:2])
-            hr_gray = _thumbnail_gray(hr, max_side=max_side)
-            hq_gray = _thumbnail_gray(hq, max_side=max_side)
-            errors.append(float(np.mean(np.abs(hr_gray - hq_gray))))
+            reference = reference_frames[int(anchor)]
+            source = resize_rgb(source_frames[source_index], reference.shape[:2])
+            source_gray = _thumbnail_gray(source, max_side=max_side)
+            reference_gray = _thumbnail_gray(reference, max_side=max_side)
+            errors.append(float(np.mean(np.abs(source_gray - reference_gray))))
         if errors:
             scores[int(offset)] = float(np.mean(errors))
     if not scores:
@@ -428,6 +428,15 @@ def audit_record(
             _append_unique(warnings, f"{name}:possible_vfr")
         if probe.duplicate_timestamp_count:
             _append_unique(warnings, f"{name}:duplicate_timestamps")
+
+    for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
+        known = {
+            getattr(probe, field)
+            for probe in probes.values()
+            if getattr(probe, field)
+        }
+        if len(known) > 1:
+            _append_unique(warnings, f"{field}_mismatch")
 
     hq = probes["hq"]
     lr = probes["lr"]
@@ -502,37 +511,56 @@ def audit_record(
             if 0 <= anchor + offset < hr_count
         }
     )
+    required_hq_indices = sorted(
+        set(anchors)
+        | {
+            anchor + offset
+            for anchor in anchors
+            for offset in offsets
+            if 0 <= anchor + offset < hq_count
+        }
+    )
     hr_frames_list = decode_frames(str(paths["hr"]), required_hr_indices)
-    hq_frames_list = decode_frames(str(paths["hq"]), anchors)
+    hq_frames_list = decode_frames(str(paths["hq"]), required_hq_indices)
     lr_frames_list = decode_frames(str(paths["lr"]), anchors)
     hr_frames = dict(zip(required_hr_indices, hr_frames_list))
-    hq_frames = dict(zip(anchors, hq_frames_list))
+    hq_frames = dict(zip(required_hq_indices, hq_frames_list))
     lr_frames = dict(zip(anchors, lr_frames_list))
 
-    best_offset, offset_scores = find_best_offset_from_sequences(
+    best_hr_hq_offset, hr_hq_offset_scores = find_best_offset_from_sequences(
         hr_frames,
         hq_frames,
         anchors,
         offsets,
         max_side=metric_thumbnail_max_side,
     )
-    if best_offset != 0:
-        errors.append(f"hr_hq_temporal_offset:{best_offset:+d}")
+    best_hq_lr_offset, hq_lr_offset_scores = find_best_offset_from_sequences(
+        hq_frames,
+        lr_frames,
+        anchors,
+        offsets,
+        max_side=metric_thumbnail_max_side,
+    )
+    if best_hr_hq_offset != 0:
+        errors.append(f"hr_hq_temporal_offset:{best_hr_hq_offset:+d}")
+    if best_hq_lr_offset != 0:
+        errors.append(f"hq_lr_temporal_offset:{best_hq_lr_offset:+d}")
 
     hr_hq_metrics: list[PairMetrics] = []
     hq_lr_metrics: list[PairMetrics] = []
     sampled_duplicates = {"hr": 0, "hq": 0, "lr": 0}
     previous: dict[str, np.ndarray | None] = {name: None for name in VIDEO_FIELDS}
     for anchor in anchors:
-        aligned_hr = hr_frames.get(anchor + best_offset)
+        aligned_hr = hr_frames.get(anchor + best_hr_hq_offset)
         hq_frame = hq_frames[anchor]
+        aligned_hq_for_lr = hq_frames.get(anchor + best_hq_lr_offset)
         lr_frame = lr_frames[anchor]
         if aligned_hr is not None:
             hr_hq_metrics.append(
                 pair_metrics(resize_rgb(aligned_hr, hq_frame.shape[:2]), hq_frame)
             )
-        if hq_frame.shape == lr_frame.shape:
-            hq_lr_metrics.append(pair_metrics(hq_frame, lr_frame))
+        if aligned_hq_for_lr is not None and aligned_hq_for_lr.shape == lr_frame.shape:
+            hq_lr_metrics.append(pair_metrics(aligned_hq_for_lr, lr_frame))
         for name, frame in (
             ("hr", aligned_hr),
             ("hq", hq_frame),
@@ -560,9 +588,15 @@ def audit_record(
         },
         "temporal_alignment": {
             "sampled_indices": anchors,
-            "best_hr_offset_relative_to_hq": best_offset,
-            "offset_mae_scores": {
-                str(offset): score for offset, score in sorted(offset_scores.items())
+            "best_hr_offset_relative_to_hq": best_hr_hq_offset,
+            "best_hq_offset_relative_to_lr": best_hq_lr_offset,
+            "hr_hq_offset_mae_scores": {
+                str(offset): score
+                for offset, score in sorted(hr_hq_offset_scores.items())
+            },
+            "hq_lr_offset_mae_scores": {
+                str(offset): score
+                for offset, score in sorted(hq_lr_offset_scores.items())
             },
             "sampled_adjacent_duplicate_counts": sampled_duplicates,
         },
@@ -592,7 +626,8 @@ def read_manifest(path: Path, *, split: str | None = None) -> list[dict[str, obj
 
 def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
     status_counts = {"pass": 0, "warn": 0, "fail": 0, "error": 0}
-    best_offsets: dict[str, int] = {}
+    best_hr_hq_offsets: dict[str, int] = {}
+    best_hq_lr_offsets: dict[str, int] = {}
     metric_values: dict[str, list[float]] = {
         "hr_downsample_vs_hq_psnr": [],
         "hq_vs_lr_psnr": [],
@@ -604,7 +639,12 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
         if isinstance(temporal, Mapping):
             offset = temporal.get("best_hr_offset_relative_to_hq")
             if isinstance(offset, int):
-                best_offsets[str(offset)] = best_offsets.get(str(offset), 0) + 1
+                key = str(offset)
+                best_hr_hq_offsets[key] = best_hr_hq_offsets.get(key, 0) + 1
+            hq_lr_offset = temporal.get("best_hq_offset_relative_to_lr")
+            if isinstance(hq_lr_offset, int):
+                key = str(hq_lr_offset)
+                best_hq_lr_offsets[key] = best_hq_lr_offsets.get(key, 0) + 1
         metrics = result.get("metrics")
         if isinstance(metrics, Mapping):
             for pair_name, output_name in (
@@ -619,7 +659,8 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     return {
         "sample_count": len(results),
         "status_counts": status_counts,
-        "best_offset_counts": best_offsets,
+        "best_hr_hq_offset_counts": best_hr_hq_offsets,
+        "best_hq_lr_offset_counts": best_hq_lr_offsets,
         "mean_metrics": {
             name: (float(np.mean(values)) if values else None)
             for name, values in metric_values.items()
