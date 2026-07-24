@@ -9,3 +9,5 @@ from .transformer import (
     get_attention_backend,
     list_available_attention_backends,
 )
+from .transformer_prompt_free import WanTransformer3DModelPromptFree
+from .transformer_prompt_free_no_time import WanTransformer3DModelPromptFreeNoTime
