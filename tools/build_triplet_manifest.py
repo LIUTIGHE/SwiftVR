@@ -2,8 +2,10 @@
 """Build a deterministic manifest for aligned HR/HQ/LR media triplets.
 
 Each dataset root may contain either encoded videos or image-frame sequences.
-Image sequences are grouped by a trailing frame number. With the default regex,
-``video1_comp2_000123.png`` belongs to clip ``video1_comp2`` and frame 123.
+Image sequences are grouped with a configurable regex containing named ``clip``
+and ``frame`` groups. The default matches names such as
+``video1_comp2_000123.png``. Per-root regex overrides support asymmetric naming,
+for example clean HR/HQ frames and ``*_text.png`` LR frames.
 
 This tool only inspects paths and frame indices. Pixel-level temporal, geometric,
 and photometric alignment is handled by ``tools/audit_triplet_alignment.py``.
@@ -140,6 +142,18 @@ def index_videos(
     return index
 
 
+def _frame_pattern(path: Path, match: re.Match[str], frame_digits: int) -> str:
+    """Replace exactly the matched frame-number span and preserve all suffixes."""
+    frame_start, frame_end = match.span("frame")
+    stem = path.stem
+    pattern_stem = (
+        stem[:frame_start]
+        + f"{{frame:0{frame_digits}d}}"
+        + stem[frame_end:]
+    )
+    return str(path.parent / f"{pattern_stem}{path.suffix.lower()}")
+
+
 def index_frame_sequences(
     root: Path,
     *,
@@ -194,12 +208,9 @@ def index_frame_sequences(
         first_path = rows[0][2]
         first_match = frame_regex.fullmatch(first_path.stem)
         assert first_match is not None
-        clip = first_match.group("clip")
         digits = next(iter(widths))
-        extension = next(iter(suffixes))
-        pattern = first_path.parent / f"{clip}_{{frame:0{digits}d}}{extension}"
         index[key] = FrameSequence(
-            pattern=str(pattern),
+            pattern=_frame_pattern(first_path, first_match, digits),
             indices=tuple(sorted(by_index)),
             frame_digits=digits,
         )
@@ -263,6 +274,19 @@ def deterministic_split(
     return "train"
 
 
+def _resolve_frame_regexes(
+    frame_regex: str,
+    hr_frame_regex: str | None,
+    hq_frame_regex: str | None,
+    lr_frame_regex: str | None,
+) -> dict[str, str]:
+    return {
+        "hr": hr_frame_regex or frame_regex,
+        "hq": hq_frame_regex or frame_regex,
+        "lr": lr_frame_regex or frame_regex,
+    }
+
+
 def build_manifest(
     *,
     hr_root: Path,
@@ -272,6 +296,9 @@ def build_manifest(
     image_extensions: tuple[str, ...] = DEFAULT_IMAGE_EXTENSIONS,
     media_mode: str = "auto",
     frame_regex: str = DEFAULT_FRAME_REGEX,
+    hr_frame_regex: str | None = None,
+    hq_frame_regex: str | None = None,
+    lr_frame_regex: str | None = None,
     match_mode: str = "relative_stem",
     seed: int = 0,
     val_fraction: float = 0.05,
@@ -306,6 +333,7 @@ def build_manifest(
             if not root.is_dir():
                 raise FileNotFoundError(f"Dataset root is not a directory: {root}")
 
+    frame_regexes: dict[str, str] | None = None
     if resolved_mode == "video":
         indices: dict[str, dict[str, object]] = {
             name: index_videos(
@@ -316,13 +344,22 @@ def build_manifest(
             for name, root in roots.items()
         }
     else:
-        compiled_regex = compile_frame_regex(frame_regex)
+        frame_regexes = _resolve_frame_regexes(
+            frame_regex,
+            hr_frame_regex,
+            hq_frame_regex,
+            lr_frame_regex,
+        )
+        compiled_regexes = {
+            name: compile_frame_regex(value)
+            for name, value in frame_regexes.items()
+        }
         indices = {
             name: index_frame_sequences(
                 root,
                 extensions=image_extensions,
                 match_mode=match_mode,
-                frame_regex=compiled_regex,
+                frame_regex=compiled_regexes[name],
             )
             for name, root in roots.items()
         }
@@ -412,7 +449,7 @@ def build_manifest(
         )
 
     summary: dict[str, object] = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "hr_root": str(roots["hr"]),
         "hq_root": str(roots["hq"]),
         "lr_root": str(roots["lr"]),
@@ -421,6 +458,7 @@ def build_manifest(
         "video_extensions": list(video_extensions),
         "image_extensions": list(image_extensions),
         "frame_regex": frame_regex if resolved_mode == "frames" else None,
+        "frame_regexes": frame_regexes,
         "seed": int(seed),
         "val_fraction": float(val_fraction),
         "test_fraction": float(test_fraction),
@@ -503,10 +541,19 @@ def parse_args() -> argparse.Namespace:
         "--frame-regex",
         default=DEFAULT_FRAME_REGEX,
         help=(
-            "Regex applied to each image stem. It must define named groups "
+            "Common regex applied to image stems. It must define named groups "
             "'clip' and 'frame'."
         ),
     )
+    for root_name in ("hr", "hq", "lr"):
+        parser.add_argument(
+            f"--{root_name}-frame-regex",
+            default=None,
+            help=(
+                f"Optional regex override for {root_name.upper()} image stems. "
+                "It must define named groups 'clip' and 'frame'."
+            ),
+        )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--test-fraction", type=float, default=0.0)
@@ -531,6 +578,9 @@ def main() -> None:
         image_extensions=parse_extensions(args.image_extensions),
         media_mode=args.media_mode,
         frame_regex=args.frame_regex,
+        hr_frame_regex=args.hr_frame_regex,
+        hq_frame_regex=args.hq_frame_regex,
+        lr_frame_regex=args.lr_frame_regex,
         match_mode=args.match_mode,
         seed=args.seed,
         val_fraction=args.val_fraction,
