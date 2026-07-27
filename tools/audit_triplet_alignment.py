@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
-"""Audit temporal, geometric, and photometric alignment of HR/HQ/LR videos.
+"""Audit temporal, geometric, and photometric alignment of HR/HQ/LR triplets.
 
-The input is the JSONL manifest produced by ``tools/build_triplet_manifest.py``.
-This tool never modifies source videos. It combines container metadata from
-``ffprobe`` with a small number of decoded RGB frames from ``decord`` to:
+The input is a JSONL manifest produced by ``tools/build_triplet_manifest.py``.
+Both encoded-video records and image-sequence records are supported. Image
+sequences may use compact ``{frame:06d}`` patterns or explicit ordered
+``hr_frames``/``hq_frames``/``lr_frames`` lists, including manifests created by
+``--group-components``.
 
-* compare frame counts, FPS, durations, dimensions, and color metadata;
-* inspect early frame timestamps for variable-frame-rate behavior;
-* search small temporal offsets for both HR<->HQ and HQ<->LR;
+The tool never modifies source media. For encoded videos it uses ffprobe and
+lazily imported decord. For image sequences it reads RGB images with Pillow.
+It samples a small number of frames to:
+
+* compare frame counts and dimensions (plus container metadata for videos);
+* search small temporal offsets for HR<->HQ and HQ<->LR;
 * report MAE, RMSE, PSNR, and global grayscale SSIM for HR->HQ and HQ->LR.
-
-Example::
-
-    python tools/audit_triplet_alignment.py \
-        --manifest manifests/vsr_triplets.jsonl \
-        --output manifests/vsr_triplets.audit.jsonl \
-        --split train \
-        --max-samples 100 \
-        --expected-scale 3 \
-        --offset-radius 5
-
-Dependencies: ffprobe on PATH and the repository's existing decord, numpy,
-and Pillow packages. Decord is imported lazily so ``--help`` and the pure CPU
-unit tests do not require video decoding support.
 """
 
 from __future__ import annotations
@@ -40,9 +31,13 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 from PIL import Image
 
+MEDIA_FIELDS = ("hr", "hq", "lr")
+VALID_MEDIA_TYPES = ("video", "frames")
+
 
 @dataclass(frozen=True)
-class VideoProbe:
+class MediaProbe:
+    media_type: str
     path: str
     width: int | None
     height: int | None
@@ -65,14 +60,26 @@ class VideoProbe:
 
 
 @dataclass(frozen=True)
+class MediaSource:
+    media_type: str
+    video_path: str | None = None
+    frame_paths: tuple[str, ...] = ()
+    frame_indices: tuple[int, ...] = ()
+    frame_path_mode: str | None = None
+
+    @property
+    def frame_count(self) -> int | None:
+        if self.media_type == "frames":
+            return len(self.frame_paths)
+        return None
+
+
+@dataclass(frozen=True)
 class PairMetrics:
     mae: float
     rmse: float
     psnr: float
     ssim_gray_global: float
-
-
-VIDEO_FIELDS = ("hr", "hq", "lr")
 
 
 def _fraction_to_float(value: str | int | float | None) -> float | None:
@@ -155,7 +162,7 @@ def _timestamp_stats(timestamps: Sequence[float]) -> dict[str, float | int | Non
     }
 
 
-def probe_video(path: Path, *, timestamp_scan_limit: int = 256) -> VideoProbe:
+def probe_video(path: Path, *, timestamp_scan_limit: int = 256) -> MediaProbe:
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Video does not exist: {path}")
@@ -226,7 +233,8 @@ def probe_video(path: Path, *, timestamp_scan_limit: int = 256) -> VideoProbe:
             warnings.append(f"timestamp_scan_failed:{type(exc).__name__}")
 
     stats = _timestamp_stats(timestamp_values)
-    return VideoProbe(
+    return MediaProbe(
+        media_type="video",
         path=str(path),
         width=_int_or_none(stream.get("width")),
         height=_int_or_none(stream.get("height")),
@@ -235,24 +243,52 @@ def probe_video(path: Path, *, timestamp_scan_limit: int = 256) -> VideoProbe:
         nominal_fps=_fraction_to_float(stream.get("r_frame_rate")),
         duration=duration,
         pix_fmt=str(stream.get("pix_fmt")) if stream.get("pix_fmt") else None,
-        color_range=(
-            str(stream.get("color_range")) if stream.get("color_range") else None
-        ),
-        color_space=(
-            str(stream.get("color_space")) if stream.get("color_space") else None
-        ),
+        color_range=str(stream.get("color_range")) if stream.get("color_range") else None,
+        color_space=str(stream.get("color_space")) if stream.get("color_space") else None,
         color_transfer=(
-            str(stream.get("color_transfer"))
-            if stream.get("color_transfer")
-            else None
+            str(stream.get("color_transfer")) if stream.get("color_transfer") else None
         ),
         color_primaries=(
-            str(stream.get("color_primaries"))
-            if stream.get("color_primaries")
-            else None
+            str(stream.get("color_primaries")) if stream.get("color_primaries") else None
         ),
         probe_warnings=tuple(warnings),
         **stats,
+    )
+
+
+def _read_rgb_image(path: str | Path) -> np.ndarray:
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Image frame does not exist: {resolved}")
+    with Image.open(resolved) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def probe_frame_sequence(source: MediaSource) -> MediaProbe:
+    if source.media_type != "frames" or not source.frame_paths:
+        raise ValueError("Frame-sequence probe requires non-empty frame paths")
+    first = _read_rgb_image(source.frame_paths[0])
+    return MediaProbe(
+        media_type="frames",
+        path=source.frame_paths[0],
+        width=int(first.shape[1]),
+        height=int(first.shape[0]),
+        frame_count=len(source.frame_paths),
+        avg_fps=None,
+        nominal_fps=None,
+        duration=None,
+        pix_fmt="rgb24",
+        color_range=None,
+        color_space=None,
+        color_transfer=None,
+        color_primaries=None,
+        timestamp_count=0,
+        timestamp_interval_median=None,
+        timestamp_interval_cv=None,
+        timestamp_interval_min=None,
+        timestamp_interval_max=None,
+        duplicate_timestamp_count=0,
+        probe_warnings=(),
     )
 
 
@@ -261,20 +297,153 @@ def _load_decord_reader(path: str):
         import decord
     except ImportError as exc:
         raise RuntimeError(
-            "decord is required for frame decoding; install repository dependencies"
+            "decord is required for encoded-video decoding; install dependencies"
         ) from exc
     return decord.VideoReader(path, ctx=decord.cpu(0), num_threads=1)
 
 
-def decode_frames(path: str, indices: Sequence[int]) -> list[np.ndarray]:
+def decode_video_frames(path: str, positions: Sequence[int]) -> list[np.ndarray]:
     reader = _load_decord_reader(path)
     if len(reader) <= 0:
         raise ValueError(f"Video has no decodable frames: {path}")
-    clipped = [min(max(int(index), 0), len(reader) - 1) for index in indices]
+    clipped = [min(max(int(position), 0), len(reader) - 1) for position in positions]
     batch = reader.get_batch(clipped).asnumpy()
     if batch.ndim != 4 or batch.shape[-1] < 3:
         raise ValueError(f"Unexpected decoded frame shape {batch.shape}: {path}")
     return [np.asarray(frame[..., :3], dtype=np.uint8) for frame in batch]
+
+
+def decode_source_frames(source: MediaSource, positions: Sequence[int]) -> list[np.ndarray]:
+    positions = [int(position) for position in positions]
+    if source.media_type == "video":
+        if source.video_path is None:
+            raise ValueError("Video source is missing video_path")
+        return decode_video_frames(source.video_path, positions)
+    if source.media_type != "frames":
+        raise ValueError(f"Unsupported media type: {source.media_type}")
+    count = len(source.frame_paths)
+    frames: list[np.ndarray] = []
+    for position in positions:
+        if position < 0 or position >= count:
+            raise IndexError(
+                f"Frame position {position} is outside image sequence of length {count}"
+            )
+        frames.append(_read_rgb_image(source.frame_paths[position]))
+    return frames
+
+
+def _infer_media_type(record: Mapping[str, object]) -> str:
+    declared = record.get("media_type")
+    if declared in VALID_MEDIA_TYPES:
+        return str(declared)
+    if any(f"{name}_frames" in record for name in MEDIA_FIELDS):
+        return "frames"
+    if "frame_start" in record or "frame_indices" in record:
+        return "frames"
+    return "video"
+
+
+def _coerce_int_sequence(value: object, *, field: str) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field} must be a JSON array")
+    try:
+        return tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must contain integers") from exc
+
+
+def _coerce_path_sequence(value: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field} must be a JSON array")
+    paths = tuple(str(Path(str(item)).resolve()) for item in value)
+    if not paths:
+        raise ValueError(f"{field} must not be empty")
+    return paths
+
+
+def _pattern_indices(record: Mapping[str, object]) -> tuple[int, ...]:
+    if "frame_indices" in record:
+        indices = _coerce_int_sequence(record["frame_indices"], field="frame_indices")
+    else:
+        start = _int_or_none(record.get("frame_start"))
+        end = _int_or_none(record.get("frame_end"))
+        if start is None or end is None or end < start:
+            raise ValueError(
+                "Pattern frame manifest requires frame_indices or valid frame_start/frame_end"
+            )
+        indices = tuple(range(start, end + 1))
+    frame_count = _int_or_none(record.get("frame_count"))
+    if frame_count is not None and frame_count != len(indices):
+        raise ValueError(
+            f"frame_count={frame_count} does not match {len(indices)} frame indices"
+        )
+    if len(set(indices)) != len(indices):
+        raise ValueError("frame_indices contains duplicates")
+    return indices
+
+
+def resolve_media_sources(record: Mapping[str, object]) -> dict[str, MediaSource]:
+    media_type = _infer_media_type(record)
+    if media_type == "video":
+        missing = [name for name in MEDIA_FIELDS if name not in record]
+        if missing:
+            raise ValueError(f"Video manifest record missing fields: {missing}")
+        return {
+            name: MediaSource(
+                media_type="video", video_path=str(Path(str(record[name])).resolve())
+            )
+            for name in MEDIA_FIELDS
+        }
+
+    explicit_fields = tuple(f"{name}_frames" for name in MEDIA_FIELDS)
+    has_explicit = [field in record for field in explicit_fields]
+    if any(has_explicit) and not all(has_explicit):
+        missing = [field for field, present in zip(explicit_fields, has_explicit) if not present]
+        raise ValueError(f"Explicit frame manifest missing fields: {missing}")
+
+    indices = _pattern_indices(record)
+    if all(has_explicit):
+        sources: dict[str, MediaSource] = {}
+        for name in MEDIA_FIELDS:
+            paths = _coerce_path_sequence(record[f"{name}_frames"], field=f"{name}_frames")
+            if len(paths) != len(indices):
+                raise ValueError(
+                    f"{name}_frames length {len(paths)} does not match "
+                    f"frame_indices length {len(indices)}"
+                )
+            sources[name] = MediaSource(
+                media_type="frames",
+                frame_paths=paths,
+                frame_indices=indices,
+                frame_path_mode="explicit",
+            )
+        return sources
+
+    missing = [name for name in MEDIA_FIELDS if name not in record]
+    if missing:
+        raise ValueError(f"Pattern frame manifest missing fields: {missing}")
+    sources = {}
+    for name in MEDIA_FIELDS:
+        pattern = str(record[name])
+        try:
+            paths = tuple(str(Path(pattern.format(frame=index)).resolve()) for index in indices)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid frame pattern for {name}: {pattern}") from exc
+        sources[name] = MediaSource(
+            media_type="frames",
+            frame_paths=paths,
+            frame_indices=indices,
+            frame_path_mode="pattern",
+        )
+    return sources
+
+
+def probe_source(source: MediaSource, *, timestamp_scan_limit: int) -> MediaProbe:
+    if source.media_type == "video":
+        if source.video_path is None:
+            raise ValueError("Video source is missing video_path")
+        return probe_video(Path(source.video_path), timestamp_scan_limit=timestamp_scan_limit)
+    return probe_frame_sequence(source)
 
 
 def resize_rgb(frame: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
@@ -310,12 +479,8 @@ def pair_metrics(a: np.ndarray, b: np.ndarray) -> PairMetrics:
     rmse = math.sqrt(mse)
     psnr = float("inf") if mse == 0 else 20.0 * math.log10(255.0 / rmse)
 
-    gray_a = (
-        0.299 * a32[..., 0] + 0.587 * a32[..., 1] + 0.114 * a32[..., 2]
-    )
-    gray_b = (
-        0.299 * b32[..., 0] + 0.587 * b32[..., 1] + 0.114 * b32[..., 2]
-    )
+    gray_a = 0.299 * a32[..., 0] + 0.587 * a32[..., 1] + 0.114 * a32[..., 2]
+    gray_b = 0.299 * b32[..., 0] + 0.587 * b32[..., 1] + 0.114 * b32[..., 2]
     mean_a = float(np.mean(gray_a))
     mean_b = float(np.mean(gray_b))
     var_a = float(np.var(gray_a))
@@ -356,11 +521,11 @@ def find_best_offset_from_sequences(
     for offset in offsets:
         errors: list[float] = []
         for anchor in anchors:
-            source_index = int(anchor) + int(offset)
-            if source_index not in source_frames or int(anchor) not in reference_frames:
+            source_position = int(anchor) + int(offset)
+            if source_position not in source_frames or int(anchor) not in reference_frames:
                 continue
             reference = reference_frames[int(anchor)]
-            source = resize_rgb(source_frames[source_index], reference.shape[:2])
+            source = resize_rgb(source_frames[source_position], reference.shape[:2])
             source_gray = _thumbnail_gray(source, max_side=max_side)
             reference_gray = _thumbnail_gray(reference, max_side=max_side)
             errors.append(float(np.mean(np.abs(source_gray - reference_gray))))
@@ -372,14 +537,11 @@ def find_best_offset_from_sequences(
     return int(best), scores
 
 
-def _mean_pair_metrics(
-    metrics: Sequence[PairMetrics],
-) -> dict[str, float | None] | None:
+def _mean_pair_metrics(metrics: Sequence[PairMetrics]) -> dict[str, float | None] | None:
     if not metrics:
         return None
-    fields = ("mae", "rmse", "psnr", "ssim_gray_global")
     result: dict[str, float | None] = {}
-    for field in fields:
+    for field in ("mae", "rmse", "psnr", "ssim_gray_global"):
         values = [float(getattr(item, field)) for item in metrics]
         finite = [value for value in values if math.isfinite(value)]
         result[field] = float(np.mean(finite)) if finite else None
@@ -389,13 +551,22 @@ def _mean_pair_metrics(
 def _relative_difference(a: float | None, b: float | None) -> float | None:
     if a is None or b is None:
         return None
-    denominator = max(abs(a), abs(b), 1e-12)
-    return abs(a - b) / denominator
+    return abs(a - b) / max(abs(a), abs(b), 1e-12)
 
 
 def _append_unique(values: list[str], message: str) -> None:
     if message not in values:
         values.append(message)
+
+
+def _source_count(source: MediaSource, probe: MediaProbe) -> int:
+    if source.media_type == "frames":
+        return len(source.frame_paths)
+    if probe.frame_count is not None:
+        return probe.frame_count
+    if source.video_path is None:
+        raise ValueError("Video source is missing video_path")
+    return len(_load_decord_reader(source.video_path))
 
 
 def audit_record(
@@ -413,34 +584,37 @@ def audit_record(
     sample_id = str(record.get("sample_id", ""))
     if not sample_id:
         raise ValueError("Manifest record is missing sample_id")
-    paths = {name: Path(str(record[name])).resolve() for name in VIDEO_FIELDS}
+    sources = resolve_media_sources(record)
+    media_types = {source.media_type for source in sources.values()}
+    if len(media_types) != 1:
+        raise ValueError(f"Triplet mixes media types: {sorted(media_types)}")
+    media_type = next(iter(media_types))
     probes = {
-        name: probe_video(path, timestamp_scan_limit=timestamp_scan_limit)
-        for name, path in paths.items()
+        name: probe_source(source, timestamp_scan_limit=timestamp_scan_limit)
+        for name, source in sources.items()
     }
 
     warnings: list[str] = []
     errors: list[str] = []
-    for name, probe in probes.items():
-        for warning in probe.probe_warnings:
-            _append_unique(warnings, f"{name}:{warning}")
-        if probe.timestamp_interval_cv is not None and probe.timestamp_interval_cv > 0.01:
-            _append_unique(warnings, f"{name}:possible_vfr")
-        if probe.duplicate_timestamp_count:
-            _append_unique(warnings, f"{name}:duplicate_timestamps")
+    if media_type == "video":
+        for name, probe in probes.items():
+            for warning in probe.probe_warnings:
+                _append_unique(warnings, f"{name}:{warning}")
+            if probe.timestamp_interval_cv is not None and probe.timestamp_interval_cv > 0.01:
+                _append_unique(warnings, f"{name}:possible_vfr")
+            if probe.duplicate_timestamp_count:
+                _append_unique(warnings, f"{name}:duplicate_timestamps")
 
-    for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
-        known = {
-            getattr(probe, field)
-            for probe in probes.values()
-            if getattr(probe, field)
-        }
-        if len(known) > 1:
-            _append_unique(warnings, f"{field}_mismatch")
+        for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
+            known = {
+                getattr(probe, field)
+                for probe in probes.values()
+                if getattr(probe, field)
+            }
+            if len(known) > 1:
+                _append_unique(warnings, f"{field}_mismatch")
 
-    hq = probes["hq"]
-    lr = probes["lr"]
-    hr = probes["hr"]
+    hq, lr, hr = probes["hq"], probes["lr"], probes["hr"]
     if None not in (hq.width, hq.height, lr.width, lr.height):
         if (hq.width, hq.height) != (lr.width, lr.height):
             errors.append("hq_lr_resolution_mismatch")
@@ -453,18 +627,16 @@ def audit_record(
         scale_y = float(hr.height) / float(hq.height)
         if abs(scale_x - scale_y) > scale_tolerance:
             errors.append("non_uniform_hr_to_hq_scale")
-        if expected_scale is not None:
-            if (
-                abs(scale_x - expected_scale) > scale_tolerance
-                or abs(scale_y - expected_scale) > scale_tolerance
-            ):
-                errors.append("unexpected_hr_to_hq_scale")
+        if expected_scale is not None and (
+            abs(scale_x - expected_scale) > scale_tolerance
+            or abs(scale_y - expected_scale) > scale_tolerance
+        ):
+            errors.append("unexpected_hr_to_hq_scale")
     else:
         warnings.append("missing_hr_or_hq_resolution_metadata")
 
     for left, right in (("hr", "hq"), ("hq", "lr")):
-        a = probes[left]
-        b = probes[right]
+        a, b = probes[left], probes[right]
         if a.frame_count is not None and b.frame_count is not None:
             difference = abs(a.frame_count - b.frame_count)
             if difference > 1:
@@ -473,59 +645,46 @@ def audit_record(
                 warnings.append(f"{left}_{right}_frame_count_off_by_one")
         else:
             warnings.append(f"{left}_{right}_missing_frame_count")
-        fps_difference = _relative_difference(a.avg_fps, b.avg_fps)
-        if fps_difference is not None and fps_difference > fps_tolerance:
-            errors.append(f"{left}_{right}_fps_mismatch")
-        duration_difference = _relative_difference(a.duration, b.duration)
-        if duration_difference is not None and duration_difference > duration_tolerance:
-            errors.append(f"{left}_{right}_duration_mismatch")
+        if media_type == "video":
+            fps_difference = _relative_difference(a.avg_fps, b.avg_fps)
+            if fps_difference is not None and fps_difference > fps_tolerance:
+                errors.append(f"{left}_{right}_fps_mismatch")
+            duration_difference = _relative_difference(a.duration, b.duration)
+            if duration_difference is not None and duration_difference > duration_tolerance:
+                errors.append(f"{left}_{right}_duration_mismatch")
 
-    if hq.frame_count is None:
-        hq_reader = _load_decord_reader(str(paths["hq"]))
-        hq_count = len(hq_reader)
-    else:
-        hq_count = hq.frame_count
-    if hr.frame_count is None:
-        hr_reader = _load_decord_reader(str(paths["hr"]))
-        hr_count = len(hr_reader)
-    else:
-        hr_count = hr.frame_count
-    if lr.frame_count is None:
-        lr_reader = _load_decord_reader(str(paths["lr"]))
-        lr_count = len(lr_reader)
-    else:
-        lr_count = lr.frame_count
-
-    common_count = min(hr_count, hq_count, lr_count)
+    counts = {name: _source_count(sources[name], probes[name]) for name in MEDIA_FIELDS}
+    common_count = min(counts.values())
     anchors = evenly_spaced_indices(
-        common_count,
-        sample_frames,
-        margin=max(0, offset_radius),
+        common_count, sample_frames, margin=max(0, offset_radius)
     )
+    if not anchors:
+        raise ValueError("Triplet has no frames available for sampling")
     offsets = range(-max(0, offset_radius), max(0, offset_radius) + 1)
-    required_hr_indices = sorted(
+    required_hr_positions = sorted(
         {
             anchor + offset
             for anchor in anchors
             for offset in offsets
-            if 0 <= anchor + offset < hr_count
+            if 0 <= anchor + offset < counts["hr"]
         }
     )
-    required_hq_indices = sorted(
+    required_hq_positions = sorted(
         set(anchors)
         | {
             anchor + offset
             for anchor in anchors
             for offset in offsets
-            if 0 <= anchor + offset < hq_count
+            if 0 <= anchor + offset < counts["hq"]
         }
     )
-    hr_frames_list = decode_frames(str(paths["hr"]), required_hr_indices)
-    hq_frames_list = decode_frames(str(paths["hq"]), required_hq_indices)
-    lr_frames_list = decode_frames(str(paths["lr"]), anchors)
-    hr_frames = dict(zip(required_hr_indices, hr_frames_list))
-    hq_frames = dict(zip(required_hq_indices, hq_frames_list))
-    lr_frames = dict(zip(anchors, lr_frames_list))
+    hr_frames = dict(
+        zip(required_hr_positions, decode_source_frames(sources["hr"], required_hr_positions))
+    )
+    hq_frames = dict(
+        zip(required_hq_positions, decode_source_frames(sources["hq"], required_hq_positions))
+    )
+    lr_frames = dict(zip(anchors, decode_source_frames(sources["lr"], anchors)))
 
     best_hr_hq_offset, hr_hq_offset_scores = find_best_offset_from_sequences(
         hr_frames,
@@ -548,8 +707,8 @@ def audit_record(
 
     hr_hq_metrics: list[PairMetrics] = []
     hq_lr_metrics: list[PairMetrics] = []
-    sampled_duplicates = {"hr": 0, "hq": 0, "lr": 0}
-    previous: dict[str, np.ndarray | None] = {name: None for name in VIDEO_FIELDS}
+    sampled_duplicates = {name: 0 for name in MEDIA_FIELDS}
+    previous: dict[str, np.ndarray | None] = {name: None for name in MEDIA_FIELDS}
     for anchor in anchors:
         aligned_hr = hr_frames.get(anchor + best_hr_hq_offset)
         hq_frame = hq_frames[anchor]
@@ -561,11 +720,7 @@ def audit_record(
             )
         if aligned_hq_for_lr is not None and aligned_hq_for_lr.shape == lr_frame.shape:
             hq_lr_metrics.append(pair_metrics(aligned_hq_for_lr, lr_frame))
-        for name, frame in (
-            ("hr", aligned_hr),
-            ("hq", hq_frame),
-            ("lr", lr_frame),
-        ):
+        for name, frame in (("hr", aligned_hr), ("hq", hq_frame), ("lr", lr_frame)):
             if frame is None:
                 continue
             thumb = _thumbnail_gray(frame, max_side=64)
@@ -573,10 +728,21 @@ def audit_record(
                 sampled_duplicates[name] += 1
             previous[name] = thumb
 
+    logical_frame_indices: list[int] | None = None
+    if media_type == "frames":
+        logical_frame_indices = list(sources["hq"].frame_indices)
+    sampled_frame_indices = (
+        [logical_frame_indices[position] for position in anchors]
+        if logical_frame_indices is not None
+        else None
+    )
+
     status = "fail" if errors else ("warn" if warnings else "pass")
     return {
         "sample_id": sample_id,
         "split": record.get("split"),
+        "media_type": media_type,
+        "frame_path_mode": record.get("frame_path_mode"),
         "status": status,
         "errors": errors,
         "warnings": warnings,
@@ -587,16 +753,15 @@ def audit_record(
             "expected_scale": expected_scale,
         },
         "temporal_alignment": {
-            "sampled_indices": anchors,
+            "sampled_positions": anchors,
+            "sampled_frame_indices": sampled_frame_indices,
             "best_hr_offset_relative_to_hq": best_hr_hq_offset,
             "best_hq_offset_relative_to_lr": best_hq_lr_offset,
             "hr_hq_offset_mae_scores": {
-                str(offset): score
-                for offset, score in sorted(hr_hq_offset_scores.items())
+                str(offset): score for offset, score in sorted(hr_hq_offset_scores.items())
             },
             "hq_lr_offset_mae_scores": {
-                str(offset): score
-                for offset, score in sorted(hq_lr_offset_scores.items())
+                str(offset): score for offset, score in sorted(hq_lr_offset_scores.items())
             },
             "sampled_adjacent_duplicate_counts": sampled_duplicates,
         },
@@ -605,6 +770,15 @@ def audit_record(
             "hq_vs_lr": _mean_pair_metrics(hq_lr_metrics),
         },
     }
+
+
+def _validate_manifest_record(payload: Mapping[str, object], line_number: int) -> None:
+    if not payload.get("sample_id"):
+        raise ValueError(f"Manifest line {line_number} missing sample_id")
+    try:
+        resolve_media_sources(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Manifest line {line_number} is invalid: {exc}") from exc
 
 
 def read_manifest(path: Path, *, split: str | None = None) -> list[dict[str, object]]:
@@ -616,9 +790,7 @@ def read_manifest(path: Path, *, split: str | None = None) -> list[dict[str, obj
             payload = json.loads(line)
             if not isinstance(payload, dict):
                 raise ValueError(f"Manifest line {line_number} is not a JSON object")
-            missing = [name for name in ("sample_id", *VIDEO_FIELDS) if name not in payload]
-            if missing:
-                raise ValueError(f"Manifest line {line_number} missing fields: {missing}")
+            _validate_manifest_record(payload, line_number)
             if split is None or payload.get("split") == split:
                 records.append(payload)
     return records
@@ -626,6 +798,8 @@ def read_manifest(path: Path, *, split: str | None = None) -> list[dict[str, obj
 
 def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, object]:
     status_counts = {"pass": 0, "warn": 0, "fail": 0, "error": 0}
+    media_type_counts: dict[str, int] = {}
+    frame_path_mode_counts: dict[str, int] = {}
     best_hr_hq_offsets: dict[str, int] = {}
     best_hq_lr_offsets: dict[str, int] = {}
     metric_values: dict[str, list[float]] = {
@@ -635,15 +809,23 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     for result in results:
         status = str(result.get("status", "error"))
         status_counts[status if status in status_counts else "error"] += 1
+        media_type = result.get("media_type")
+        if media_type:
+            key = str(media_type)
+            media_type_counts[key] = media_type_counts.get(key, 0) + 1
+        path_mode = result.get("frame_path_mode")
+        if path_mode:
+            key = str(path_mode)
+            frame_path_mode_counts[key] = frame_path_mode_counts.get(key, 0) + 1
         temporal = result.get("temporal_alignment")
         if isinstance(temporal, Mapping):
             offset = temporal.get("best_hr_offset_relative_to_hq")
             if isinstance(offset, int):
                 key = str(offset)
                 best_hr_hq_offsets[key] = best_hr_hq_offsets.get(key, 0) + 1
-            hq_lr_offset = temporal.get("best_hq_offset_relative_to_lr")
-            if isinstance(hq_lr_offset, int):
-                key = str(hq_lr_offset)
+            offset = temporal.get("best_hq_offset_relative_to_lr")
+            if isinstance(offset, int):
+                key = str(offset)
                 best_hq_lr_offsets[key] = best_hq_lr_offsets.get(key, 0) + 1
         metrics = result.get("metrics")
         if isinstance(metrics, Mapping):
@@ -659,6 +841,8 @@ def summarize_results(results: Sequence[Mapping[str, object]]) -> dict[str, obje
     return {
         "sample_count": len(results),
         "status_counts": status_counts,
+        "media_type_counts": media_type_counts,
+        "frame_path_mode_counts": frame_path_mode_counts,
         "best_hr_hq_offset_counts": best_hr_hq_offsets,
         "best_hq_lr_offset_counts": best_hq_lr_offsets,
         "mean_metrics": {
@@ -737,6 +921,8 @@ def main() -> None:
             result = {
                 "sample_id": sample_id,
                 "split": record.get("split"),
+                "media_type": _infer_media_type(record),
+                "frame_path_mode": record.get("frame_path_mode"),
                 "status": "error",
                 "error_type": type(exc).__name__,
                 "error": str(exc),
