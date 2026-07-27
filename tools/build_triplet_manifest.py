@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """Build deterministic manifests for aligned HR/HQ/LR media triplets.
 
-The three dataset roots may contain either encoded videos or image-frame
-sequences. Image sequences are grouped using regular expressions with named
-``clip`` and ``frame`` groups. The default expression matches names such as
-``video1_comp2_000123.png``. Per-root overrides support asymmetric names, for
-example clean HR/HQ frames and ``*_text.png`` LR frames.
+The three dataset roots may contain encoded videos or image-frame sequences.
+Frame sequences are grouped using regexes with named ``clip`` and ``frame``
+groups. The default matches ``video1_comp2_000123.png``; per-root overrides
+support asymmetric names such as clean HR/HQ frames and ``*_text.png`` LR.
 
-For datasets that already provide train/validation/test directories, use
-``--split-all`` so every record receives the directory's official split. If it
-is omitted, samples are divided deterministically by hashing ``sample_id``.
-
-This tool only inspects paths and frame indices. Pixel-level temporal,
-geometric, and photometric alignment belongs in
+For datasets with official train/validation/test directories, use
+``--split-all``. Otherwise records are divided deterministically by sample ID.
+This tool inspects paths and frame indices only; pixel alignment is audited by
 ``tools/audit_triplet_alignment.py``.
 """
 
@@ -26,22 +22,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Pattern
 
-
-DEFAULT_VIDEO_EXTENSIONS = (
-    ".mp4",
-    ".mkv",
-    ".mov",
-    ".avi",
-    ".webm",
-    ".m4v",
-)
-DEFAULT_IMAGE_EXTENSIONS = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".bmp",
-)
+DEFAULT_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
+DEFAULT_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 DEFAULT_FRAME_REGEX = r"^(?P<clip>.+)_(?P<frame>\d{6})$"
 VALID_MEDIA_MODES = ("auto", "video", "frames")
 VALID_MATCH_MODES = ("relative_stem", "basename_stem")
@@ -60,6 +42,8 @@ class TripletRecord:
     frame_end: int | None = None
     frame_count: int | None = None
     frame_digits: int | None = None
+    frame_contiguous: bool | None = None
+    frame_indices: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -70,9 +54,9 @@ class FrameSequence:
 
     @property
     def contiguous(self) -> bool:
-        if not self.indices:
-            return False
-        return self.indices == tuple(range(self.indices[0], self.indices[-1] + 1))
+        return bool(self.indices) and self.indices == tuple(
+            range(self.indices[0], self.indices[-1] + 1)
+        )
 
 
 @dataclass(frozen=True)
@@ -117,9 +101,7 @@ def logical_key(parent: Path, root: Path, clip: str, match_mode: str) -> str:
     if match_mode != "relative_stem":
         raise ValueError(f"Unsupported match mode: {match_mode}")
     relative_parent = parent.relative_to(root)
-    if relative_parent == Path("."):
-        return clip
-    return (relative_parent / clip).as_posix()
+    return clip if relative_parent == Path(".") else (relative_parent / clip).as_posix()
 
 
 def _raise_duplicates(
@@ -160,7 +142,6 @@ def index_videos(
 
 
 def _frame_pattern(path: Path, match: re.Match[str], frame_digits: int) -> str:
-    """Replace exactly the frame-number span while preserving other suffixes."""
     frame_start, frame_end = match.span("frame")
     stem = path.stem
     pattern_stem = (
@@ -206,7 +187,7 @@ def index_frame_sequences(
             f"{frame_regex.pattern!r}.{detail}"
         )
 
-    index: dict[str, FrameSequence] = {}
+    sequences: dict[str, FrameSequence] = {}
     duplicate_frames: dict[str, list[Path]] = {}
     for key, rows in sorted(grouped.items()):
         widths = {len(frame_text) for _, frame_text, _ in rows}
@@ -230,7 +211,7 @@ def index_frame_sequences(
         first_match = frame_regex.fullmatch(first_path.stem)
         assert first_match is not None
         digits = next(iter(widths))
-        index[key] = FrameSequence(
+        sequences[key] = FrameSequence(
             pattern=_frame_pattern(first_path, first_match, digits),
             indices=tuple(sorted(by_index)),
             frame_digits=digits,
@@ -240,7 +221,7 @@ def index_frame_sequences(
         _raise_duplicates(root, duplicate_frames, match_mode)
 
     return FrameIndexResult(
-        sequences=index,
+        sequences=sequences,
         matched_file_count=matched_file_count,
         unmatched_file_count=unmatched_file_count,
         unmatched_examples=tuple(unmatched),
@@ -355,11 +336,7 @@ def build_manifest(
     test_fraction: float = 0.0,
     strict: bool = False,
 ) -> tuple[list[TripletRecord], dict[str, object]]:
-    roots = {
-        "hr": hr_root.resolve(),
-        "hq": hq_root.resolve(),
-        "lr": lr_root.resolve(),
-    }
+    roots = {"hr": hr_root.resolve(), "hq": hq_root.resolve(), "lr": lr_root.resolve()}
     video_extensions = parse_extensions(video_extensions)
     image_extensions = parse_extensions(image_extensions)
 
@@ -401,23 +378,15 @@ def build_manifest(
     frame_scan: dict[str, FrameIndexResult] | None = None
     if resolved_mode == "video":
         indices: dict[str, dict[str, object]] = {
-            name: index_videos(
-                root,
-                extensions=video_extensions,
-                match_mode=match_mode,
-            )
+            name: index_videos(root, extensions=video_extensions, match_mode=match_mode)
             for name, root in roots.items()
         }
     else:
         frame_regexes = _resolve_frame_regexes(
-            frame_regex,
-            hr_frame_regex,
-            hq_frame_regex,
-            lr_frame_regex,
+            frame_regex, hr_frame_regex, hq_frame_regex, lr_frame_regex
         )
         compiled_regexes = {
-            name: compile_frame_regex(value)
-            for name, value in frame_regexes.items()
+            name: compile_frame_regex(value) for name, value in frame_regexes.items()
         }
         frame_scan = {
             name: index_frame_sequences(
@@ -428,10 +397,7 @@ def build_manifest(
             )
             for name, root in roots.items()
         }
-        indices = {
-            name: result.sequences
-            for name, result in frame_scan.items()
-        }
+        indices = {name: result.sequences for name, result in frame_scan.items()}
 
     if any(not index for index in indices.values()):
         counts = {name: len(index) for name, index in indices.items()}
@@ -439,10 +405,7 @@ def build_manifest(
 
     all_keys = set().union(*(set(index) for index in indices.values()))
     common_keys = set.intersection(*(set(index) for index in indices.values()))
-    missing = {
-        name: sorted(all_keys - set(index))
-        for name, index in indices.items()
-    }
+    missing = {name: sorted(all_keys - set(index)) for name, index in indices.items()}
     if strict and any(missing.values()):
         counts = {name: len(keys) for name, keys in missing.items()}
         raise ValueError(
@@ -453,29 +416,21 @@ def build_manifest(
     records: list[TripletRecord] = []
     split_counts = {split: 0 for split in VALID_SPLITS}
     invalid_sequences: dict[str, str] = {}
+    non_contiguous_sequences: dict[str, dict[str, object]] = {}
     frame_counts: list[int] = []
 
     for key in sorted(common_keys):
         frame_start = frame_end = frame_count = frame_digits = None
+        frame_contiguous = None
+        frame_indices = None
         if resolved_mode == "frames":
-            sequences = {
-                name: index[key]
-                for name, index in indices.items()
-            }
+            sequences = {name: index[key] for name, index in indices.items()}
             assert all(isinstance(sequence, FrameSequence) for sequence in sequences.values())
             sequence_values = list(sequences.values())
-            non_contiguous = [
-                name
-                for name, sequence in sequences.items()
-                if not sequence.contiguous
-            ]
             same_indices = len({sequence.indices for sequence in sequence_values}) == 1
             same_digits = len({sequence.frame_digits for sequence in sequence_values}) == 1
-            if non_contiguous or not same_indices or not same_digits:
-                reason = (
-                    f"non_contiguous={non_contiguous}, "
-                    f"same_indices={same_indices}, same_digits={same_digits}"
-                )
+            if not same_indices or not same_digits:
+                reason = f"same_indices={same_indices}, same_digits={same_digits}"
                 invalid_sequences[key] = reason
                 if strict:
                     raise ValueError(
@@ -484,10 +439,27 @@ def build_manifest(
                 continue
 
             shared_indices = sequence_values[0].indices
+            shared_contiguous = sequence_values[0].contiguous
+            if not shared_contiguous and not strict:
+                reason = (
+                    "synchronized_non_contiguous=True; rerun with --strict to "
+                    "preserve explicit frame_indices"
+                )
+                invalid_sequences[key] = reason
+                continue
             frame_start = shared_indices[0]
             frame_end = shared_indices[-1]
             frame_count = len(shared_indices)
             frame_digits = sequence_values[0].frame_digits
+            frame_contiguous = shared_contiguous
+            if not frame_contiguous:
+                frame_indices = shared_indices
+                non_contiguous_sequences[key] = {
+                    "frame_count": frame_count,
+                    "frame_start": frame_start,
+                    "frame_end": frame_end,
+                    "index_preview": list(shared_indices[:20]),
+                }
             frame_counts.append(frame_count)
             hr_value = sequences["hr"].pattern
             hq_value = sequences["hq"].pattern
@@ -517,6 +489,8 @@ def build_manifest(
                 frame_end=frame_end,
                 frame_count=frame_count,
                 frame_digits=frame_digits,
+                frame_contiguous=frame_contiguous,
+                frame_indices=frame_indices,
             )
         )
 
@@ -537,20 +511,16 @@ def build_manifest(
         "seed": int(seed) if split_all is None else None,
         "val_fraction": float(val_fraction) if split_all is None else None,
         "test_fraction": float(test_fraction) if split_all is None else None,
-        "indexed_counts": {
-            name: len(index) for name, index in indices.items()
-        },
+        "indexed_counts": {name: len(index) for name, index in indices.items()},
         "triplet_count": len(records),
         "split_counts": split_counts,
-        "missing_counts": {
-            name: len(keys) for name, keys in missing.items()
-        },
-        "missing_examples": {
-            name: keys[:20] for name, keys in missing.items()
-        },
+        "missing_counts": {name: len(keys) for name, keys in missing.items()},
+        "missing_examples": {name: keys[:20] for name, keys in missing.items()},
         "invalid_sequence_count": len(invalid_sequences),
-        "invalid_sequence_examples": dict(
-            list(sorted(invalid_sequences.items()))[:20]
+        "invalid_sequence_examples": dict(list(sorted(invalid_sequences.items()))[:20]),
+        "non_contiguous_sequence_count": len(non_contiguous_sequences),
+        "non_contiguous_sequence_examples": dict(
+            list(sorted(non_contiguous_sequences.items()))[:20]
         ),
     }
     if frame_scan is not None:
@@ -581,9 +551,7 @@ def write_manifest(
     with output.open("w", encoding="utf-8") as handle:
         for record in records:
             payload = {
-                key: value
-                for key, value in asdict(record).items()
-                if value is not None
+                key: value for key, value in asdict(record).items() if value is not None
             }
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
@@ -607,9 +575,7 @@ def parse_args() -> argparse.Namespace:
         help="Auto-detect encoded videos or image-frame sequences",
     )
     parser.add_argument(
-        "--match-mode",
-        choices=VALID_MATCH_MODES,
-        default="relative_stem",
+        "--match-mode", choices=VALID_MATCH_MODES, default="relative_stem"
     )
     parser.add_argument(
         "--video-extensions",
@@ -652,20 +618,20 @@ def parse_args() -> argparse.Namespace:
         "--val-fraction",
         type=float,
         default=0.05,
-        help="Hash-split validation fraction; ignored when --split-all is used",
+        help="Hash-split validation fraction; ignored with --split-all",
     )
     parser.add_argument(
         "--test-fraction",
         type=float,
         default=0.0,
-        help="Hash-split test fraction; ignored when --split-all is used",
+        help="Hash-split test fraction; ignored with --split-all",
     )
     parser.add_argument(
         "--strict",
         action="store_true",
         help=(
-            "Fail on missing triplets, non-contiguous frame indices, or "
-            "mismatched HR/HQ/LR frame-index sets"
+            "Fail on missing triplets or mismatched HR/HQ/LR frame-index sets. "
+            "Synchronized non-contiguous indices are preserved explicitly."
         ),
     )
     return parser.parse_args()
