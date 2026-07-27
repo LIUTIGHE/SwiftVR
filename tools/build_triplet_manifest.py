@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""Build a deterministic manifest for aligned HR/HQ/LR video triplets.
+"""Build a deterministic manifest for aligned HR/HQ/LR media triplets.
 
-The expected dataset contains three roots with the same logical clips:
+Each dataset root may contain either encoded videos or image-frame sequences.
+Image sequences are grouped by a trailing frame number. With the default regex,
+``video1_comp2_000123.png`` belongs to clip ``video1_comp2`` and frame 123.
 
-* HR: highest-quality high-resolution target, e.g. 3840x2160
-* HQ: clean/downsampled same-resolution reference, e.g. 1280x720
-* LR: degraded/compressed input, e.g. 1280x720
-
-Files are matched by a configurable key and written as JSON Lines. No video is
-decoded here; geometric/temporal alignment is checked separately by
-``tools/audit_triplet_alignment.py``.
-
-Example::
-
-    python tools/build_triplet_manifest.py \
-        --hr-root /data/vsr/HR_2160p \
-        --hq-root /data/vsr/HQ_720p \
-        --lr-root /data/vsr/LR_720p \
-        --output manifests/vsr_triplets.jsonl \
-        --val-fraction 0.05 \
-        --strict
+This tool only inspects paths and frame indices. Pixel-level temporal, geometric,
+and photometric alignment is handled by ``tools/audit_triplet_alignment.py``.
 """
 
 from __future__ import annotations
@@ -27,12 +14,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Pattern
 
 
-DEFAULT_EXTENSIONS = (
+DEFAULT_VIDEO_EXTENSIONS = (
     ".mp4",
     ".mkv",
     ".mov",
@@ -40,6 +28,14 @@ DEFAULT_EXTENSIONS = (
     ".webm",
     ".m4v",
 )
+DEFAULT_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+)
+DEFAULT_FRAME_REGEX = r"^(?P<clip>.+)_(?P<frame>\d{6})$"
 
 
 @dataclass(frozen=True)
@@ -49,14 +45,29 @@ class TripletRecord:
     hq: str
     lr: str
     split: str
+    media_type: str
+    frame_start: int | None = None
+    frame_end: int | None = None
+    frame_count: int | None = None
+    frame_digits: int | None = None
+
+
+@dataclass(frozen=True)
+class FrameSequence:
+    pattern: str
+    indices: tuple[int, ...]
+    frame_digits: int
+
+    @property
+    def contiguous(self) -> bool:
+        if not self.indices:
+            return False
+        return self.indices == tuple(range(self.indices[0], self.indices[-1] + 1))
 
 
 def parse_extensions(value: str | Iterable[str]) -> tuple[str, ...]:
-    if isinstance(value, str):
-        values = value.split(",")
-    else:
-        values = list(value)
-    normalized = []
+    values = value.split(",") if isinstance(value, str) else list(value)
+    normalized: list[str] = []
     for extension in values:
         extension = str(extension).strip().lower()
         if not extension:
@@ -69,49 +80,166 @@ def parse_extensions(value: str | Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(normalized))
 
 
-def sample_key(path: Path, root: Path, mode: str) -> str:
-    if mode == "relative_stem":
-        return path.relative_to(root).with_suffix("").as_posix()
-    if mode == "basename_stem":
-        return path.stem
-    raise ValueError(f"Unsupported match mode: {mode}")
+def compile_frame_regex(value: str) -> Pattern[str]:
+    try:
+        pattern = re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"Invalid frame regex {value!r}: {exc}") from exc
+    if not {"clip", "frame"}.issubset(pattern.groupindex):
+        raise ValueError(
+            "Frame regex must define named groups (?P<clip>...) and (?P<frame>...)"
+        )
+    return pattern
 
 
-def index_media(
+def logical_key(parent: Path, root: Path, clip: str, match_mode: str) -> str:
+    if match_mode == "basename_stem":
+        return clip
+    if match_mode != "relative_stem":
+        raise ValueError(f"Unsupported match mode: {match_mode}")
+    relative_parent = parent.relative_to(root)
+    if relative_parent == Path("."):
+        return clip
+    return (relative_parent / clip).as_posix()
+
+
+def _raise_duplicates(
+    root: Path,
+    duplicates: dict[str, list[Path]],
+    match_mode: str,
+) -> None:
+    preview = {
+        key: [str(path) for path in paths]
+        for key, paths in list(sorted(duplicates.items()))[:10]
+    }
+    raise ValueError(
+        f"Duplicate match keys under {root} using mode={match_mode}: "
+        f"{json.dumps(preview, indent=2)}"
+    )
+
+
+def index_videos(
     root: Path,
     *,
     extensions: tuple[str, ...],
     match_mode: str,
 ) -> dict[str, Path]:
     root = root.resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Dataset root is not a directory: {root}")
-
     index: dict[str, Path] = {}
     duplicates: dict[str, list[Path]] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in extensions:
             continue
-        key = sample_key(path, root, match_mode)
+        key = logical_key(path.parent, root, path.stem, match_mode)
         if key in index:
-            duplicates.setdefault(key, [index[key]]).append(path)
+            duplicates.setdefault(key, [index[key]]).append(path.resolve())
         else:
             index[key] = path.resolve()
-
     if duplicates:
-        preview = {
-            key: [str(path) for path in paths]
-            for key, paths in list(sorted(duplicates.items()))[:10]
-        }
-        raise ValueError(
-            f"Duplicate match keys under {root} using mode={match_mode}: "
-            f"{json.dumps(preview, indent=2)}"
-        )
-    if not index:
-        raise ValueError(
-            f"No media files found under {root} with extensions={extensions}"
-        )
+        _raise_duplicates(root, duplicates, match_mode)
     return index
+
+
+def index_frame_sequences(
+    root: Path,
+    *,
+    extensions: tuple[str, ...],
+    match_mode: str,
+    frame_regex: Pattern[str],
+) -> dict[str, FrameSequence]:
+    root = root.resolve()
+    grouped: dict[str, list[tuple[int, str, Path]]] = {}
+    unmatched: list[str] = []
+
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in extensions:
+            continue
+        match = frame_regex.fullmatch(path.stem)
+        if match is None:
+            if len(unmatched) < 20:
+                unmatched.append(str(path))
+            continue
+        clip = match.group("clip")
+        frame_text = match.group("frame")
+        key = logical_key(path.parent, root, clip, match_mode)
+        grouped.setdefault(key, []).append((int(frame_text), frame_text, path.resolve()))
+
+    if not grouped:
+        detail = f" unmatched_examples={unmatched}" if unmatched else ""
+        raise ValueError(
+            f"No frame sequences found under {root} using regex={frame_regex.pattern!r}."
+            f"{detail}"
+        )
+
+    index: dict[str, FrameSequence] = {}
+    duplicate_frames: dict[str, list[Path]] = {}
+    for key, rows in sorted(grouped.items()):
+        widths = {len(frame_text) for _, frame_text, _ in rows}
+        suffixes = {path.suffix.lower() for _, _, path in rows}
+        if len(widths) != 1 or len(suffixes) != 1:
+            raise ValueError(
+                f"Sequence {key!r} mixes frame widths or extensions: "
+                f"widths={sorted(widths)}, extensions={sorted(suffixes)}"
+            )
+
+        by_index: dict[int, Path] = {}
+        for frame_index, _, path in rows:
+            if frame_index in by_index:
+                duplicate_frames.setdefault(key, [by_index[frame_index]]).append(path)
+            else:
+                by_index[frame_index] = path
+        if key in duplicate_frames:
+            continue
+
+        first_path = rows[0][2]
+        first_match = frame_regex.fullmatch(first_path.stem)
+        assert first_match is not None
+        clip = first_match.group("clip")
+        digits = next(iter(widths))
+        extension = next(iter(suffixes))
+        pattern = first_path.parent / f"{clip}_{{frame:0{digits}d}}{extension}"
+        index[key] = FrameSequence(
+            pattern=str(pattern),
+            indices=tuple(sorted(by_index)),
+            frame_digits=digits,
+        )
+
+    if duplicate_frames:
+        _raise_duplicates(root, duplicate_frames, match_mode)
+    return index
+
+
+def detect_root_mode(
+    root: Path,
+    *,
+    video_extensions: tuple[str, ...],
+    image_extensions: tuple[str, ...],
+) -> str:
+    root = root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset root is not a directory: {root}")
+
+    has_video = False
+    has_image = False
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        has_video = has_video or suffix in video_extensions
+        has_image = has_image or suffix in image_extensions
+        if has_video and has_image:
+            break
+
+    if has_video and has_image:
+        raise ValueError(
+            f"Dataset root contains both videos and images: {root}. "
+            "Pass --media-mode video or --media-mode frames explicitly."
+        )
+    if has_video:
+        return "video"
+    if has_image:
+        return "frames"
+    raise ValueError(f"No supported media files found under {root}")
 
 
 def deterministic_split(
@@ -140,25 +268,68 @@ def build_manifest(
     hr_root: Path,
     hq_root: Path,
     lr_root: Path,
-    extensions: tuple[str, ...] = DEFAULT_EXTENSIONS,
+    video_extensions: tuple[str, ...] = DEFAULT_VIDEO_EXTENSIONS,
+    image_extensions: tuple[str, ...] = DEFAULT_IMAGE_EXTENSIONS,
+    media_mode: str = "auto",
+    frame_regex: str = DEFAULT_FRAME_REGEX,
     match_mode: str = "relative_stem",
     seed: int = 0,
     val_fraction: float = 0.05,
     test_fraction: float = 0.0,
     strict: bool = False,
 ) -> tuple[list[TripletRecord], dict[str, object]]:
-    extensions = parse_extensions(extensions)
-    indices = {
-        "hr": index_media(
-            hr_root, extensions=extensions, match_mode=match_mode
-        ),
-        "hq": index_media(
-            hq_root, extensions=extensions, match_mode=match_mode
-        ),
-        "lr": index_media(
-            lr_root, extensions=extensions, match_mode=match_mode
-        ),
+    roots = {
+        "hr": hr_root.resolve(),
+        "hq": hq_root.resolve(),
+        "lr": lr_root.resolve(),
     }
+    video_extensions = parse_extensions(video_extensions)
+    image_extensions = parse_extensions(image_extensions)
+
+    if media_mode not in {"auto", "video", "frames"}:
+        raise ValueError(f"Unsupported media mode: {media_mode}")
+    if media_mode == "auto":
+        detected = {
+            name: detect_root_mode(
+                root,
+                video_extensions=video_extensions,
+                image_extensions=image_extensions,
+            )
+            for name, root in roots.items()
+        }
+        if len(set(detected.values())) != 1:
+            raise ValueError(f"Dataset roots use different media modes: {detected}")
+        resolved_mode = next(iter(detected.values()))
+    else:
+        resolved_mode = media_mode
+        for root in roots.values():
+            if not root.is_dir():
+                raise FileNotFoundError(f"Dataset root is not a directory: {root}")
+
+    if resolved_mode == "video":
+        indices: dict[str, dict[str, object]] = {
+            name: index_videos(
+                root,
+                extensions=video_extensions,
+                match_mode=match_mode,
+            )
+            for name, root in roots.items()
+        }
+    else:
+        compiled_regex = compile_frame_regex(frame_regex)
+        indices = {
+            name: index_frame_sequences(
+                root,
+                extensions=image_extensions,
+                match_mode=match_mode,
+                frame_regex=compiled_regex,
+            )
+            for name, root in roots.items()
+        }
+
+    if any(not index for index in indices.values()):
+        counts = {name: len(index) for name, index in indices.items()}
+        raise ValueError(f"One or more roots contain no usable clips: {counts}")
 
     all_keys = set().union(*(set(index) for index in indices.values()))
     common_keys = set.intersection(*(set(index) for index in indices.values()))
@@ -173,9 +344,51 @@ def build_manifest(
             f"missing_counts={counts}"
         )
 
-    records = []
+    records: list[TripletRecord] = []
     split_counts = {"train": 0, "val": 0, "test": 0}
+    invalid_sequences: dict[str, str] = {}
+    frame_counts: list[int] = []
+
     for key in sorted(common_keys):
+        frame_start = frame_end = frame_count = frame_digits = None
+        if resolved_mode == "frames":
+            sequences = {
+                name: index[key]
+                for name, index in indices.items()
+            }
+            assert all(isinstance(sequence, FrameSequence) for sequence in sequences.values())
+            sequence_values = list(sequences.values())
+            non_contiguous = [
+                name
+                for name, sequence in sequences.items()
+                if not sequence.contiguous
+            ]
+            same_indices = len({sequence.indices for sequence in sequence_values}) == 1
+            same_digits = len({sequence.frame_digits for sequence in sequence_values}) == 1
+            if non_contiguous or not same_indices or not same_digits:
+                reason = (
+                    f"non_contiguous={non_contiguous}, "
+                    f"same_indices={same_indices}, same_digits={same_digits}"
+                )
+                invalid_sequences[key] = reason
+                if strict:
+                    raise ValueError(f"Frame sequence alignment failed for {key!r}: {reason}")
+                continue
+
+            shared_indices = sequence_values[0].indices
+            frame_start = shared_indices[0]
+            frame_end = shared_indices[-1]
+            frame_count = len(shared_indices)
+            frame_digits = sequence_values[0].frame_digits
+            frame_counts.append(frame_count)
+            hr_value = sequences["hr"].pattern
+            hq_value = sequences["hq"].pattern
+            lr_value = sequences["lr"].pattern
+        else:
+            hr_value = str(indices["hr"][key])
+            hq_value = str(indices["hq"][key])
+            lr_value = str(indices["lr"][key])
+
         split = deterministic_split(
             key,
             seed=seed,
@@ -186,19 +399,28 @@ def build_manifest(
         records.append(
             TripletRecord(
                 sample_id=key,
-                hr=str(indices["hr"][key]),
-                hq=str(indices["hq"][key]),
-                lr=str(indices["lr"][key]),
+                hr=hr_value,
+                hq=hq_value,
+                lr=lr_value,
                 split=split,
+                media_type=resolved_mode,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                frame_count=frame_count,
+                frame_digits=frame_digits,
             )
         )
 
     summary: dict[str, object] = {
-        "hr_root": str(hr_root.resolve()),
-        "hq_root": str(hq_root.resolve()),
-        "lr_root": str(lr_root.resolve()),
+        "manifest_version": 2,
+        "hr_root": str(roots["hr"]),
+        "hq_root": str(roots["hq"]),
+        "lr_root": str(roots["lr"]),
+        "media_mode": resolved_mode,
         "match_mode": match_mode,
-        "extensions": list(extensions),
+        "video_extensions": list(video_extensions),
+        "image_extensions": list(image_extensions),
+        "frame_regex": frame_regex if resolved_mode == "frames" else None,
         "seed": int(seed),
         "val_fraction": float(val_fraction),
         "test_fraction": float(test_fraction),
@@ -213,7 +435,17 @@ def build_manifest(
         "missing_examples": {
             name: keys[:20] for name, keys in missing.items()
         },
+        "invalid_sequence_count": len(invalid_sequences),
+        "invalid_sequence_examples": dict(
+            list(sorted(invalid_sequences.items()))[:20]
+        ),
     }
+    if frame_counts:
+        summary["frame_count_stats"] = {
+            "min": min(frame_counts),
+            "max": max(frame_counts),
+            "total": sum(frame_counts),
+        }
     return records, summary
 
 
@@ -226,7 +458,12 @@ def write_manifest(
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(asdict(record), sort_keys=True) + "\n")
+            payload = {
+                key: value
+                for key, value in asdict(record).items()
+                if value is not None
+            }
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
     summary_path = output.with_suffix(output.suffix + ".summary.json")
     summary_path.write_text(
@@ -242,14 +479,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--media-mode",
+        choices=("auto", "video", "frames"),
+        default="auto",
+        help="Auto-detect encoded videos or image-frame sequences",
+    )
+    parser.add_argument(
         "--match-mode",
         choices=("relative_stem", "basename_stem"),
         default="relative_stem",
     )
     parser.add_argument(
-        "--extensions",
-        default=",".join(DEFAULT_EXTENSIONS),
-        help="Comma-separated media extensions",
+        "--video-extensions",
+        default=",".join(DEFAULT_VIDEO_EXTENSIONS),
+        help="Comma-separated encoded-video extensions",
+    )
+    parser.add_argument(
+        "--image-extensions",
+        default=",".join(DEFAULT_IMAGE_EXTENSIONS),
+        help="Comma-separated image extensions",
+    )
+    parser.add_argument(
+        "--frame-regex",
+        default=DEFAULT_FRAME_REGEX,
+        help=(
+            "Regex applied to each image stem. It must define named groups "
+            "'clip' and 'frame'."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.05)
@@ -257,7 +513,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Fail if any logical clip is missing from one of the three roots",
+        help=(
+            "Fail on missing triplets, non-contiguous frame indices, or "
+            "mismatched HR/HQ/LR frame-index sets"
+        ),
     )
     return parser.parse_args()
 
@@ -268,7 +527,10 @@ def main() -> None:
         hr_root=args.hr_root,
         hq_root=args.hq_root,
         lr_root=args.lr_root,
-        extensions=parse_extensions(args.extensions),
+        video_extensions=parse_extensions(args.video_extensions),
+        image_extensions=parse_extensions(args.image_extensions),
+        media_mode=args.media_mode,
+        frame_regex=args.frame_regex,
         match_mode=args.match_mode,
         seed=args.seed,
         val_fraction=args.val_fraction,
@@ -276,7 +538,7 @@ def main() -> None:
         strict=args.strict,
     )
     if not records:
-        raise RuntimeError("No complete HR/HQ/LR triplets were found")
+        raise RuntimeError("No complete aligned HR/HQ/LR triplets were found")
     write_manifest(records, summary, args.output)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
