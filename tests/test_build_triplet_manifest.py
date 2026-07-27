@@ -84,6 +84,55 @@ class BuildTripletManifestTest(unittest.TestCase):
             self.assertTrue(first.hr.endswith("video1_comp2_{frame:06d}.png"))
             self.assertEqual(summary["media_mode"], "frames")
 
+    def test_text_suffix_is_preserved_in_frame_pattern(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self._make_roots(Path(tmp))
+            for frame in range(2):
+                for dataset_root in roots.values():
+                    self._touch(dataset_root / f"video1_comp2_{frame:06d}_text.png")
+
+            regex = r"^(?P<clip>.+)_(?P<frame>\d{6})_text$"
+            records, summary = _TOOL.build_manifest(
+                hr_root=roots["hr"],
+                hq_root=roots["hq"],
+                lr_root=roots["lr"],
+                media_mode="frames",
+                frame_regex=regex,
+                val_fraction=0.0,
+                strict=True,
+            )
+
+            self.assertEqual(records[0].sample_id, "video1_comp2")
+            self.assertTrue(
+                records[0].lr.endswith("video1_comp2_{frame:06d}_text.png")
+            )
+            self.assertEqual(summary["frame_regexes"]["lr"], regex)
+
+    def test_per_root_regex_maps_plain_targets_to_text_lr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self._make_roots(Path(tmp))
+            for frame in range(3):
+                self._touch(roots["hr"] / f"video1_comp2_{frame:06d}.png")
+                self._touch(roots["hq"] / f"video1_comp2_{frame:06d}.png")
+                self._touch(roots["lr"] / f"video1_comp2_{frame:06d}_text.png")
+
+            text_regex = r"^(?P<clip>.+)_(?P<frame>\d{6})_text$"
+            records, summary = _TOOL.build_manifest(
+                hr_root=roots["hr"],
+                hq_root=roots["hq"],
+                lr_root=roots["lr"],
+                media_mode="frames",
+                lr_frame_regex=text_regex,
+                val_fraction=0.0,
+                strict=True,
+            )
+
+            record = records[0]
+            self.assertTrue(record.hr.endswith("video1_comp2_{frame:06d}.png"))
+            self.assertTrue(record.hq.endswith("video1_comp2_{frame:06d}.png"))
+            self.assertTrue(record.lr.endswith("video1_comp2_{frame:06d}_text.png"))
+            self.assertEqual(summary["frame_regexes"]["lr"], text_regex)
+
     def test_nested_frame_sequences_keep_relative_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
             roots = self._make_roots(Path(tmp))
@@ -229,6 +278,7 @@ class BuildTripletManifestTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--media-mode", result.stdout)
         self.assertIn("--frame-regex", result.stdout)
+        self.assertIn("--lr-frame-regex", result.stdout)
 
 
 if __name__ == "__main__":
