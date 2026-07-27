@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Build a deterministic manifest for aligned HR/HQ/LR media triplets.
+"""Build deterministic manifests for aligned HR/HQ/LR media triplets.
 
-Each dataset root may contain either encoded videos or image-frame sequences.
-Image sequences are grouped with a configurable regex containing named ``clip``
-and ``frame`` groups. The default matches names such as
-``video1_comp2_000123.png``. Per-root regex overrides support asymmetric naming,
-for example clean HR/HQ frames and ``*_text.png`` LR frames.
+The three dataset roots may contain either encoded videos or image-frame
+sequences. Image sequences are grouped using regular expressions with named
+``clip`` and ``frame`` groups. The default expression matches names such as
+``video1_comp2_000123.png``. Per-root overrides support asymmetric names, for
+example clean HR/HQ frames and ``*_text.png`` LR frames.
 
-This tool only inspects paths and frame indices. Pixel-level temporal, geometric,
-and photometric alignment is handled by ``tools/audit_triplet_alignment.py``.
+For datasets that already provide train/validation/test directories, use
+``--split-all`` so every record receives the directory's official split. If it
+is omitted, samples are divided deterministically by hashing ``sample_id``.
+
+This tool only inspects paths and frame indices. Pixel-level temporal,
+geometric, and photometric alignment belongs in
+``tools/audit_triplet_alignment.py``.
 """
 
 from __future__ import annotations
@@ -38,6 +43,9 @@ DEFAULT_IMAGE_EXTENSIONS = (
     ".bmp",
 )
 DEFAULT_FRAME_REGEX = r"^(?P<clip>.+)_(?P<frame>\d{6})$"
+VALID_MEDIA_MODES = ("auto", "video", "frames")
+VALID_MATCH_MODES = ("relative_stem", "basename_stem")
+VALID_SPLITS = ("train", "val", "test")
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,14 @@ class FrameSequence:
         return self.indices == tuple(range(self.indices[0], self.indices[-1] + 1))
 
 
+@dataclass(frozen=True)
+class FrameIndexResult:
+    sequences: dict[str, FrameSequence]
+    matched_file_count: int
+    unmatched_file_count: int
+    unmatched_examples: tuple[str, ...]
+
+
 def parse_extensions(value: str | Iterable[str]) -> tuple[str, ...]:
     values = value.split(",") if isinstance(value, str) else list(value)
     normalized: list[str] = []
@@ -89,7 +105,8 @@ def compile_frame_regex(value: str) -> Pattern[str]:
         raise ValueError(f"Invalid frame regex {value!r}: {exc}") from exc
     if not {"clip", "frame"}.issubset(pattern.groupindex):
         raise ValueError(
-            "Frame regex must define named groups (?P<clip>...) and (?P<frame>...)"
+            "Frame regex must define named groups (?P<clip>...) and "
+            "(?P<frame>...)"
         )
     return pattern
 
@@ -143,7 +160,7 @@ def index_videos(
 
 
 def _frame_pattern(path: Path, match: re.Match[str], frame_digits: int) -> str:
-    """Replace exactly the matched frame-number span and preserve all suffixes."""
+    """Replace exactly the frame-number span while preserving other suffixes."""
     frame_start, frame_end = match.span("frame")
     stem = path.stem
     pattern_stem = (
@@ -160,19 +177,23 @@ def index_frame_sequences(
     extensions: tuple[str, ...],
     match_mode: str,
     frame_regex: Pattern[str],
-) -> dict[str, FrameSequence]:
+) -> FrameIndexResult:
     root = root.resolve()
     grouped: dict[str, list[tuple[int, str, Path]]] = {}
     unmatched: list[str] = []
+    matched_file_count = 0
+    unmatched_file_count = 0
 
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in extensions:
             continue
         match = frame_regex.fullmatch(path.stem)
         if match is None:
+            unmatched_file_count += 1
             if len(unmatched) < 20:
-                unmatched.append(str(path))
+                unmatched.append(str(path.resolve()))
             continue
+        matched_file_count += 1
         clip = match.group("clip")
         frame_text = match.group("frame")
         key = logical_key(path.parent, root, clip, match_mode)
@@ -181,8 +202,8 @@ def index_frame_sequences(
     if not grouped:
         detail = f" unmatched_examples={unmatched}" if unmatched else ""
         raise ValueError(
-            f"No frame sequences found under {root} using regex={frame_regex.pattern!r}."
-            f"{detail}"
+            f"No frame sequences found under {root} using regex="
+            f"{frame_regex.pattern!r}.{detail}"
         )
 
     index: dict[str, FrameSequence] = {}
@@ -217,7 +238,13 @@ def index_frame_sequences(
 
     if duplicate_frames:
         _raise_duplicates(root, duplicate_frames, match_mode)
-    return index
+
+    return FrameIndexResult(
+        sequences=index,
+        matched_file_count=matched_file_count,
+        unmatched_file_count=unmatched_file_count,
+        unmatched_examples=tuple(unmatched),
+    )
 
 
 def detect_root_mode(
@@ -274,6 +301,28 @@ def deterministic_split(
     return "train"
 
 
+def assign_split(
+    sample_id: str,
+    *,
+    split_all: str | None,
+    seed: int,
+    val_fraction: float,
+    test_fraction: float,
+) -> str:
+    if split_all is not None:
+        if split_all not in VALID_SPLITS:
+            raise ValueError(
+                f"Unsupported fixed split {split_all!r}; expected one of {VALID_SPLITS}"
+            )
+        return split_all
+    return deterministic_split(
+        sample_id,
+        seed=seed,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )
+
+
 def _resolve_frame_regexes(
     frame_regex: str,
     hr_frame_regex: str | None,
@@ -300,6 +349,7 @@ def build_manifest(
     hq_frame_regex: str | None = None,
     lr_frame_regex: str | None = None,
     match_mode: str = "relative_stem",
+    split_all: str | None = None,
     seed: int = 0,
     val_fraction: float = 0.05,
     test_fraction: float = 0.0,
@@ -313,8 +363,22 @@ def build_manifest(
     video_extensions = parse_extensions(video_extensions)
     image_extensions = parse_extensions(image_extensions)
 
-    if media_mode not in {"auto", "video", "frames"}:
+    if media_mode not in VALID_MEDIA_MODES:
         raise ValueError(f"Unsupported media mode: {media_mode}")
+    if match_mode not in VALID_MATCH_MODES:
+        raise ValueError(f"Unsupported match mode: {match_mode}")
+    if split_all is not None and split_all not in VALID_SPLITS:
+        raise ValueError(
+            f"Unsupported fixed split {split_all!r}; expected one of {VALID_SPLITS}"
+        )
+    if split_all is None:
+        deterministic_split(
+            "__split_validation__",
+            seed=seed,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+        )
+
     if media_mode == "auto":
         detected = {
             name: detect_root_mode(
@@ -334,6 +398,7 @@ def build_manifest(
                 raise FileNotFoundError(f"Dataset root is not a directory: {root}")
 
     frame_regexes: dict[str, str] | None = None
+    frame_scan: dict[str, FrameIndexResult] | None = None
     if resolved_mode == "video":
         indices: dict[str, dict[str, object]] = {
             name: index_videos(
@@ -354,7 +419,7 @@ def build_manifest(
             name: compile_frame_regex(value)
             for name, value in frame_regexes.items()
         }
-        indices = {
+        frame_scan = {
             name: index_frame_sequences(
                 root,
                 extensions=image_extensions,
@@ -362,6 +427,10 @@ def build_manifest(
                 frame_regex=compiled_regexes[name],
             )
             for name, root in roots.items()
+        }
+        indices = {
+            name: result.sequences
+            for name, result in frame_scan.items()
         }
 
     if any(not index for index in indices.values()):
@@ -382,7 +451,7 @@ def build_manifest(
         )
 
     records: list[TripletRecord] = []
-    split_counts = {"train": 0, "val": 0, "test": 0}
+    split_counts = {split: 0 for split in VALID_SPLITS}
     invalid_sequences: dict[str, str] = {}
     frame_counts: list[int] = []
 
@@ -409,7 +478,9 @@ def build_manifest(
                 )
                 invalid_sequences[key] = reason
                 if strict:
-                    raise ValueError(f"Frame sequence alignment failed for {key!r}: {reason}")
+                    raise ValueError(
+                        f"Frame sequence alignment failed for {key!r}: {reason}"
+                    )
                 continue
 
             shared_indices = sequence_values[0].indices
@@ -426,8 +497,9 @@ def build_manifest(
             hq_value = str(indices["hq"][key])
             lr_value = str(indices["lr"][key])
 
-        split = deterministic_split(
+        split = assign_split(
             key,
+            split_all=split_all,
             seed=seed,
             val_fraction=val_fraction,
             test_fraction=test_fraction,
@@ -448,8 +520,9 @@ def build_manifest(
             )
         )
 
+    split_strategy = "fixed" if split_all is not None else "deterministic_hash"
     summary: dict[str, object] = {
-        "manifest_version": 3,
+        "manifest_version": 4,
         "hr_root": str(roots["hr"]),
         "hq_root": str(roots["hq"]),
         "lr_root": str(roots["lr"]),
@@ -459,9 +532,11 @@ def build_manifest(
         "image_extensions": list(image_extensions),
         "frame_regex": frame_regex if resolved_mode == "frames" else None,
         "frame_regexes": frame_regexes,
-        "seed": int(seed),
-        "val_fraction": float(val_fraction),
-        "test_fraction": float(test_fraction),
+        "split_strategy": split_strategy,
+        "split_all": split_all,
+        "seed": int(seed) if split_all is None else None,
+        "val_fraction": float(val_fraction) if split_all is None else None,
+        "test_fraction": float(test_fraction) if split_all is None else None,
         "indexed_counts": {
             name: len(index) for name, index in indices.items()
         },
@@ -478,6 +553,15 @@ def build_manifest(
             list(sorted(invalid_sequences.items()))[:20]
         ),
     }
+    if frame_scan is not None:
+        summary["frame_scan"] = {
+            name: {
+                "matched_file_count": result.matched_file_count,
+                "unmatched_file_count": result.unmatched_file_count,
+                "unmatched_examples": list(result.unmatched_examples),
+            }
+            for name, result in frame_scan.items()
+        }
     if frame_counts:
         summary["frame_count_stats"] = {
             "min": min(frame_counts),
@@ -518,13 +602,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--media-mode",
-        choices=("auto", "video", "frames"),
+        choices=VALID_MEDIA_MODES,
         default="auto",
         help="Auto-detect encoded videos or image-frame sequences",
     )
     parser.add_argument(
         "--match-mode",
-        choices=("relative_stem", "basename_stem"),
+        choices=VALID_MATCH_MODES,
         default="relative_stem",
     )
     parser.add_argument(
@@ -554,9 +638,28 @@ def parse_args() -> argparse.Namespace:
                 "It must define named groups 'clip' and 'frame'."
             ),
         )
+    parser.add_argument(
+        "--split-all",
+        choices=VALID_SPLITS,
+        default=None,
+        help=(
+            "Assign every record to one official split and bypass hash-based "
+            "fractional splitting."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--val-fraction", type=float, default=0.05)
-    parser.add_argument("--test-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.05,
+        help="Hash-split validation fraction; ignored when --split-all is used",
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=0.0,
+        help="Hash-split test fraction; ignored when --split-all is used",
+    )
     parser.add_argument(
         "--strict",
         action="store_true",
@@ -582,6 +685,7 @@ def main() -> None:
         hq_frame_regex=args.hq_frame_regex,
         lr_frame_regex=args.lr_frame_regex,
         match_mode=args.match_mode,
+        split_all=args.split_all,
         seed=args.seed,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
