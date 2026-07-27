@@ -6,6 +6,12 @@ Frame sequences are grouped using regexes with named ``clip`` and ``frame``
 groups. The default matches ``video1_comp2_000123.png``; per-root overrides
 support asymmetric names such as clean HR/HQ frames and ``*_text.png`` LR.
 
+For interleaved names such as ``vid0_comp0_000000.png`` through
+``vid0_comp9_000009.png``, pass ``--group-components``. The component suffix is
+removed from the logical clip ID and, because the component changes with the
+frame, the manifest stores explicit ordered frame paths instead of inventing an
+invalid single path pattern.
+
 For datasets with official train/validation/test directories, use
 ``--split-all``. Otherwise records are divided deterministically by sample ID.
 This tool inspects paths and frame indices only; pixel alignment is audited by
@@ -25,6 +31,7 @@ from typing import Iterable, Pattern
 DEFAULT_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
 DEFAULT_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 DEFAULT_FRAME_REGEX = r"^(?P<clip>.+)_(?P<frame>\d{6})$"
+DEFAULT_COMPONENT_SUFFIX_REGEX = r"^(?P<clip>.+)_comp(?P<component>\d+)$"
 VALID_MEDIA_MODES = ("auto", "video", "frames")
 VALID_MATCH_MODES = ("relative_stem", "basename_stem")
 VALID_SPLITS = ("train", "val", "test")
@@ -33,22 +40,27 @@ VALID_SPLITS = ("train", "val", "test")
 @dataclass(frozen=True)
 class TripletRecord:
     sample_id: str
-    hr: str
-    hq: str
-    lr: str
     split: str
     media_type: str
+    hr: str | None = None
+    hq: str | None = None
+    lr: str | None = None
     frame_start: int | None = None
     frame_end: int | None = None
     frame_count: int | None = None
     frame_digits: int | None = None
     frame_contiguous: bool | None = None
     frame_indices: tuple[int, ...] | None = None
+    frame_path_mode: str | None = None
+    hr_frames: tuple[str, ...] | None = None
+    hq_frames: tuple[str, ...] | None = None
+    lr_frames: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
 class FrameSequence:
-    pattern: str
+    pattern: str | None
+    paths: tuple[str, ...]
     indices: tuple[int, ...]
     frame_digits: int
 
@@ -91,6 +103,19 @@ def compile_frame_regex(value: str) -> Pattern[str]:
         raise ValueError(
             "Frame regex must define named groups (?P<clip>...) and "
             "(?P<frame>...)"
+        )
+    return pattern
+
+
+def compile_component_suffix_regex(value: str) -> Pattern[str]:
+    try:
+        pattern = re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"Invalid component suffix regex {value!r}: {exc}") from exc
+    if not {"clip", "component"}.issubset(pattern.groupindex):
+        raise ValueError(
+            "Component suffix regex must define named groups (?P<clip>...) and "
+            "(?P<component>...)"
         )
     return pattern
 
@@ -152,15 +177,45 @@ def _frame_pattern(path: Path, match: re.Match[str], frame_digits: int) -> str:
     return str(path.parent / f"{pattern_stem}{path.suffix.lower()}")
 
 
+def _logical_clip(
+    match: re.Match[str],
+    *,
+    group_components: bool,
+    component_suffix_regex: Pattern[str],
+    path: Path,
+) -> str:
+    clip = match.group("clip")
+    if not group_components:
+        return clip
+
+    component_from_frame_regex = match.groupdict().get("component")
+    if component_from_frame_regex is not None:
+        return clip
+
+    component_match = component_suffix_regex.fullmatch(clip)
+    if component_match is None:
+        raise ValueError(
+            f"--group-components was requested, but matched clip {clip!r} from "
+            f"{path} does not match component suffix regex "
+            f"{component_suffix_regex.pattern!r}"
+        )
+    return component_match.group("clip")
+
+
 def index_frame_sequences(
     root: Path,
     *,
     extensions: tuple[str, ...],
     match_mode: str,
     frame_regex: Pattern[str],
+    group_components: bool = False,
+    component_suffix_regex: Pattern[str] | None = None,
 ) -> FrameIndexResult:
     root = root.resolve()
-    grouped: dict[str, list[tuple[int, str, Path]]] = {}
+    component_suffix_regex = component_suffix_regex or compile_component_suffix_regex(
+        DEFAULT_COMPONENT_SUFFIX_REGEX
+    )
+    grouped: dict[str, list[tuple[int, str, Path, str]]] = {}
     unmatched: list[str] = []
     matched_file_count = 0
     unmatched_file_count = 0
@@ -174,11 +229,24 @@ def index_frame_sequences(
             if len(unmatched) < 20:
                 unmatched.append(str(path.resolve()))
             continue
+
         matched_file_count += 1
-        clip = match.group("clip")
         frame_text = match.group("frame")
+        clip = _logical_clip(
+            match,
+            group_components=group_components,
+            component_suffix_regex=component_suffix_regex,
+            path=path,
+        )
         key = logical_key(path.parent, root, clip, match_mode)
-        grouped.setdefault(key, []).append((int(frame_text), frame_text, path.resolve()))
+        grouped.setdefault(key, []).append(
+            (
+                int(frame_text),
+                frame_text,
+                path.resolve(),
+                _frame_pattern(path.resolve(), match, len(frame_text)),
+            )
+        )
 
     if not grouped:
         detail = f" unmatched_examples={unmatched}" if unmatched else ""
@@ -190,31 +258,32 @@ def index_frame_sequences(
     sequences: dict[str, FrameSequence] = {}
     duplicate_frames: dict[str, list[Path]] = {}
     for key, rows in sorted(grouped.items()):
-        widths = {len(frame_text) for _, frame_text, _ in rows}
-        suffixes = {path.suffix.lower() for _, _, path in rows}
+        widths = {len(frame_text) for _, frame_text, _, _ in rows}
+        suffixes = {path.suffix.lower() for _, _, path, _ in rows}
         if len(widths) != 1 or len(suffixes) != 1:
             raise ValueError(
                 f"Sequence {key!r} mixes frame widths or extensions: "
                 f"widths={sorted(widths)}, extensions={sorted(suffixes)}"
             )
 
-        by_index: dict[int, Path] = {}
-        for frame_index, _, path in rows:
+        by_index: dict[int, tuple[Path, str]] = {}
+        for frame_index, _, path, candidate_pattern in rows:
             if frame_index in by_index:
-                duplicate_frames.setdefault(key, [by_index[frame_index]]).append(path)
+                duplicate_frames.setdefault(key, [by_index[frame_index][0]]).append(path)
             else:
-                by_index[frame_index] = path
+                by_index[frame_index] = (path, candidate_pattern)
         if key in duplicate_frames:
             continue
 
-        first_path = rows[0][2]
-        first_match = frame_regex.fullmatch(first_path.stem)
-        assert first_match is not None
-        digits = next(iter(widths))
+        ordered_indices = tuple(sorted(by_index))
+        ordered_paths = tuple(str(by_index[index][0]) for index in ordered_indices)
+        candidate_patterns = {by_index[index][1] for index in ordered_indices}
+        pattern = next(iter(candidate_patterns)) if len(candidate_patterns) == 1 else None
         sequences[key] = FrameSequence(
-            pattern=_frame_pattern(first_path, first_match, digits),
-            indices=tuple(sorted(by_index)),
-            frame_digits=digits,
+            pattern=pattern,
+            paths=ordered_paths,
+            indices=ordered_indices,
+            frame_digits=next(iter(widths)),
         )
 
     if duplicate_frames:
@@ -330,6 +399,8 @@ def build_manifest(
     hq_frame_regex: str | None = None,
     lr_frame_regex: str | None = None,
     match_mode: str = "relative_stem",
+    group_components: bool = False,
+    component_suffix_regex: str = DEFAULT_COMPONENT_SUFFIX_REGEX,
     split_all: str | None = None,
     seed: int = 0,
     val_fraction: float = 0.05,
@@ -355,6 +426,7 @@ def build_manifest(
             val_fraction=val_fraction,
             test_fraction=test_fraction,
         )
+    compiled_component_suffix = compile_component_suffix_regex(component_suffix_regex)
 
     if media_mode == "auto":
         detected = {
@@ -377,6 +449,8 @@ def build_manifest(
     frame_regexes: dict[str, str] | None = None
     frame_scan: dict[str, FrameIndexResult] | None = None
     if resolved_mode == "video":
+        if group_components:
+            raise ValueError("--group-components is only valid with frame sequences")
         indices: dict[str, dict[str, object]] = {
             name: index_videos(root, extensions=video_extensions, match_mode=match_mode)
             for name, root in roots.items()
@@ -394,6 +468,8 @@ def build_manifest(
                 extensions=image_extensions,
                 match_mode=match_mode,
                 frame_regex=compiled_regexes[name],
+                group_components=group_components,
+                component_suffix_regex=compiled_component_suffix,
             )
             for name, root in roots.items()
         }
@@ -418,11 +494,10 @@ def build_manifest(
     invalid_sequences: dict[str, str] = {}
     non_contiguous_sequences: dict[str, dict[str, object]] = {}
     frame_counts: list[int] = []
+    frame_path_mode_counts = {"pattern": 0, "explicit": 0}
 
     for key in sorted(common_keys):
-        frame_start = frame_end = frame_count = frame_digits = None
-        frame_contiguous = None
-        frame_indices = None
+        record_kwargs: dict[str, object] = {}
         if resolved_mode == "frames":
             sequences = {name: index[key] for name, index in indices.items()}
             assert all(isinstance(sequence, FrameSequence) for sequence in sequences.values())
@@ -441,33 +516,53 @@ def build_manifest(
             shared_indices = sequence_values[0].indices
             shared_contiguous = sequence_values[0].contiguous
             if not shared_contiguous and not strict:
-                reason = (
+                invalid_sequences[key] = (
                     "synchronized_non_contiguous=True; rerun with --strict to "
                     "preserve explicit frame_indices"
                 )
-                invalid_sequences[key] = reason
                 continue
-            frame_start = shared_indices[0]
-            frame_end = shared_indices[-1]
-            frame_count = len(shared_indices)
-            frame_digits = sequence_values[0].frame_digits
-            frame_contiguous = shared_contiguous
-            if not frame_contiguous:
-                frame_indices = shared_indices
+
+            use_explicit_paths = any(sequence.pattern is None for sequence in sequence_values)
+            path_mode = "explicit" if use_explicit_paths else "pattern"
+            frame_path_mode_counts[path_mode] += 1
+            record_kwargs.update(
+                frame_start=shared_indices[0],
+                frame_end=shared_indices[-1],
+                frame_count=len(shared_indices),
+                frame_digits=sequence_values[0].frame_digits,
+                frame_contiguous=shared_contiguous,
+                frame_path_mode=path_mode,
+            )
+            if use_explicit_paths:
+                record_kwargs.update(
+                    frame_indices=shared_indices,
+                    hr_frames=sequences["hr"].paths,
+                    hq_frames=sequences["hq"].paths,
+                    lr_frames=sequences["lr"].paths,
+                )
+            else:
+                record_kwargs.update(
+                    hr=sequences["hr"].pattern,
+                    hq=sequences["hq"].pattern,
+                    lr=sequences["lr"].pattern,
+                )
+                if not shared_contiguous:
+                    record_kwargs["frame_indices"] = shared_indices
+
+            if not shared_contiguous:
                 non_contiguous_sequences[key] = {
-                    "frame_count": frame_count,
-                    "frame_start": frame_start,
-                    "frame_end": frame_end,
+                    "frame_count": len(shared_indices),
+                    "frame_start": shared_indices[0],
+                    "frame_end": shared_indices[-1],
                     "index_preview": list(shared_indices[:20]),
                 }
-            frame_counts.append(frame_count)
-            hr_value = sequences["hr"].pattern
-            hq_value = sequences["hq"].pattern
-            lr_value = sequences["lr"].pattern
+            frame_counts.append(len(shared_indices))
         else:
-            hr_value = str(indices["hr"][key])
-            hq_value = str(indices["hq"][key])
-            lr_value = str(indices["lr"][key])
+            record_kwargs.update(
+                hr=str(indices["hr"][key]),
+                hq=str(indices["hq"][key]),
+                lr=str(indices["lr"][key]),
+            )
 
         split = assign_split(
             key,
@@ -480,17 +575,9 @@ def build_manifest(
         records.append(
             TripletRecord(
                 sample_id=key,
-                hr=hr_value,
-                hq=hq_value,
-                lr=lr_value,
                 split=split,
                 media_type=resolved_mode,
-                frame_start=frame_start,
-                frame_end=frame_end,
-                frame_count=frame_count,
-                frame_digits=frame_digits,
-                frame_contiguous=frame_contiguous,
-                frame_indices=frame_indices,
+                **record_kwargs,
             )
         )
 
@@ -502,6 +589,8 @@ def build_manifest(
         "lr_root": str(roots["lr"]),
         "media_mode": resolved_mode,
         "match_mode": match_mode,
+        "group_components": bool(group_components),
+        "component_suffix_regex": component_suffix_regex if group_components else None,
         "video_extensions": list(video_extensions),
         "image_extensions": list(image_extensions),
         "frame_regex": frame_regex if resolved_mode == "frames" else None,
@@ -522,6 +611,7 @@ def build_manifest(
         "non_contiguous_sequence_examples": dict(
             list(sorted(non_contiguous_sequences.items()))[:20]
         ),
+        "frame_path_mode_counts": frame_path_mode_counts,
     }
     if frame_scan is not None:
         summary["frame_scan"] = {
@@ -605,6 +695,22 @@ def parse_args() -> argparse.Namespace:
             ),
         )
     parser.add_argument(
+        "--group-components",
+        action="store_true",
+        help=(
+            "Merge interleaved clip suffixes such as _comp0 ... _comp9 into one "
+            "logical sequence and store explicit ordered frame paths."
+        ),
+    )
+    parser.add_argument(
+        "--component-suffix-regex",
+        default=DEFAULT_COMPONENT_SUFFIX_REGEX,
+        help=(
+            "Regex applied to the captured clip when --group-components is used; "
+            "it must define named groups 'clip' and 'component'."
+        ),
+    )
+    parser.add_argument(
         "--split-all",
         choices=VALID_SPLITS,
         default=None,
@@ -651,6 +757,8 @@ def main() -> None:
         hq_frame_regex=args.hq_frame_regex,
         lr_frame_regex=args.lr_frame_regex,
         match_mode=args.match_mode,
+        group_components=args.group_components,
+        component_suffix_regex=args.component_suffix_regex,
         split_all=args.split_all,
         seed=args.seed,
         val_fraction=args.val_fraction,
