@@ -43,7 +43,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 hr_root=roots["hr"],
                 hq_root=roots["hq"],
                 lr_root=roots["lr"],
-                val_fraction=0.0,
+                split_all="train",
                 strict=True,
             )
 
@@ -52,8 +52,10 @@ class BuildTripletManifestTest(unittest.TestCase):
                 ["scene_a/clip_001", "scene_b/clip_002"],
             )
             self.assertTrue(all(record.media_type == "video" for record in records))
-            self.assertEqual(summary["triplet_count"], 2)
+            self.assertTrue(all(record.split == "train" for record in records))
+            self.assertEqual(summary["manifest_version"], 4)
             self.assertEqual(summary["media_mode"], "video")
+            self.assertEqual(summary["split_strategy"], "fixed")
 
     def test_frame_sequences_are_grouped_by_six_digit_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,7 +69,8 @@ class BuildTripletManifestTest(unittest.TestCase):
                 hr_root=roots["hr"],
                 hq_root=roots["hq"],
                 lr_root=roots["lr"],
-                val_fraction=0.0,
+                media_mode="frames",
+                split_all="train",
                 strict=True,
             )
 
@@ -82,7 +85,7 @@ class BuildTripletManifestTest(unittest.TestCase):
             self.assertEqual(first.frame_count, 3)
             self.assertEqual(first.frame_digits, 6)
             self.assertTrue(first.hr.endswith("video1_comp2_{frame:06d}.png"))
-            self.assertEqual(summary["media_mode"], "frames")
+            self.assertEqual(summary["frame_scan"]["hr"]["matched_file_count"], 6)
 
     def test_text_suffix_is_preserved_in_frame_pattern(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +101,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 lr_root=roots["lr"],
                 media_mode="frames",
                 frame_regex=regex,
-                val_fraction=0.0,
+                split_all="train",
                 strict=True,
             )
 
@@ -123,7 +126,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 lr_root=roots["lr"],
                 media_mode="frames",
                 lr_frame_regex=text_regex,
-                val_fraction=0.0,
+                split_all="train",
                 strict=True,
             )
 
@@ -132,6 +135,38 @@ class BuildTripletManifestTest(unittest.TestCase):
             self.assertTrue(record.hq.endswith("video1_comp2_{frame:06d}.png"))
             self.assertTrue(record.lr.endswith("video1_comp2_{frame:06d}_text.png"))
             self.assertEqual(summary["frame_regexes"]["lr"], text_regex)
+
+    def test_plain_and_text_files_can_share_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self._make_roots(Path(tmp))
+            for frame in range(2):
+                for dataset_root in roots.values():
+                    self._touch(dataset_root / f"clip_{frame:06d}.png")
+                    self._touch(dataset_root / f"clip_{frame:06d}_text.png")
+
+            plain, plain_summary = _TOOL.build_manifest(
+                hr_root=roots["hr"],
+                hq_root=roots["hq"],
+                lr_root=roots["lr"],
+                media_mode="frames",
+                split_all="train",
+                strict=True,
+            )
+            text_regex = r"^(?P<clip>.+)_(?P<frame>\d{6})_text$"
+            text, text_summary = _TOOL.build_manifest(
+                hr_root=roots["hr"],
+                hq_root=roots["hq"],
+                lr_root=roots["lr"],
+                media_mode="frames",
+                frame_regex=text_regex,
+                split_all="train",
+                strict=True,
+            )
+
+            self.assertEqual(len(plain), 1)
+            self.assertEqual(len(text), 1)
+            self.assertEqual(plain_summary["frame_scan"]["hr"]["unmatched_file_count"], 2)
+            self.assertEqual(text_summary["frame_scan"]["hr"]["unmatched_file_count"], 2)
 
     def test_nested_frame_sequences_keep_relative_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,7 +180,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 hq_root=roots["hq"],
                 lr_root=roots["lr"],
                 media_mode="frames",
-                val_fraction=0.0,
+                split_all="train",
                 strict=True,
             )
             self.assertEqual(records[0].sample_id, "scene_a/video1_comp2")
@@ -166,6 +201,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                     hq_root=roots["hq"],
                     lr_root=roots["lr"],
                     media_mode="frames",
+                    split_all="train",
                     strict=True,
                 )
 
@@ -183,7 +219,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 hq_root=roots["hq"],
                 lr_root=roots["lr"],
                 media_mode="frames",
-                val_fraction=0.0,
+                split_all="train",
                 strict=False,
             )
             self.assertEqual([record.sample_id for record in records], ["good"])
@@ -213,7 +249,7 @@ class BuildTripletManifestTest(unittest.TestCase):
                 hr_root=roots["hr"],
                 hq_root=roots["hq"],
                 lr_root=roots["lr"],
-                val_fraction=0.0,
+                split_all="train",
                 strict=False,
             )
 
@@ -237,7 +273,41 @@ class BuildTripletManifestTest(unittest.TestCase):
                     match_mode="basename_stem",
                 )
 
-    def test_split_is_deterministic_and_manifest_is_jsonl(self):
+    def test_fixed_val_split_marks_every_record_val(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self._make_roots(Path(tmp))
+            for index in range(5):
+                for dataset_root in roots.values():
+                    self._touch(dataset_root / f"clip_{index:03d}.mp4")
+
+            records, summary = _TOOL.build_manifest(
+                hr_root=roots["hr"],
+                hq_root=roots["hq"],
+                lr_root=roots["lr"],
+                split_all="val",
+                strict=True,
+            )
+
+            self.assertTrue(all(record.split == "val" for record in records))
+            self.assertEqual(summary["split_counts"], {"train": 0, "val": 5, "test": 0})
+            self.assertEqual(summary["split_strategy"], "fixed")
+            self.assertEqual(summary["split_all"], "val")
+            self.assertIsNone(summary["val_fraction"])
+
+    def test_invalid_fixed_split_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = self._make_roots(Path(tmp))
+            for dataset_root in roots.values():
+                self._touch(dataset_root / "clip.mp4")
+            with self.assertRaisesRegex(ValueError, "Unsupported fixed split"):
+                _TOOL.build_manifest(
+                    hr_root=roots["hr"],
+                    hq_root=roots["hq"],
+                    lr_root=roots["lr"],
+                    split_all="validation",
+                )
+
+    def test_hash_split_is_deterministic_and_manifest_is_jsonl(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             roots = self._make_roots(root)
@@ -258,6 +328,7 @@ class BuildTripletManifestTest(unittest.TestCase):
             second, _ = _TOOL.build_manifest(**kwargs)
             self.assertEqual(first, second)
             self.assertEqual(sum(first_summary["split_counts"].values()), 100)
+            self.assertEqual(first_summary["split_strategy"], "deterministic_hash")
 
             output = root / "manifests/triplets.jsonl"
             _TOOL.write_manifest(first, first_summary, output)
@@ -279,6 +350,7 @@ class BuildTripletManifestTest(unittest.TestCase):
         self.assertIn("--media-mode", result.stdout)
         self.assertIn("--frame-regex", result.stdout)
         self.assertIn("--lr-frame-regex", result.stdout)
+        self.assertIn("--split-all", result.stdout)
 
 
 if __name__ == "__main__":
