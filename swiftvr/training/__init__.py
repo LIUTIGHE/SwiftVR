@@ -2,6 +2,7 @@
 
 from .checkpoint import (
     capture_trainable_parameters,
+    cast_trainable_parameters,
     load_delta_checkpoint,
     parameter_update_summary,
     save_delta_checkpoint,
@@ -22,6 +23,7 @@ __all__ = [
     "SwiftVRTrainingForward",
     "WanShiftWindow2DTrainProcessor",
     "capture_trainable_parameters",
+    "cast_trainable_parameters",
     "decode_reae_clip",
     "encode_reae_clip",
     "forward_prompt_free_no_time_training",
