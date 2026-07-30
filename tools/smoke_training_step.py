@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
 """Run one real SwiftVR optimizer step and verify delta-checkpoint resume.
 
-This script extends ``smoke_training_forward.py`` from a gradient-only diagnostic
-to a complete one-step training transaction:
-
-1. load a folded prompt-free no-time base checkpoint;
-2. read one real aligned LR/HQ/HR batch;
-3. run forward and backward;
-4. apply one AdamW update;
-5. verify that trainable parameters changed finitely;
-6. save a lightweight delta checkpoint;
-7. perturb the model and restore model + optimizer state exactly.
-
-The default scope is adapter-only.  Full-transformer AdamW states for a 5B model
-are not expected to fit on a single 32GB V100; using a larger scope therefore
-requires the explicit ``--allow-large-optimizer`` acknowledgement.
+Frozen ReAE/DiT weights keep the folded checkpoint runtime dtype. Only trainable
+parameters are promoted to FP32 before AdamW construction, so optimizer moments
+and epsilon arithmetic are numerically stable on FP16-only GPUs such as V100.
+FP16 forward/backward additionally uses AMP GradScaler.
 """
 
 from __future__ import annotations
@@ -45,6 +35,7 @@ from swiftvr.models.transformer_prompt_free_no_time import (
 from swiftvr.training import (
     SwiftVRTrainingForward,
     capture_trainable_parameters,
+    cast_trainable_parameters,
     load_delta_checkpoint,
     parameter_update_summary,
     save_delta_checkpoint,
@@ -97,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--optimizer-eps",
+        type=float,
+        default=1e-8,
+        help="AdamW epsilon. Safe because trainable parameters/states are FP32.",
+    )
     parser.add_argument(
         "--max-grad-norm",
         type=float,
@@ -184,18 +181,56 @@ def _build_optimizer(
     *,
     learning_rate: float,
     weight_decay: float,
+    eps: float,
 ) -> torch.optim.AdamW:
     if learning_rate <= 0:
         raise ValueError(f"learning_rate must be positive, got {learning_rate}")
     if weight_decay < 0:
         raise ValueError(f"weight_decay must be non-negative, got {weight_decay}")
+    if eps <= 0:
+        raise ValueError(f"optimizer eps must be positive, got {eps}")
     parameters = [parameter for _, parameter in trainable_named_parameters(module)]
+    non_fp32 = [str(parameter.dtype) for parameter in parameters if parameter.dtype != torch.float32]
+    if non_fp32:
+        raise RuntimeError(
+            "AdamW trainable parameters must be FP32; call "
+            f"cast_trainable_parameters first. Found: {sorted(set(non_fp32))}"
+        )
     return torch.optim.AdamW(
         parameters,
         lr=float(learning_rate),
         weight_decay=float(weight_decay),
+        eps=float(eps),
         foreach=False,
     )
+
+
+def _build_grad_scaler(device: torch.device, dtype: torch.dtype):
+    enabled = device.type == "cuda" and dtype == torch.float16
+    try:
+        return torch.amp.GradScaler(device.type, enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _optimizer_state_summary(optimizer: torch.optim.Optimizer) -> dict[str, object]:
+    dtype_counts: dict[str, int] = {}
+    tensor_count = 0
+    nonfinite = 0
+    for state in optimizer.state.values():
+        for value in state.values():
+            if not isinstance(value, torch.Tensor):
+                continue
+            tensor_count += 1
+            dtype_name = str(value.dtype).removeprefix("torch.")
+            dtype_counts[dtype_name] = dtype_counts.get(dtype_name, 0) + 1
+            if value.is_floating_point():
+                nonfinite += int((~torch.isfinite(value.detach())).sum().item())
+    return {
+        "tensor_count": tensor_count,
+        "dtype_counts": dtype_counts,
+        "nonfinite_elements": nonfinite,
+    }
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -269,11 +304,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.train_scope != "all":
         reae.eval()
 
+    optimizer_precision = cast_trainable_parameters(closure, dtype=torch.float32)
     optimizer = _build_optimizer(
         closure,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        eps=args.optimizer_eps,
     )
+    scaler = _build_grad_scaler(device, dtype)
+
     before = capture_trainable_parameters(closure)
     batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
     optimizer.zero_grad(set_to_none=True)
@@ -301,7 +340,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if not torch.isfinite(loss.detach()).item():
         raise FloatingPointError(f"Non-finite loss: {float(loss.detach().float())}")
 
-    loss.backward()
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+
     gradients = gradient_summary(closure.named_parameters())
     if int(gradients["gradient_tensors"]) == 0:
         raise RuntimeError("Backward produced no trainable gradients")
@@ -324,16 +365,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
         clipped_norm = float(clipped.detach().float().item())
 
-    optimizer.step()
+    scale_before = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    scale_after = float(scaler.get_scale())
     optimizer.zero_grad(set_to_none=True)
+
     updates = parameter_update_summary(before, closure)
     if int(updates["changed_tensors"]) == 0:
         raise RuntimeError(
-            "Optimizer step completed but no trainable parameter changed; "
-            "increase --learning-rate for the diagnostic or inspect FP16 updates"
+            "Optimizer step completed but no trainable parameter changed. "
+            "Inspect GradScaler overflow status or increase --learning-rate for this diagnostic."
         )
     if int(updates["nonfinite_elements"]) != 0:
         raise FloatingPointError("Optimizer step produced non-finite parameter deltas")
+
+    optimizer_state = _optimizer_state_summary(optimizer)
+    if int(optimizer_state["nonfinite_elements"]) != 0:
+        raise FloatingPointError("AdamW state contains non-finite values")
+    state_dtypes = set(optimizer_state["dtype_counts"])
+    if state_dtypes and state_dtypes != {"float32"}:
+        raise RuntimeError(
+            "AdamW state was expected to be FP32, got "
+            f"{optimizer_state['dtype_counts']}"
+        )
 
     checkpoint_dir = args.checkpoint_output.expanduser().resolve()
     checkpoint_metadata = save_delta_checkpoint(
@@ -341,14 +396,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         closure,
         optimizer,
         step=1,
+        grad_scaler=scaler,
         metadata={
             "base_checkpoint": str(base_checkpoint),
             "train_scope": args.train_scope,
-            "dtype": _CANONICAL_DTYPE_NAME[dtype],
+            "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
+            "optimizer_parameter_dtype": "float32",
             "folded_timestep": config.get("folded_timestep"),
             "learning_rate": float(args.learning_rate),
             "weight_decay": float(args.weight_decay),
+            "optimizer_eps": float(args.optimizer_eps),
             "max_grad_norm": float(args.max_grad_norm),
+            "amp_grad_scaler_enabled": bool(scaler.is_enabled()),
             "sample_id": list(batch_cpu.get("sample_id", [])),
             "variant": list(batch_cpu.get("variant", [])),
         },
@@ -358,6 +417,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if not args.skip_resume_verify:
         expected_parameters = capture_trainable_parameters(closure)
         expected_optimizer = _clone_to_cpu(optimizer.state_dict())
+        expected_scaler = _clone_to_cpu(scaler.state_dict())
 
         with torch.no_grad():
             for _, parameter in trainable_named_parameters(closure):
@@ -367,13 +427,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             closure,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
+            eps=args.optimizer_eps,
         )
+        resumed_scaler = _build_grad_scaler(device, dtype)
         loaded_metadata = load_delta_checkpoint(
             checkpoint_dir,
             closure,
             resumed_optimizer,
             strict=True,
             map_location="cpu",
+            grad_scaler=resumed_scaler,
         )
         if int(loaded_metadata["step"]) != 1:
             raise AssertionError("Restored global step does not equal 1")
@@ -382,6 +445,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             expected_optimizer,
             _clone_to_cpu(resumed_optimizer.state_dict()),
             path="optimizer",
+        )
+        _assert_nested_equal(
+            expected_scaler,
+            _clone_to_cpu(resumed_scaler.state_dict()),
+            path="grad_scaler",
         )
         resume_verified = True
 
@@ -395,7 +463,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else 0
     )
 
-    result: dict[str, object] = {
+    return {
         "status": "PASS",
         "device": str(device),
         "device_name": (
@@ -411,8 +479,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "pixel_l1": float(output["pixel_l1"].detach().float().item()),
         "learning_rate": float(args.learning_rate),
         "weight_decay": float(args.weight_decay),
+        "optimizer_eps": float(args.optimizer_eps),
         "max_grad_norm": float(args.max_grad_norm),
         "pre_clip_gradient_norm": clipped_norm,
+        "grad_scaler_enabled": bool(scaler.is_enabled()),
+        "grad_scale_before": scale_before,
+        "grad_scale_after": scale_after,
+        "optimizer_precision": optimizer_precision,
+        "optimizer_state": optimizer_state,
         "elapsed_seconds": elapsed,
         "peak_allocated_gb": peak_bytes / (1024**3),
         "peak_reserved_gb": reserved_bytes / (1024**3),
@@ -423,21 +497,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "checkpoint": checkpoint_metadata,
         "resume_verified": resume_verified,
     }
-    return result
 
 
 def print_result(result: Mapping[str, object]) -> None:
     print("\n========== SwiftVR optimizer smoke ==========")
     print("status              :", result["status"])
     print("device              :", result["device_name"])
-    print("dtype               :", result["dtype"])
+    print("runtime dtype       :", result["dtype"])
+    print("optimizer dtype     :", result["optimizer_precision"]["target_dtype"])
     print("folded timestep     :", result["folded_timestep"])
     print("train scope         :", result["train_scope"])
     print("dataset length      :", result["dataset_length"])
     print("sample / variant    :", result["sample_id"], result["variant"])
     print("loss / pixel L1     :", result["loss"], "/", result["pixel_l1"])
     print("learning rate       :", result["learning_rate"])
+    print("optimizer eps       :", result["optimizer_eps"])
     print("pre-clip grad norm  :", result["pre_clip_gradient_norm"])
+    print("GradScaler enabled  :", result["grad_scaler_enabled"])
+    print(
+        "GradScaler scale    :",
+        result["grad_scale_before"],
+        "->",
+        result["grad_scale_after"],
+    )
     print("elapsed seconds     :", f"{float(result['elapsed_seconds']):.3f}")
     print("peak allocated GB   :", f"{float(result['peak_allocated_gb']):.3f}")
     print("peak reserved GB    :", f"{float(result['peak_reserved_gb']):.3f}")
@@ -453,14 +535,17 @@ def print_result(result: Mapping[str, object]) -> None:
     )
     gradients = result["gradients"]
     updates = result["updates"]
+    optimizer_state = result["optimizer_state"]
     assert isinstance(gradients, Mapping)
     assert isinstance(updates, Mapping)
+    assert isinstance(optimizer_state, Mapping)
     print("gradient tensors    :", gradients["gradient_tensors"])
     print("gradient global L2  :", f"{float(gradients['global_l2']):.6g}")
     print("changed tensors     :", updates["changed_tensors"])
     print("changed elements    :", updates["changed_elements"])
     print("update global L2    :", f"{float(updates['global_l2']):.6g}")
     print("update max abs      :", f"{float(updates['max_abs']):.6g}")
+    print("optimizer state     :", optimizer_state["dtype_counts"])
     print("checkpoint          :", result["checkpoint_dir"])
     print("resume verified     :", result["resume_verified"])
     print("=============================================\n")
