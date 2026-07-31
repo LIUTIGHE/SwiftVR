@@ -33,11 +33,20 @@ from .loop import (
     skip_batches,
     write_latest_checkpoint,
 )
+from .stage3 import (
+    VideoMetricAccumulator,
+    advance_cursor_batches,
+    stage3_reconstruction_objective,
+    temporal_difference_mse,
+    video_ssim,
+)
 
 __all__ = [
     "SwiftVRTrainingForward",
     "TrainingCursor",
+    "VideoMetricAccumulator",
     "WanShiftWindow2DTrainProcessor",
+    "advance_cursor_batches",
     "append_jsonl",
     "build_fp32_adamw",
     "build_grad_scaler",
@@ -60,6 +69,9 @@ __all__ = [
     "save_trainer_state",
     "seed_everything",
     "skip_batches",
+    "stage3_reconstruction_objective",
+    "temporal_difference_mse",
     "trainable_named_parameters",
+    "video_ssim",
     "write_latest_checkpoint",
 ]
