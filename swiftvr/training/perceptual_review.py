@@ -1,4 +1,4 @@
-""Perceptual metrics and visual-review helpers for SwiftVR checkpoints.""
+"""Perceptual metrics and visual-review helpers for SwiftVR checkpoints."""
 
 from __future__ import annotations
 
