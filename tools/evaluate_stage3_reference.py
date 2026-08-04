@@ -105,6 +105,30 @@ def main() -> int:
     dtype = resolve_runtime_dtype(args.dtype, folded_config, device, allow_mismatch=False)
     cache = ConditionalReferenceCache(args.reference_cache)
     expected_samples = int(cache.metadata["sample_count"])
+    expected_config = {
+        "val_split": args.val_split,
+        "clip_length": int(args.clip_length),
+        "crop_size": int(args.crop_size),
+        "scale": int(args.scale),
+    }
+    differences = [
+        f"{key}: cache={cache.metadata.get(key)!r}, current={value!r}"
+        for key, value in expected_config.items()
+        if cache.metadata.get(key) != value
+    ]
+    current_manifests = [path.expanduser().resolve() for path in args.val_manifest]
+    saved_hashes = cache.metadata.get("val_manifest_sha256")
+    if not isinstance(saved_hashes, dict):
+        differences.append("cache does not contain val_manifest_sha256")
+    else:
+        from swiftvr.training.reference import sha256_file
+
+        for path in current_manifests:
+            current_hash = sha256_file(path)
+            if saved_hashes.get(str(path)) != current_hash:
+                differences.append(f"manifest hash mismatch: {path}")
+    if differences:
+        raise ValueError("Reference cache configuration differs:\n  " + "\n  ".join(differences))
 
     dataset = TripletVideoDataset(
         args.val_manifest,
