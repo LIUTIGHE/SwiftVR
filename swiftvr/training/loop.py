@@ -22,6 +22,7 @@ from .checkpoint import trainable_named_parameters
 
 TRAINER_STATE_FILENAME = "trainer_state.pt"
 LATEST_CHECKPOINT_FILENAME = "latest.json"
+_CUDA_RNG_SCOPE_CURRENT_DEVICE = "current_device"
 
 
 @dataclass(frozen=True)
@@ -74,22 +75,49 @@ def seed_everything(seed: int) -> None:
 
 
 def capture_rng_state() -> dict[str, object]:
-    """Capture RNG state required for exact single-worker resume."""
+    """Capture RNG state for the CPU and the current process-local CUDA device.
+
+    DDP processes see the same visible CUDA device list but each process executes
+    only on its ``LOCAL_RANK`` device. Saving every visible device therefore makes
+    each rank checkpoint redundant and couples resume to ``CUDA_VISIBLE_DEVICES``.
+    The current format saves exactly one CUDA generator state and restores it onto
+    whichever logical CUDA device the process selects at resume time.
+    """
+
+    cuda_states: list[torch.Tensor] = []
+    cuda_device: int | None = None
+    cuda_scope = "none"
+    if torch.cuda.is_available():
+        cuda_device = int(torch.cuda.current_device())
+        cuda_states = [torch.cuda.get_rng_state(cuda_device).cpu()]
+        cuda_scope = _CUDA_RNG_SCOPE_CURRENT_DEVICE
 
     return {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch_cpu": torch.get_rng_state().cpu(),
-        "torch_cuda": (
-            [state.cpu() for state in torch.cuda.get_rng_state_all()]
-            if torch.cuda.is_available()
-            else []
-        ),
+        "torch_cuda": cuda_states,
+        "torch_cuda_scope": cuda_scope,
+        "torch_cuda_device": cuda_device,
     }
 
 
+def _as_cuda_rng_tensor(value: object) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("CUDA RNG state entries must be tensors")
+    return value.to(device="cpu", dtype=torch.uint8)
+
+
 def restore_rng_state(state: Mapping[str, object]) -> None:
-    """Restore a state produced by :func:`capture_rng_state`."""
+    """Restore RNG state, including legacy all-visible-device checkpoints.
+
+    New checkpoints contain one CUDA state with ``torch_cuda_scope`` set to
+    ``current_device``. Legacy checkpoints contain one state per device that was
+    visible when they were saved. For legacy data, the entry matching the current
+    logical device is selected when available; a single legacy entry is also
+    accepted and mapped to the current device. This removes the old requirement
+    that checkpoint and runtime expose the same number of GPUs.
+    """
 
     required = {"python", "numpy", "torch_cpu", "torch_cuda"}
     missing = sorted(required - set(state))
@@ -105,20 +133,39 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
     torch.set_rng_state(torch_cpu.to(device="cpu", dtype=torch.uint8))
 
     cuda_states = state["torch_cuda"]
-    if torch.cuda.is_available():
-        if not isinstance(cuda_states, (list, tuple)):
-            raise TypeError("torch_cuda RNG state must be a sequence")
-        if len(cuda_states) != torch.cuda.device_count():
+    if not isinstance(cuda_states, (list, tuple)):
+        raise TypeError("torch_cuda RNG state must be a sequence")
+    if not torch.cuda.is_available():
+        return
+    if not cuda_states:
+        raise ValueError("Checkpoint does not contain a CUDA RNG state")
+
+    current_device = int(torch.cuda.current_device())
+    scope = state.get("torch_cuda_scope")
+    if scope == _CUDA_RNG_SCOPE_CURRENT_DEVICE:
+        if len(cuda_states) != 1:
             raise ValueError(
-                "CUDA RNG state count does not match visible devices: "
-                f"checkpoint={len(cuda_states)}, current={torch.cuda.device_count()}"
+                "Current-device CUDA RNG checkpoints must contain exactly one state, "
+                f"got {len(cuda_states)}"
             )
-        torch.cuda.set_rng_state_all(
-            [
-                state_tensor.to(device="cpu", dtype=torch.uint8)
-                for state_tensor in cuda_states
-            ]
+        selected = cuda_states[0]
+    elif len(cuda_states) == 1:
+        # Compatibility with manually migrated or early single-device states.
+        selected = cuda_states[0]
+    elif current_device < len(cuda_states):
+        # Legacy format from torch.cuda.get_rng_state_all(). The logical device
+        # index identifies the generator used by this process before migration.
+        selected = cuda_states[current_device]
+    else:
+        raise ValueError(
+            "Legacy CUDA RNG checkpoint has no state for the current logical device: "
+            f"checkpoint_states={len(cuda_states)}, current_device={current_device}"
         )
+
+    torch.cuda.set_rng_state(
+        _as_cuda_rng_tensor(selected),
+        device=current_device,
+    )
 
 
 def _load_torch_file(path: Path, *, map_location: str | torch.device = "cpu"):
