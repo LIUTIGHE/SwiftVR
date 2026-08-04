@@ -16,6 +16,10 @@ class ReferenceMetricTest(unittest.TestCase):
         left = cache_sample_key("plain:vid0", [1, 2, 3])
         self.assertEqual(left, cache_sample_key("plain:vid0", [1, 2, 3]))
         self.assertNotEqual(left, cache_sample_key("plain:vid0", [2, 3, 4]))
+        self.assertNotEqual(
+            left,
+            cache_sample_key("plain:vid0", [1, 2, 3], crop_left=4),
+        )
 
     def test_prompt_embedding_expands_batch(self):
         prompt = torch.arange(12).reshape(3, 4)
