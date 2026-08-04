@@ -32,7 +32,7 @@ from swiftvr.training.reference import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--student-base-checkpoint", type=Path, required=True)
-    parser.add_argument("--student-checkpoint", type=Path, required=True)
+    parser.add_argument("--student-checkpoint", type=Path, default=None)
     parser.add_argument("--reference-cache", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -171,13 +171,16 @@ def main() -> int:
         attention_backend=args.attention_backend,
     )
     cast_trainable_parameters(closure, dtype=torch.float32)
-    metadata = load_delta_checkpoint(
-        args.student_checkpoint,
-        closure,
-        optimizer=None,
-        strict=True,
-        map_location="cpu",
-    )
+    if args.student_checkpoint is None:
+        metadata: dict[str, object] = {"step": 0}
+    else:
+        metadata = load_delta_checkpoint(
+            args.student_checkpoint,
+            closure,
+            optimizer=None,
+            strict=True,
+            map_location="cpu",
+        )
     closure.eval()
 
     student_gt_acc = VideoMetricAccumulator()
@@ -254,7 +257,11 @@ def main() -> int:
     student_reference.update(velocity_acc.compute())
     result: dict[str, object] = {
         "global_step": int(metadata["step"]),
-        "student_checkpoint": str(args.student_checkpoint.expanduser().resolve()),
+        "student_checkpoint": (
+            None
+            if args.student_checkpoint is None
+            else str(args.student_checkpoint.expanduser().resolve())
+        ),
         "student_base_checkpoint": str(base),
         "reference_cache": str(args.reference_cache.expanduser().resolve()),
         "sample_count": processed,
