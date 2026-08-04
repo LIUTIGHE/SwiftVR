@@ -28,8 +28,19 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def cache_sample_key(record_uid: str, frame_indices: Sequence[int]) -> str:
-    payload = record_uid + ":" + ",".join(str(int(value)) for value in frame_indices)
+def cache_sample_key(
+    record_uid: str,
+    frame_indices: Sequence[int],
+    *,
+    crop_top: int = 0,
+    crop_left: int = 0,
+) -> str:
+    payload = (
+        record_uid
+        + ":"
+        + ",".join(str(int(value)) for value in frame_indices)
+        + f":crop={int(crop_top)},{int(crop_left)}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
@@ -48,12 +59,27 @@ def batch_sample_identity(batch: Mapping[str, object], index: int) -> dict[str, 
         raise TypeError("batch frame_indices must be a [B,T] tensor")
     indices = [int(value) for value in frame_indices[index].tolist()]
     record_uid = str(record_uids[index])
+
+    def batch_int(name: str) -> int:
+        value = batch.get(name)
+        if isinstance(value, torch.Tensor):
+            return int(value[index].item())
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return int(value[index])
+        raise TypeError(f"batch {name} must be a tensor or sequence")
+
+    crop_top = batch_int("crop_top")
+    crop_left = batch_int("crop_left")
     return {
         "record_uid": record_uid,
         "sample_id": str(sample_ids[index]),
         "variant": str(variants[index]),
         "frame_indices": indices,
-        "key": cache_sample_key(record_uid, indices),
+        "crop_top": crop_top,
+        "crop_left": crop_left,
+        "key": cache_sample_key(
+            record_uid, indices, crop_top=crop_top, crop_left=crop_left
+        ),
     }
 
 
@@ -188,6 +214,9 @@ class ConditionalReferenceCache:
         saved_indices = [int(value) for value in item.get("frame_indices", [])]
         if saved_indices != expected_indices:
             raise ValueError(f"Reference frame_indices mismatch for key {key}")
+        for field in ("crop_top", "crop_left"):
+            if int(item.get(field, -1)) != int(identity.get(field, -2)):
+                raise ValueError(f"Reference {field} mismatch for key {key}")
         filename = item.get("file")
         if not isinstance(filename, str):
             raise TypeError(f"Reference cache file is missing for key {key}")
