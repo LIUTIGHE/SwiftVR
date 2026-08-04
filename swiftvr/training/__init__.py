@@ -8,6 +8,17 @@ from .checkpoint import (
     save_delta_checkpoint,
     trainable_named_parameters,
 )
+from .distillation import (
+    DeterministicTripletViewDataset,
+    DistillationMetricAccumulator,
+    SwiftVRVelocityDistillationForward,
+    TeacherVelocityCache,
+    conditional_teacher_velocity,
+    decode_student_prediction,
+    decode_teacher_prediction,
+    distillation_sample_identity,
+    velocity_distillation_objective,
+)
 from .forward import (
     SwiftVRTrainingForward,
     WanShiftWindow2DTrainProcessor,
@@ -42,7 +53,11 @@ from .stage3 import (
 )
 
 __all__ = [
+    "DeterministicTripletViewDataset",
+    "DistillationMetricAccumulator",
     "SwiftVRTrainingForward",
+    "SwiftVRVelocityDistillationForward",
+    "TeacherVelocityCache",
     "TrainingCursor",
     "VideoMetricAccumulator",
     "WanShiftWindow2DTrainProcessor",
@@ -53,7 +68,11 @@ __all__ = [
     "capture_rng_state",
     "capture_trainable_parameters",
     "cast_trainable_parameters",
+    "conditional_teacher_velocity",
     "decode_reae_clip",
+    "decode_student_prediction",
+    "decode_teacher_prediction",
+    "distillation_sample_identity",
     "encode_reae_clip",
     "forward_prompt_free_no_time_training",
     "load_delta_checkpoint",
@@ -72,6 +91,7 @@ __all__ = [
     "stage3_reconstruction_objective",
     "temporal_difference_mse",
     "trainable_named_parameters",
+    "velocity_distillation_objective",
     "video_ssim",
     "write_latest_checkpoint",
 ]
