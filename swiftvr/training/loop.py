@@ -275,13 +275,23 @@ def append_jsonl(path: str | Path, record: Mapping[str, object]) -> None:
 
 
 def skip_batches(iterator: Iterator[object], count: int) -> None:
-    """Consume exactly ``count`` batches or fail if the epoch is too short."""
+    """Skip batches without loading Dataset items when the iterator permits it.
+
+    PyTorch DataLoader iterators expose their batch-sampler iterator internally as
+    ``_sampler_iter``. Advancing that iterator preserves the epoch permutation but
+    avoids calling ``Dataset.__getitem__`` for already-consumed batches. This is
+    critical for exact mid-epoch resume of video training, where replaying hundreds
+    of batches would otherwise decode thousands of frames before the first new
+    optimizer step. Generic iterators fall back to consuming their items normally.
+    """
 
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
+    sampler_iterator = getattr(iterator, "_sampler_iter", None)
+    target = sampler_iterator if sampler_iterator is not None else iterator
     for index in range(count):
         try:
-            next(iterator)
+            next(target)
         except StopIteration as exc:
             raise RuntimeError(
                 f"Cannot skip {count} batches; iterator ended after {index}"
