@@ -1,9 +1,9 @@
 """Teacher-behaviour distillation helpers for prompt-free SwiftVR students.
 
 The first distillation stage keeps the released ReAE and 5B DiT topology fixed,
-but removes runtime text/prompt/timestep inputs.  A frozen conditional teacher is
+but removes runtime text/prompt/timestep inputs. A frozen conditional teacher is
 run offline at the deployment endpoint (empty prompt, timestep 1000) and its
-velocity predictions are cached for deterministic video views.  Training then
+velocity predictions are cached for deterministic video views. Training then
 matches the cached velocity without loading a second 5B model on every rank.
 """
 
@@ -28,6 +28,7 @@ from .stage3 import temporal_difference_mse
 
 TEACHER_CACHE_FORMAT_VERSION = 1
 TEACHER_CACHE_METADATA_FILENAME = "metadata.json"
+GT_LOSS_MODES = frozenset({"none", "guard", "direct"})
 
 
 def _stable_view_seed(base_seed: int, record_index: int, view_index: int) -> int:
@@ -37,14 +38,7 @@ def _stable_view_seed(base_seed: int, record_index: int, view_index: int) -> int
 
 
 class DeterministicTripletViewDataset(Dataset):
-    """Expand each triplet record into reproducible random-looking views.
-
-    ``TripletVideoDataset(training=True)`` normally draws temporal starts, crops,
-    and flips from global torch RNG state.  This wrapper isolates that RNG inside
-    ``fork_rng`` and seeds every ``(record, view)`` independently.  The resulting
-    sample is therefore invariant to DataLoader ordering, rank sharding, resume,
-    and worker scheduling, which is required for an offline teacher cache.
-    """
+    """Expand each triplet record into reproducible random-looking views."""
 
     def __init__(
         self,
@@ -335,69 +329,225 @@ class DistillationMetricAccumulator:
         }
 
 
+def _validate_video_triplet(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if student.ndim != 5 or teacher.ndim != 5 or target.ndim != 5:
+        raise ValueError("RGB videos must use [B,T,C,H,W]")
+    if student.shape != teacher.shape or student.shape != target.shape:
+        raise ValueError(
+            "RGB video shape mismatch: "
+            f"student={tuple(student.shape)}, teacher={tuple(teacher.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
+    if student.shape[2] != 3:
+        raise ValueError(f"Expected RGB videos, got C={student.shape[2]}")
+    return student.float(), teacher.detach().float(), target.detach().float()
+
+
+def _per_sample_pixel_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return (prediction - target).abs().flatten(1).mean(dim=1)
+
+
+def _per_sample_temporal_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    if prediction.shape[1] < 2:
+        return prediction.new_zeros((prediction.shape[0],), dtype=torch.float32)
+    prediction_delta = prediction[:, 1:] - prediction[:, :-1]
+    target_delta = target[:, 1:] - target[:, :-1]
+    return (prediction_delta - target_delta).square().flatten(1).mean(dim=1)
+
+
+def gt_reconstruction_constraint(
+    student_prediction: torch.Tensor,
+    teacher_prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mode: str = "guard",
+    epsilon: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Build a teacher-relative GT constraint in FP32.
+
+    ``guard`` only penalizes the student when it is worse than the teacher on a
+    per-sample GT error. ``direct`` applies ordinary student-vs-GT pixel and
+    temporal losses. The returned diagnostics are present in both modes.
+    """
+
+    normalized_mode = str(mode).lower()
+    if normalized_mode not in GT_LOSS_MODES - {"none"}:
+        raise ValueError(
+            f"GT reconstruction mode must be 'guard' or 'direct', got {mode!r}"
+        )
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    student, teacher, target_f = _validate_video_triplet(
+        student_prediction,
+        teacher_prediction,
+        target,
+    )
+    student_pixel = _per_sample_pixel_l1(student, target_f)
+    teacher_pixel = _per_sample_pixel_l1(teacher, target_f)
+    student_temporal = _per_sample_temporal_mse(student, target_f)
+    teacher_temporal = _per_sample_temporal_mse(teacher, target_f)
+
+    pixel_excess = torch.relu(student_pixel - teacher_pixel.detach())
+    temporal_excess = torch.relu(student_temporal - teacher_temporal.detach())
+    pixel_guard = (
+        pixel_excess / teacher_pixel.detach().clamp_min(float(epsilon))
+    ).mean()
+    temporal_guard = (
+        temporal_excess / teacher_temporal.detach().clamp_min(float(epsilon))
+    ).mean()
+
+    if normalized_mode == "guard":
+        pixel_loss = pixel_guard
+        temporal_loss = temporal_guard
+    else:
+        pixel_loss = student_pixel.mean()
+        temporal_loss = student_temporal.mean()
+
+    return {
+        "gt_pixel_loss": pixel_loss,
+        "gt_temporal_loss": temporal_loss,
+        "gt_pixel_guard": pixel_guard,
+        "gt_temporal_guard": temporal_guard,
+        "gt_student_pixel_l1": student_pixel.mean(),
+        "gt_teacher_pixel_l1": teacher_pixel.mean(),
+        "gt_student_temporal_mse": student_temporal.mean(),
+        "gt_teacher_temporal_mse": teacher_temporal.mean(),
+        "gt_pixel_excess": pixel_excess.mean(),
+        "gt_temporal_excess": temporal_excess.mean(),
+        "gt_pixel_violation_rate": (student_pixel > teacher_pixel).float().mean(),
+        "gt_temporal_violation_rate": (
+            student_temporal > teacher_temporal
+        ).float().mean(),
+    }
+
+
 def velocity_distillation_objective(
     student_velocity: torch.Tensor,
     teacher_velocity: torch.Tensor,
     *,
     student_prediction: torch.Tensor | None = None,
     teacher_prediction: torch.Tensor | None = None,
+    target: torch.Tensor | None = None,
     velocity_mse_weight: float = 1.0,
     velocity_cosine_weight: float = 1.0,
     output_l1_weight: float = 0.0,
     output_temporal_weight: float = 0.0,
+    gt_loss_mode: str = "none",
+    gt_pixel_weight: float = 0.0,
+    gt_temporal_weight: float = 0.0,
     epsilon: float = 1e-8,
 ) -> dict[str, torch.Tensor]:
-    """Composite endpoint teacher-matching objective.
+    """Composite endpoint teacher-matching objective with FP32 reductions."""
 
-    The velocity MSE is normalized by detached teacher power, so its scale is
-    comparable across clips.  Cosine similarity is computed per sample over the
-    complete latent velocity.  Optional RGB losses match the teacher output, not
-    GT, and therefore preserve a concrete teacher-generated solution rather than
-    encouraging a conditional mean.
-    """
-
+    weights = {
+        "velocity_mse_weight": velocity_mse_weight,
+        "velocity_cosine_weight": velocity_cosine_weight,
+        "output_l1_weight": output_l1_weight,
+        "output_temporal_weight": output_temporal_weight,
+        "gt_pixel_weight": gt_pixel_weight,
+        "gt_temporal_weight": gt_temporal_weight,
+    }
+    negative = [name for name, value in weights.items() if float(value) < 0]
+    if negative:
+        raise ValueError(f"Loss weights must be non-negative: {negative}")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    normalized_gt_mode = str(gt_loss_mode).lower()
+    if normalized_gt_mode not in GT_LOSS_MODES:
+        raise ValueError(
+            f"Unsupported gt_loss_mode={gt_loss_mode!r}; "
+            f"expected one of {sorted(GT_LOSS_MODES)}"
+        )
     if student_velocity.shape != teacher_velocity.shape:
         raise ValueError(
             f"Velocity shape mismatch: {tuple(student_velocity.shape)} vs "
             f"{tuple(teacher_velocity.shape)}"
         )
+
     student_f = student_velocity.float()
     teacher_f = teacher_velocity.detach().float()
     raw_mse = F.mse_loss(student_f, teacher_f)
     teacher_power = teacher_f.square().mean().detach()
     normalized_mse = raw_mse / teacher_power.clamp_min(float(epsilon))
-    student_flat = student_f.flatten(1)
-    teacher_flat = teacher_f.flatten(1)
     cosine = F.cosine_similarity(
-        student_flat,
-        teacher_flat,
+        student_f.flatten(1),
+        teacher_f.flatten(1),
         dim=1,
         eps=float(epsilon),
     ).mean()
     cosine_loss = 1.0 - cosine
-
     zero = raw_mse.new_zeros(())
+
     output_l1 = zero
     output_temporal = zero
-    if output_l1_weight != 0.0 or output_temporal_weight != 0.0:
+    requires_output_pair = (
+        float(output_l1_weight) != 0.0
+        or float(output_temporal_weight) != 0.0
+        or (
+            normalized_gt_mode != "none"
+            and (float(gt_pixel_weight) != 0.0 or float(gt_temporal_weight) != 0.0)
+        )
+    )
+    if requires_output_pair:
         if student_prediction is None or teacher_prediction is None:
-            raise ValueError("Output teacher losses require both RGB predictions")
+            raise ValueError("RGB losses require student and teacher predictions")
         if student_prediction.shape != teacher_prediction.shape:
             raise ValueError(
                 f"Output shape mismatch: {tuple(student_prediction.shape)} vs "
                 f"{tuple(teacher_prediction.shape)}"
             )
-        output_l1 = F.l1_loss(student_prediction.float(), teacher_prediction.float())
+        output_l1 = F.l1_loss(
+            student_prediction.float(),
+            teacher_prediction.detach().float(),
+        )
         output_temporal = temporal_difference_mse(
+            student_prediction.float(),
+            teacher_prediction.detach().float(),
+        )
+
+    gt_metrics = {
+        "gt_pixel_loss": zero,
+        "gt_temporal_loss": zero,
+        "gt_pixel_guard": zero,
+        "gt_temporal_guard": zero,
+        "gt_student_pixel_l1": zero,
+        "gt_teacher_pixel_l1": zero,
+        "gt_student_temporal_mse": zero,
+        "gt_teacher_temporal_mse": zero,
+        "gt_pixel_excess": zero,
+        "gt_temporal_excess": zero,
+        "gt_pixel_violation_rate": zero,
+        "gt_temporal_violation_rate": zero,
+    }
+    gt_applied = zero
+    if normalized_gt_mode != "none" and (
+        float(gt_pixel_weight) != 0.0 or float(gt_temporal_weight) != 0.0
+    ):
+        if student_prediction is None or teacher_prediction is None or target is None:
+            raise ValueError("GT constraints require student, teacher, and GT videos")
+        gt_metrics = gt_reconstruction_constraint(
             student_prediction,
             teacher_prediction,
+            target,
+            mode=normalized_gt_mode,
+            epsilon=epsilon,
         )
+        gt_applied = zero.new_ones(())
 
     total = (
         float(velocity_mse_weight) * normalized_mse
         + float(velocity_cosine_weight) * cosine_loss
         + float(output_l1_weight) * output_l1
         + float(output_temporal_weight) * output_temporal
+        + float(gt_pixel_weight) * gt_metrics["gt_pixel_loss"]
+        + float(gt_temporal_weight) * gt_metrics["gt_temporal_loss"]
     )
     return {
         "loss": total,
@@ -408,6 +558,8 @@ def velocity_distillation_objective(
         "teacher_velocity_power": teacher_power,
         "output_l1": output_l1,
         "output_temporal_mse": output_temporal,
+        "gt_constraint_applied": gt_applied,
+        **gt_metrics,
     }
 
 
@@ -461,7 +613,9 @@ class SwiftVRVelocityDistillationForward(torch.nn.Module):
         prepared = prepare_training_batch(batch)
         lq_input = prepared["lq_input"]
         target = prepared["target"]
-        if not isinstance(lq_input, torch.Tensor) or not isinstance(target, torch.Tensor):
+        if not isinstance(lq_input, torch.Tensor) or not isinstance(
+            target, torch.Tensor
+        ):
             raise TypeError("Prepared batch is missing lq_input/target tensors")
         z_lq_ntchw = encode_reae_clip(self.reae, lq_input, require_4k_plus_1=True)
         z_lq = z_lq_ntchw.permute(0, 2, 1, 3, 4).contiguous()
