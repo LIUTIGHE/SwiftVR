@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """DDP endpoint teacher distillation for prompt-free SwiftVR adapters.
 
-This first D0 trainer is intentionally a gate implementation: deterministic
-cached teacher velocities, adapter-only DDP, fixed validation, TensorBoard, and
-rank-0 delta checkpoints. It starts from the zero-adapter folded checkpoint and
-does not use GT pixel loss.
+The D0 trainer uses deterministic cached conditional-teacher velocities,
+adapter-only DDP, optional teacher-relative GT guards, fixed visual validation,
+TensorBoard, and rank-0 delta checkpoints. GT supervision is auxiliary: the
+default guard only activates when the student is worse than the teacher.
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ from smoke_training_forward import (
 )
 from swiftvr.data import TripletVideoDataset
 from swiftvr.models import ReAE
-from swiftvr.models.transformer_prompt_free_no_time import WanTransformer3DModelPromptFreeNoTime
+from swiftvr.models.transformer_prompt_free_no_time import (
+    WanTransformer3DModelPromptFreeNoTime,
+)
 from swiftvr.training import (
     VideoMetricAccumulator,
     append_jsonl,
@@ -47,6 +49,7 @@ from swiftvr.training import (
     write_latest_checkpoint,
 )
 from swiftvr.training.distillation import (
+    GT_LOSS_MODES,
     DeterministicTripletViewDataset,
     DistillationMetricAccumulator,
     SwiftVRVelocityDistillationForward,
@@ -55,6 +58,8 @@ from swiftvr.training.distillation import (
     decode_teacher_prediction,
     velocity_distillation_objective,
 )
+from swiftvr.training.distillation_visuals import export_validation_visuals
+from swiftvr.training.perceptual_review import parse_csv_ints
 from swiftvr.training.reference import sha256_file
 
 
@@ -83,14 +88,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--verify-paths", action="store_true")
-    parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="auto",
+    )
     parser.add_argument("--allow-dtype-mismatch", action="store_true")
     parser.add_argument("--attention-backend", default="sdpa")
+
     parser.add_argument("--velocity-mse-weight", type=float, default=1.0)
     parser.add_argument("--velocity-cosine-weight", type=float, default=1.0)
     parser.add_argument("--output-l1-weight", type=float, default=0.0)
     parser.add_argument("--output-temporal-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--gt-loss-mode",
+        choices=tuple(sorted(GT_LOSS_MODES)),
+        default="guard",
+        help="none, teacher-relative guard, or direct student-vs-GT regression.",
+    )
+    parser.add_argument("--gt-pixel-weight", type=float, default=0.10)
+    parser.add_argument("--gt-temporal-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--gt-loss-every",
+        type=int,
+        default=1,
+        help="Decode and apply the GT term every N optimizer steps.",
+    )
     parser.add_argument("--loss-epsilon", type=float, default=1e-8)
+
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--optimizer-eps", type=float, default=1e-8)
@@ -102,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--validate-every", type=int, default=20)
     parser.add_argument("--validate-at-start", action="store_true")
+
+    parser.add_argument("--visual-validation-samples", type=int, default=2)
+    parser.add_argument("--visual-frame-indices", default="0,6,12")
+    parser.add_argument("--visual-video-fps", type=float, default=8.0)
+    parser.add_argument("--visual-difference-scale", type=float, default=4.0)
+    parser.add_argument(
+        "--visualize-every",
+        type=int,
+        default=None,
+        help="Visualize at validation steps divisible by N; defaults to validate-every.",
+    )
+    parser.add_argument("--no-validation-visuals", action="store_true")
+
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tensorboard-dir", type=Path, default=None)
     parser.add_argument("--no-tensorboard", action="store_true")
@@ -118,7 +156,8 @@ def write_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def init_distributed() -> tuple[int, int, int, torch.device]:
-    missing = [name for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE") if name not in os.environ]
+    required = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
+    missing = [name for name in required if name not in os.environ]
     if missing:
         raise RuntimeError("Launch with torchrun; missing: " + ", ".join(missing))
     if not torch.cuda.is_available():
@@ -219,8 +258,49 @@ def create_writer(args: argparse.Namespace, run_dir: Path, rank: int):
         from torch.utils.tensorboard import SummaryWriter
     except Exception as exc:
         raise RuntimeError("TensorBoard is required unless --no-tensorboard is set") from exc
-    log_dir = args.tensorboard_dir.expanduser().resolve() if args.tensorboard_dir else run_dir / "tensorboard"
+    log_dir = (
+        args.tensorboard_dir.expanduser().resolve()
+        if args.tensorboard_dir
+        else run_dir / "tensorboard"
+    )
     return SummaryWriter(log_dir=str(log_dir))
+
+
+def _gt_due(args: argparse.Namespace, next_step: int) -> bool:
+    return (
+        args.gt_loss_mode != "none"
+        and (args.gt_pixel_weight != 0.0 or args.gt_temporal_weight != 0.0)
+        and int(next_step) % int(args.gt_loss_every) == 0
+    )
+
+
+def _needs_rgb(args: argparse.Namespace, *, apply_gt: bool) -> bool:
+    return (
+        args.output_l1_weight != 0.0
+        or args.output_temporal_weight != 0.0
+        or apply_gt
+    )
+
+
+def _decode_pair(
+    output: Mapping[str, torch.Tensor],
+    teacher_velocity: torch.Tensor,
+    closure: SwiftVRVelocityDistillationForward,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_frames = int(output["target"].shape[1])
+    student_prediction = decode_student_prediction(
+        reae=closure.reae,
+        z_lq=output["z_lq"],
+        student_velocity=output["velocity"],
+        output_frames=output_frames,
+    )
+    teacher_prediction = decode_teacher_prediction(
+        reae=closure.reae,
+        z_lq=output["z_lq"],
+        teacher_velocity=teacher_velocity,
+        output_frames=output_frames,
+    )
+    return student_prediction, teacher_prediction
 
 
 def objective_for_batch(
@@ -228,34 +308,42 @@ def objective_for_batch(
     teacher_velocity: torch.Tensor,
     closure: SwiftVRVelocityDistillationForward,
     args: argparse.Namespace,
+    *,
+    apply_gt: bool,
 ) -> dict[str, torch.Tensor]:
     student_prediction = None
     teacher_prediction = None
-    if args.output_l1_weight != 0.0 or args.output_temporal_weight != 0.0:
-        output_frames = int(output["target"].shape[1])
-        student_prediction = decode_student_prediction(
-            reae=closure.reae,
-            z_lq=output["z_lq"],
-            student_velocity=output["velocity"],
-            output_frames=output_frames,
-        )
-        teacher_prediction = decode_teacher_prediction(
-            reae=closure.reae,
-            z_lq=output["z_lq"],
-            teacher_velocity=teacher_velocity,
-            output_frames=output_frames,
+    if _needs_rgb(args, apply_gt=apply_gt):
+        student_prediction, teacher_prediction = _decode_pair(
+            output,
+            teacher_velocity,
+            closure,
         )
     return velocity_distillation_objective(
         output["velocity"],
         teacher_velocity,
         student_prediction=student_prediction,
         teacher_prediction=teacher_prediction,
+        target=output["target"] if apply_gt else None,
         velocity_mse_weight=args.velocity_mse_weight,
         velocity_cosine_weight=args.velocity_cosine_weight,
         output_l1_weight=args.output_l1_weight,
         output_temporal_weight=args.output_temporal_weight,
+        gt_loss_mode=args.gt_loss_mode if apply_gt else "none",
+        gt_pixel_weight=args.gt_pixel_weight if apply_gt else 0.0,
+        gt_temporal_weight=args.gt_temporal_weight if apply_gt else 0.0,
         epsilon=args.loss_epsilon,
     )
+
+
+def _batch_text(batch: Mapping[str, object], key: str, index: int) -> str:
+    value = batch.get(key)
+    if isinstance(value, (list, tuple)):
+        return str(value[index])
+    if isinstance(value, torch.Tensor):
+        item = value[index]
+        return str(item.item() if item.ndim == 0 else item.tolist())
+    return str(value)
 
 
 @torch.no_grad()
@@ -267,63 +355,120 @@ def validate_rank0(
     device: torch.device,
     dtype: torch.dtype,
     args: argparse.Namespace,
-) -> dict[str, float | int]:
+    visual_samples: int = 0,
+) -> tuple[dict[str, float | int], list[dict[str, object]]]:
     closure.eval()
     velocity_metrics = DistillationMetricAccumulator()
     student_teacher = VideoMetricAccumulator()
     student_gt = VideoMetricAccumulator()
+    teacher_gt = VideoMetricAccumulator()
     loss_sums: dict[str, float] = {}
+    visuals: list[dict[str, object]] = []
     batches = 0
     autocast_enabled = dtype in (torch.float16, torch.bfloat16)
+    apply_gt = args.gt_loss_mode != "none" and (
+        args.gt_pixel_weight != 0.0 or args.gt_temporal_weight != 0.0
+    )
     try:
         for batch_cpu in loader:
             teacher_velocity = cache.load_batch(batch_cpu, device=device, dtype=dtype)
             batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
             with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
                 output = closure(batch)
-                output_frames = int(output["target"].shape[1])
-                student_prediction = decode_student_prediction(
-                    reae=closure.reae,
-                    z_lq=output["z_lq"],
-                    student_velocity=output["velocity"],
-                    output_frames=output_frames,
-                )
-                teacher_prediction = decode_teacher_prediction(
-                    reae=closure.reae,
-                    z_lq=output["z_lq"],
-                    teacher_velocity=teacher_velocity,
-                    output_frames=output_frames,
-                )
-                objective = velocity_distillation_objective(
-                    output["velocity"],
+                student_prediction, teacher_prediction = _decode_pair(
+                    output,
                     teacher_velocity,
-                    student_prediction=student_prediction,
-                    teacher_prediction=teacher_prediction,
-                    velocity_mse_weight=args.velocity_mse_weight,
-                    velocity_cosine_weight=args.velocity_cosine_weight,
-                    output_l1_weight=args.output_l1_weight,
-                    output_temporal_weight=args.output_temporal_weight,
-                    epsilon=args.loss_epsilon,
+                    closure,
                 )
+            objective = velocity_distillation_objective(
+                output["velocity"],
+                teacher_velocity,
+                student_prediction=student_prediction,
+                teacher_prediction=teacher_prediction,
+                target=output["target"] if apply_gt else None,
+                velocity_mse_weight=args.velocity_mse_weight,
+                velocity_cosine_weight=args.velocity_cosine_weight,
+                output_l1_weight=args.output_l1_weight,
+                output_temporal_weight=args.output_temporal_weight,
+                gt_loss_mode=args.gt_loss_mode if apply_gt else "none",
+                gt_pixel_weight=args.gt_pixel_weight if apply_gt else 0.0,
+                gt_temporal_weight=args.gt_temporal_weight if apply_gt else 0.0,
+                epsilon=args.loss_epsilon,
+            )
             velocity_metrics.update(output["velocity"], teacher_velocity)
             student_teacher.update(student_prediction, teacher_prediction, clamp=True)
             student_gt.update(student_prediction, output["target"], clamp=True)
+            teacher_gt.update(teacher_prediction, output["target"], clamp=True)
             for key, value in objective.items():
-                loss_sums[key] = loss_sums.get(key, 0.0) + float(value.float().item())
+                loss_sums[key] = loss_sums.get(key, 0.0) + float(
+                    value.detach().float().item()
+                )
+
+            if len(visuals) < visual_samples:
+                batch_size = int(student_prediction.shape[0])
+                for local_index in range(batch_size):
+                    if len(visuals) >= visual_samples:
+                        break
+                    visuals.append(
+                        {
+                            "record_uid": _batch_text(
+                                batch_cpu, "record_uid", local_index
+                            ),
+                            "lq_input": output["lq_input"][local_index].clamp(0, 1).cpu(),
+                            "target": output["target"][local_index].clamp(0, 1).cpu(),
+                            "teacher_prediction": teacher_prediction[local_index]
+                            .clamp(0, 1)
+                            .cpu(),
+                            "student_prediction": student_prediction[local_index]
+                            .clamp(0, 1)
+                            .cpu(),
+                        }
+                    )
             batches += 1
     finally:
         closure.train()
         closure.reae.eval()
     if batches == 0:
         raise RuntimeError("Validation produced no batches")
-    velocity = velocity_metrics.compute()
-    st = student_teacher.compute()
-    sg = student_gt.compute()
-    result: dict[str, float | int] = {**velocity, "batches": batches}
-    result.update({f"student_teacher_{key}": value for key, value in st.items()})
-    result.update({f"student_gt_{key}": value for key, value in sg.items()})
+
+    result: dict[str, float | int] = {
+        **velocity_metrics.compute(),
+        "batches": batches,
+    }
+    result.update(
+        {
+            f"student_teacher_{key}": value
+            for key, value in student_teacher.compute().items()
+        }
+    )
+    result.update(
+        {f"student_gt_{key}": value for key, value in student_gt.compute().items()}
+    )
+    result.update(
+        {f"teacher_gt_{key}": value for key, value in teacher_gt.compute().items()}
+    )
     result.update({key: value / batches for key, value in loss_sums.items()})
-    return result
+    return result, visuals
+
+
+def _write_validation_scalars(writer, step: int, validation: Mapping[str, object]) -> None:
+    if writer is None:
+        return
+    for key, value in validation.items():
+        if not isinstance(value, (int, float)):
+            continue
+        if key.startswith("student_teacher_"):
+            tag = "val/student_teacher/" + key.removeprefix("student_teacher_")
+        elif key.startswith("student_gt_"):
+            tag = "val/student_gt/" + key.removeprefix("student_gt_")
+        elif key.startswith("teacher_gt_"):
+            tag = "val/teacher_gt/" + key.removeprefix("teacher_gt_")
+        elif key.startswith("gt_"):
+            tag = "val/gt_constraint/" + key.removeprefix("gt_")
+        else:
+            tag = "val/teacher_distillation/" + key
+        writer.add_scalar(tag, float(value), int(step))
+    writer.flush()
 
 
 def save_checkpoint(
@@ -334,6 +479,7 @@ def save_checkpoint(
     *,
     step: int,
     last_record: Mapping[str, object],
+    runtime_dtype: torch.dtype,
 ) -> Path:
     checkpoint = run_dir / "checkpoints" / f"step_{step:08d}"
     if checkpoint.exists():
@@ -346,38 +492,87 @@ def save_checkpoint(
         step=step,
         grad_scaler=scaler,
         metadata={
-            "trainer": "teacher_distillation_ddp_gate_v1",
+            "trainer": "teacher_distillation_ddp_v2",
             "last_loss": last_record.get("loss"),
             "last_velocity_relative_l2": last_record.get("velocity_relative_l2"),
             "last_velocity_cosine": last_record.get("velocity_cosine"),
+            "runtime_dtype": _CANONICAL_DTYPE_NAME[runtime_dtype],
+            "grad_scaler_enabled": bool(scaler.is_enabled()),
         },
     )
     write_latest_checkpoint(run_dir, checkpoint)
     return checkpoint
 
 
+def _validate_arguments(args: argparse.Namespace) -> tuple[int, ...]:
+    if args.num_workers != 0:
+        raise ValueError("The D0 trainer currently requires --num-workers 0")
+    positive = {
+        "max_steps": args.max_steps,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "save_every": args.save_every,
+        "log_every": args.log_every,
+        "gt_loss_every": args.gt_loss_every,
+    }
+    bad_positive = [name for name, value in positive.items() if int(value) <= 0]
+    if bad_positive:
+        raise ValueError(f"These arguments must be positive: {bad_positive}")
+    if args.validate_every > 0 and (
+        not args.val_manifest or not args.val_teacher_cache
+    ):
+        raise ValueError("Validation requires --val-manifest and --val-teacher-cache")
+    if args.loss_epsilon <= 0:
+        raise ValueError("loss-epsilon must be positive")
+    loss_weights = {
+        "velocity_mse_weight": args.velocity_mse_weight,
+        "velocity_cosine_weight": args.velocity_cosine_weight,
+        "output_l1_weight": args.output_l1_weight,
+        "output_temporal_weight": args.output_temporal_weight,
+        "gt_pixel_weight": args.gt_pixel_weight,
+        "gt_temporal_weight": args.gt_temporal_weight,
+    }
+    negative = [name for name, value in loss_weights.items() if value < 0]
+    if negative:
+        raise ValueError(f"Loss weights must be non-negative: {negative}")
+    if args.gt_loss_mode == "none" and (
+        args.gt_pixel_weight != 0.0 or args.gt_temporal_weight != 0.0
+    ):
+        raise ValueError(
+            "Set --gt-pixel-weight 0 and --gt-temporal-weight 0 with "
+            "--gt-loss-mode none"
+        )
+    if args.visual_validation_samples < 0:
+        raise ValueError("visual-validation-samples must be non-negative")
+    if args.visual_video_fps <= 0 or args.visual_difference_scale <= 0:
+        raise ValueError("visual video FPS and difference scale must be positive")
+    if args.visualize_every is not None and args.visualize_every <= 0:
+        raise ValueError("visualize-every must be positive")
+    return parse_csv_ints(args.visual_frame_indices)
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    visual_frame_indices = _validate_arguments(args)
     rank, local_rank, world_size, device = init_distributed()
     writer = None
     try:
-        if args.num_workers != 0:
-            raise ValueError("The first D0 gate requires --num-workers 0")
-        if args.max_steps <= 0 or args.gradient_accumulation_steps <= 0:
-            raise ValueError("max-steps and accumulation must be positive")
-        if args.validate_every > 0 and (not args.val_manifest or not args.val_teacher_cache):
-            raise ValueError("Validation requires --val-manifest and --val-teacher-cache")
-        if args.loss_epsilon <= 0:
-            raise ValueError("loss-epsilon must be positive")
-        effective_batch = world_size * args.batch_size * args.gradient_accumulation_steps
-        if args.expected_global_batch_size is not None and effective_batch != args.expected_global_batch_size:
+        effective_batch = (
+            world_size * args.batch_size * args.gradient_accumulation_steps
+        )
+        if (
+            args.expected_global_batch_size is not None
+            and effective_batch != args.expected_global_batch_size
+        ):
             raise ValueError(
-                f"Global effective batch={effective_batch}, expected={args.expected_global_batch_size}"
+                f"Global effective batch={effective_batch}, "
+                f"expected={args.expected_global_batch_size}"
             )
 
         run_dir = args.output_dir.expanduser().resolve()
         if rank == 0:
-            if (run_dir / "train_log.jsonl").exists() or (run_dir / "latest.json").exists():
+            if (run_dir / "train_log.jsonl").exists() or (
+                run_dir / "latest.json"
+            ).exists():
                 raise FileExistsError("Output directory already contains a run")
             run_dir.mkdir(parents=True, exist_ok=True)
         dist.barrier()
@@ -394,6 +589,10 @@ def main() -> int:
             device,
             allow_mismatch=args.allow_dtype_mismatch,
         )
+        if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                f"{torch.cuda.get_device_name(device)} does not report BF16 support"
+            )
         seed_everything(args.seed + rank)
 
         train_cache = TeacherVelocityCache(args.teacher_cache)
@@ -415,7 +614,9 @@ def main() -> int:
         val_loader = None
         if args.val_manifest and args.val_teacher_cache:
             val_cache = TeacherVelocityCache(args.val_teacher_cache)
-            val_crop = args.crop_size if args.val_crop_size is None else args.val_crop_size
+            val_crop = (
+                args.crop_size if args.val_crop_size is None else args.val_crop_size
+            )
             val_dataset = build_cached_dataset(
                 args.val_manifest,
                 val_cache,
@@ -439,36 +640,6 @@ def main() -> int:
                     num_workers=0,
                     pin_memory=args.pin_memory,
                 )
-
-        run_config = {
-            "trainer": "teacher_distillation_ddp_gate_v1",
-            "base_checkpoint": str(base_checkpoint),
-            "teacher_cache": str(args.teacher_cache.expanduser().resolve()),
-            "teacher_cache_metadata_sha256": sha256_file(
-                args.teacher_cache.expanduser().resolve() / "metadata.json"
-            ),
-            "val_teacher_cache": None if args.val_teacher_cache is None else str(args.val_teacher_cache.expanduser().resolve()),
-            "manifests": [str(path.expanduser().resolve()) for path in args.manifest],
-            "val_manifests": [str(path.expanduser().resolve()) for path in (args.val_manifest or [])],
-            "clip_length": args.clip_length,
-            "crop_size": args.crop_size,
-            "scale": args.scale,
-            "views_per_record": args.views_per_record,
-            "view_seed": args.view_seed,
-            "world_size": world_size,
-            "local_batch_size": args.batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "global_effective_batch_size": effective_batch,
-            "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
-            "velocity_mse_weight": args.velocity_mse_weight,
-            "velocity_cosine_weight": args.velocity_cosine_weight,
-            "output_l1_weight": args.output_l1_weight,
-            "output_temporal_weight": args.output_temporal_weight,
-            "learning_rate": args.learning_rate,
-        }
-        if rank == 0:
-            write_json(run_dir / "run_config.json", run_config)
-        dist.barrier()
 
         reae = ReAE(str(base_checkpoint / args.reae_filename))
         transformer = WanTransformer3DModelPromptFreeNoTime.from_pretrained(
@@ -505,6 +676,63 @@ def main() -> int:
         )
         writer = create_writer(args, run_dir, rank)
 
+        visualize_every = (
+            args.validate_every
+            if args.visualize_every is None
+            else args.visualize_every
+        )
+        visuals_enabled = (
+            not args.no_validation_visuals
+            and args.visual_validation_samples > 0
+            and visualize_every > 0
+        )
+        run_config = {
+            "trainer": "teacher_distillation_ddp_v2",
+            "base_checkpoint": str(base_checkpoint),
+            "teacher_cache": str(args.teacher_cache.expanduser().resolve()),
+            "teacher_cache_metadata_sha256": sha256_file(
+                args.teacher_cache.expanduser().resolve() / "metadata.json"
+            ),
+            "val_teacher_cache": (
+                None
+                if args.val_teacher_cache is None
+                else str(args.val_teacher_cache.expanduser().resolve())
+            ),
+            "manifests": [str(path.expanduser().resolve()) for path in args.manifest],
+            "val_manifests": [
+                str(path.expanduser().resolve()) for path in (args.val_manifest or [])
+            ],
+            "clip_length": args.clip_length,
+            "crop_size": args.crop_size,
+            "scale": args.scale,
+            "views_per_record": args.views_per_record,
+            "view_seed": args.view_seed,
+            "world_size": world_size,
+            "local_batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "global_effective_batch_size": effective_batch,
+            "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
+            "grad_scaler_enabled": bool(scaler.is_enabled()),
+            "teacher_cache_storage_dtype": train_cache.metadata.get("dtype"),
+            "loss_reduction_dtype": "float32",
+            "velocity_mse_weight": args.velocity_mse_weight,
+            "velocity_cosine_weight": args.velocity_cosine_weight,
+            "output_l1_weight": args.output_l1_weight,
+            "output_temporal_weight": args.output_temporal_weight,
+            "gt_loss_mode": args.gt_loss_mode,
+            "gt_pixel_weight": args.gt_pixel_weight,
+            "gt_temporal_weight": args.gt_temporal_weight,
+            "gt_loss_every": args.gt_loss_every,
+            "visuals_enabled": visuals_enabled,
+            "visualize_every": visualize_every,
+            "visual_validation_samples": args.visual_validation_samples,
+            "visual_frame_indices": list(visual_frame_indices),
+            "learning_rate": args.learning_rate,
+        }
+        if rank == 0:
+            write_json(run_dir / "run_config.json", run_config)
+        dist.barrier()
+
         train_log = run_dir / "train_log.jsonl"
         val_log = run_dir / "val_log.jsonl"
         best_relative_l2 = float("inf")
@@ -513,18 +741,62 @@ def main() -> int:
         last_record: dict[str, object] = {}
         started = time.perf_counter()
 
-        if args.validate_at_start and val_loader is not None and val_cache is not None:
+        def run_validation(step: int) -> dict[str, float | int] | None:
+            nonlocal best_relative_l2
+            if val_loader is None or val_cache is None:
+                return None
+            visual_due = visuals_enabled and (
+                step == 0
+                or step % visualize_every == 0
+                or step == args.max_steps
+            )
+            validation, visual_samples = validate_rank0(
+                closure,
+                val_loader,
+                val_cache,
+                device=device,
+                dtype=dtype,
+                args=args,
+                visual_samples=(
+                    args.visual_validation_samples if visual_due else 0
+                ),
+            )
+            append_jsonl(val_log, {"global_step": step, **validation})
+            _write_validation_scalars(writer, step, validation)
+            if visual_due:
+                visual_report = export_validation_visuals(
+                    visual_samples,
+                    output_root=run_dir,
+                    step=step,
+                    frame_indices=visual_frame_indices,
+                    fps=args.visual_video_fps,
+                    difference_scale=args.visual_difference_scale,
+                    writer=writer,
+                )
+                if visual_report["video_errors"]:
+                    print(
+                        "validation visual MP4 warnings: "
+                        + json.dumps(visual_report["video_errors"]),
+                        flush=True,
+                    )
+            best_relative_l2 = min(
+                best_relative_l2,
+                float(validation["velocity_relative_l2"]),
+            )
+            return validation
+
+        validation_configured = bool(args.val_manifest and args.val_teacher_cache)
+        if args.validate_at_start and validation_configured:
             dist.barrier()
             if rank == 0:
-                baseline = validate_rank0(
-                    closure, val_loader, val_cache, device=device, dtype=dtype, args=args
-                )
-                append_jsonl(val_log, {"global_step": 0, **baseline})
-                best_relative_l2 = float(baseline["velocity_relative_l2"])
+                assert val_loader is not None and val_cache is not None
+                baseline = run_validation(0)
+                assert baseline is not None
                 print(
                     f"validation start rel_l2={baseline['velocity_relative_l2']:.6f} "
                     f"cos={baseline['velocity_cosine']:.6f} "
-                    f"ref_psnr={baseline['student_teacher_psnr']:.4f}",
+                    f"ref_psnr={baseline['student_teacher_psnr']:.4f} "
+                    f"gt_guard={baseline.get('gt_pixel_guard', 0.0):.6f}",
                     flush=True,
                 )
             dist.barrier()
@@ -546,6 +818,8 @@ def main() -> int:
                 sums: dict[str, float] = {}
                 step_started = time.perf_counter()
                 consumed = 0
+                apply_gt = _gt_due(args, global_step + 1)
+
                 for micro_index in range(args.gradient_accumulation_steps):
                     try:
                         batch_cpu = next(iterator)
@@ -553,28 +827,72 @@ def main() -> int:
                         break
                     consumed += 1
                     teacher_velocity = train_cache.load_batch(
-                        batch_cpu, device=device, dtype=dtype
+                        batch_cpu,
+                        device=device,
+                        dtype=dtype,
                     )
                     batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
-                    synchronize = micro_index + 1 == args.gradient_accumulation_steps
-                    sync_context = nullcontext() if synchronize else ddp_model.no_sync()
+                    synchronize = (
+                        micro_index + 1 == args.gradient_accumulation_steps
+                    )
+                    sync_context = (
+                        nullcontext() if synchronize else ddp_model.no_sync()
+                    )
                     with sync_context:
-                        with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
+                        with torch.autocast(
+                            "cuda",
+                            dtype=dtype,
+                            enabled=autocast_enabled,
+                        ):
                             output = ddp_model(batch)
-                            objective = objective_for_batch(
-                                output, teacher_velocity, closure, args
-                            )
-                            scaled_loss = objective["loss"] / args.gradient_accumulation_steps
+                            student_prediction = None
+                            teacher_prediction = None
+                            if _needs_rgb(args, apply_gt=apply_gt):
+                                student_prediction, teacher_prediction = _decode_pair(
+                                    output,
+                                    teacher_velocity,
+                                    closure,
+                                )
+                        objective = velocity_distillation_objective(
+                            output["velocity"],
+                            teacher_velocity,
+                            student_prediction=student_prediction,
+                            teacher_prediction=teacher_prediction,
+                            target=output["target"] if apply_gt else None,
+                            velocity_mse_weight=args.velocity_mse_weight,
+                            velocity_cosine_weight=args.velocity_cosine_weight,
+                            output_l1_weight=args.output_l1_weight,
+                            output_temporal_weight=args.output_temporal_weight,
+                            gt_loss_mode=args.gt_loss_mode if apply_gt else "none",
+                            gt_pixel_weight=(
+                                args.gt_pixel_weight if apply_gt else 0.0
+                            ),
+                            gt_temporal_weight=(
+                                args.gt_temporal_weight if apply_gt else 0.0
+                            ),
+                            epsilon=args.loss_epsilon,
+                        )
+                        scaled_loss = (
+                            objective["loss"]
+                            / args.gradient_accumulation_steps
+                        )
                         if not torch.isfinite(objective["loss"].detach()).item():
                             raise FloatingPointError("Non-finite distillation loss")
-                        scaler.scale(scaled_loss).backward()
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
                     for key, value in objective.items():
-                        sums[key] = sums.get(key, 0.0) + float(value.detach().float().item())
+                        sums[key] = sums.get(key, 0.0) + float(
+                            value.detach().float().item()
+                        )
+
                 if consumed != args.gradient_accumulation_steps:
                     optimizer.zero_grad(set_to_none=True)
                     break
 
-                scaler.unscale_(optimizer)
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 gradients = gradient_summary(closure.named_parameters())
                 if int(gradients["gradient_tensors"]) == 0:
                     raise RuntimeError("Backward produced no trainable gradients")
@@ -588,17 +906,30 @@ def main() -> int:
                 if args.max_grad_norm > 0:
                     grad_norm = float(
                         torch.nn.utils.clip_grad_norm_(
-                            [parameter for _, parameter in trainable_named_parameters(closure)],
+                            [
+                                parameter
+                                for _, parameter in trainable_named_parameters(closure)
+                            ],
                             max_norm=args.max_grad_norm,
                             error_if_nonfinite=True,
-                        ).float().item()
+                        )
+                        .float()
+                        .item()
                     )
+
                 scale_before = float(scaler.get_scale())
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 scale_after = float(scaler.get_scale())
                 overflow = torch.tensor(
-                    [1 if scale_after < scale_before else 0],
+                    [
+                        1
+                        if scaler.is_enabled() and scale_after < scale_before
+                        else 0
+                    ],
                     device=device,
                     dtype=torch.int32,
                 )
@@ -610,7 +941,8 @@ def main() -> int:
 
                 keys = tuple(sums)
                 packed = torch.tensor(
-                    [sums[key] for key in keys] + [grad_norm, time.perf_counter() - step_started],
+                    [sums[key] for key in keys]
+                    + [grad_norm, time.perf_counter() - step_started],
                     device=device,
                     dtype=torch.float64,
                 )
@@ -633,11 +965,15 @@ def main() -> int:
                     "global_effective_batch_size": effective_batch,
                     **averages,
                     "velocity_relative_l2": relative_l2,
+                    "gt_loss_due": float(apply_gt),
                     "gradient_norm": grad_norm_global,
+                    "grad_scaler_enabled": float(scaler.is_enabled()),
                     "grad_scaler_scale": scale_after,
                     "learning_rate": float(optimizer.param_groups[0]["lr"]),
                     "step_seconds": step_seconds,
-                    "peak_allocated_gb_per_rank": torch.cuda.max_memory_allocated(device) / 1024**3,
+                    "peak_allocated_gb_per_rank": (
+                        torch.cuda.max_memory_allocated(device) / 1024**3
+                    ),
                 }
                 if rank == 0:
                     append_jsonl(train_log, last_record)
@@ -646,58 +982,59 @@ def main() -> int:
                             f"step={global_step} loss={averages['loss']:.8f} "
                             f"rel_l2={relative_l2:.6f} "
                             f"cos={averages['velocity_cosine']:.6f} "
+                            f"gt_guard={averages['gt_pixel_guard']:.6f} "
+                            f"dtype={_CANONICAL_DTYPE_NAME[dtype]} "
+                            f"scaler={scaler.is_enabled()} "
                             f"time={step_seconds:.3f}s",
                             flush=True,
                         )
                     if writer is not None:
                         for key, value in last_record.items():
                             if isinstance(value, (int, float)) and key != "global_step":
-                                writer.add_scalar(f"train/teacher_distillation/{key}", value, global_step)
+                                if key.startswith("gt_"):
+                                    tag = (
+                                        "train/gt_constraint/"
+                                        + key.removeprefix("gt_")
+                                    )
+                                else:
+                                    tag = "train/teacher_distillation/" + key
+                                writer.add_scalar(tag, value, global_step)
                         writer.flush()
 
                 validation_due = (
-                    val_loader is not None
-                    and val_cache is not None
+                    validation_configured
                     and args.validate_every > 0
-                    and (global_step % args.validate_every == 0 or global_step == args.max_steps)
+                    and (
+                        global_step % args.validate_every == 0
+                        or global_step == args.max_steps
+                    )
                 )
                 improved = False
                 if validation_due:
                     dist.barrier()
                     if rank == 0:
-                        validation = validate_rank0(
-                            closure,
-                            val_loader,
-                            val_cache,
-                            device=device,
-                            dtype=dtype,
-                            args=args,
+                        assert val_loader is not None and val_cache is not None
+                        previous_best = best_relative_l2
+                        validation = run_validation(global_step)
+                        assert validation is not None
+                        improved = (
+                            float(validation["velocity_relative_l2"])
+                            < previous_best
                         )
-                        append_jsonl(val_log, {"global_step": global_step, **validation})
-                        improved = float(validation["velocity_relative_l2"]) < best_relative_l2
-                        if improved:
-                            best_relative_l2 = float(validation["velocity_relative_l2"])
                         print(
                             f"validation step={global_step} "
                             f"rel_l2={validation['velocity_relative_l2']:.6f} "
                             f"cos={validation['velocity_cosine']:.6f} "
                             f"ref_psnr={validation['student_teacher_psnr']:.4f} "
-                            f"gt_psnr={validation['student_gt_psnr']:.4f}",
+                            f"gt_psnr={validation['student_gt_psnr']:.4f} "
+                            f"gt_guard={validation.get('gt_pixel_guard', 0.0):.6f}",
                             flush=True,
                         )
-                        if writer is not None:
-                            for key, value in validation.items():
-                                if not isinstance(value, (int, float)):
-                                    continue
-                                if key.startswith("student_teacher_"):
-                                    tag = "val/student_teacher/" + key.removeprefix("student_teacher_")
-                                elif key.startswith("student_gt_"):
-                                    tag = "val/student_gt/" + key.removeprefix("student_gt_")
-                                else:
-                                    tag = "val/teacher_distillation/" + key
-                                writer.add_scalar(tag, value, global_step)
-                            writer.flush()
-                    marker = torch.tensor([1 if improved else 0], device=device)
+                    marker = torch.tensor(
+                        [1 if improved else 0],
+                        device=device,
+                        dtype=torch.int32,
+                    )
                     dist.broadcast(marker, src=0)
                     improved = bool(marker.item())
                     dist.barrier()
@@ -720,6 +1057,7 @@ def main() -> int:
                             scaler,
                             step=global_step,
                             last_record=last_record,
+                            runtime_dtype=dtype,
                         )
                         if improved:
                             write_json(
@@ -740,10 +1078,15 @@ def main() -> int:
                 "global_step": global_step,
                 "max_steps": args.max_steps,
                 "elapsed_seconds": time.perf_counter() - started,
-                "best_velocity_relative_l2": None if best_relative_l2 == float("inf") else best_relative_l2,
+                "best_velocity_relative_l2": (
+                    None
+                    if best_relative_l2 == float("inf")
+                    else best_relative_l2
+                ),
                 "last_record": last_record,
                 "run_dir": str(run_dir),
                 "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
+                "grad_scaler_enabled": bool(scaler.is_enabled()),
                 "world_size": world_size,
             }
             write_json(run_dir / "summary.json", summary)
