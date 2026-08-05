@@ -14,7 +14,10 @@ from typing import Mapping, Sequence
 import torch
 from torch.utils.data import Dataset, Subset
 
+from swiftvr.data import TripletSequenceRecord, read_triplet_manifests
+
 SELECTION_MODES = frozenset({"all", "prefix", "random"})
+SOURCE_IDENTITY_METHOD = "resolved_hr_frame_paths_sha256_v1"
 
 
 def _sha256_json(value: object) -> str:
@@ -114,6 +117,27 @@ def build_cache_backed_subset(dataset: Dataset, cache) -> Subset:
     return Subset(dataset, list(indices))
 
 
+def record_source_uid(record: TripletSequenceRecord) -> str:
+    """Hash the complete resolved HR sequence path list for leakage checks.
+
+    HR paths identify the underlying clean source sequence. HQ/LR paths, crop,
+    temporal view, degradation variant, and augmentation are intentionally omitted:
+    distinct degradations or views of the same HR sequence must still count as the
+    same source. Paths are already absolute and normalized by the manifest reader.
+    """
+
+    if not record.hr_paths:
+        raise ValueError("Triplet record has no HR paths")
+    return _sha256_json(
+        {
+            "method": SOURCE_IDENTITY_METHOD,
+            "hr_paths": [
+                str(Path(path).expanduser().resolve()) for path in record.hr_paths
+            ],
+        }
+    )
+
+
 def cache_record_uids(metadata: Mapping[str, object]) -> set[str]:
     samples = metadata.get("samples")
     if not isinstance(samples, list):
@@ -129,18 +153,172 @@ def cache_record_uids(metadata: Mapping[str, object]) -> set[str]:
     return result
 
 
+def _resolved_records_for_cache(
+    metadata: Mapping[str, object],
+    *,
+    path_root: str | Path | None,
+) -> list[TripletSequenceRecord]:
+    manifests = metadata.get("manifests")
+    if not isinstance(manifests, list) or not manifests:
+        raise ValueError(
+            "Legacy cache has no embedded source_uid and metadata lacks manifests"
+        )
+    root_value: str | Path
+    if path_root is not None:
+        root_value = path_root
+    elif metadata.get("path_root") not in (None, ""):
+        root_value = str(metadata["path_root"])
+    else:
+        root_value = Path.cwd()
+    split_value = metadata.get("split")
+    split = None if split_value in (None, "") else str(split_value)
+    records = read_triplet_manifests(
+        [Path(str(value)) for value in manifests],
+        split=split,
+        path_root=root_value,
+        verify_paths=False,
+    )
+    clip_length = int(metadata.get("clip_length", 0))
+    if clip_length <= 0:
+        raise ValueError("Cache metadata has no valid clip_length")
+    filtered = [record for record in records if record.frame_count >= clip_length]
+    expected = metadata.get("base_record_count")
+    if expected is not None and len(filtered) != int(expected):
+        raise ValueError(
+            "Cache source reconstruction record count differs: "
+            f"metadata={expected}, reconstructed={len(filtered)}"
+        )
+    if not filtered:
+        raise ValueError("No records remain while reconstructing cache sources")
+    return filtered
+
+
+def cache_source_entries(
+    metadata: Mapping[str, object],
+    *,
+    path_root: str | Path | None = None,
+) -> dict[str, dict[str, object]]:
+    """Return unique source identities represented by a cache.
+
+    New caches embed ``source_uid`` per sample. Existing caches are supported by
+    resolving their recorded manifests and mapping ``distillation_index`` back to
+    the original record index. Thus old velocity tensors do not need rebuilding.
+    """
+
+    samples = metadata.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise TypeError("Cache metadata samples must be a non-empty list")
+    embedded = all(
+        isinstance(sample, Mapping)
+        and isinstance(sample.get("source_uid"), str)
+        and bool(sample.get("source_uid"))
+        for sample in samples
+    )
+    records: list[TripletSequenceRecord] | None = None
+    views_per_record = int(metadata.get("views_per_record", 0))
+    if not embedded:
+        if views_per_record <= 0:
+            raise ValueError("Cache metadata has no valid views_per_record")
+        records = _resolved_records_for_cache(metadata, path_root=path_root)
+
+    entries: dict[str, dict[str, object]] = {}
+    for sample in samples:
+        if not isinstance(sample, Mapping):
+            raise TypeError("Cache sample entries must be mappings")
+        record_uid = sample.get("record_uid")
+        if not isinstance(record_uid, str) or not record_uid:
+            raise ValueError("Cache sample is missing record_uid")
+
+        if embedded:
+            source_uid = str(sample["source_uid"])
+            first_path = sample.get("source_hr_first")
+            last_path = sample.get("source_hr_last")
+        else:
+            assert records is not None
+            index = int(sample.get("distillation_index", -1))
+            if index < 0:
+                raise ValueError("Legacy cache sample lacks distillation_index")
+            record_index = index // views_per_record
+            if record_index >= len(records):
+                raise ValueError(
+                    f"Cache distillation_index={index} maps beyond {len(records)} records"
+                )
+            record = records[record_index]
+            if sample.get("sample_id") != record.sample_id:
+                raise ValueError(
+                    "Cache source reconstruction sample_id mismatch: "
+                    f"cache={sample.get('sample_id')!r}, manifest={record.sample_id!r}"
+                )
+            if sample.get("variant") != record.variant:
+                raise ValueError(
+                    "Cache source reconstruction variant mismatch: "
+                    f"cache={sample.get('variant')!r}, manifest={record.variant!r}"
+                )
+            source_uid = record_source_uid(record)
+            first_path = record.hr_paths[0]
+            last_path = record.hr_paths[-1]
+
+        entry = entries.setdefault(
+            source_uid,
+            {
+                "record_uids": set(),
+                "source_hr_first": first_path,
+                "source_hr_last": last_path,
+            },
+        )
+        record_uids = entry["record_uids"]
+        if not isinstance(record_uids, set):
+            raise TypeError("Internal source entry record_uids must be a set")
+        record_uids.add(record_uid)
+    return entries
+
+
 def cache_overlap_report(
     train_metadata: Mapping[str, object],
     val_metadata: Mapping[str, object],
+    *,
+    train_path_root: str | Path | None = None,
+    val_path_root: str | Path | None = None,
 ) -> dict[str, object]:
-    train_uids = cache_record_uids(train_metadata)
-    val_uids = cache_record_uids(val_metadata)
-    overlap = sorted(train_uids & val_uids)
+    """Separate harmless human-readable name collisions from true source overlap."""
+
+    train_record_uids = cache_record_uids(train_metadata)
+    val_record_uids = cache_record_uids(val_metadata)
+    record_uid_collisions = sorted(train_record_uids & val_record_uids)
+
+    train_sources = cache_source_entries(train_metadata, path_root=train_path_root)
+    val_sources = cache_source_entries(val_metadata, path_root=val_path_root)
+    source_overlap_uids = sorted(set(train_sources) & set(val_sources))
+    source_overlap_examples = []
+    for uid in source_overlap_uids[:16]:
+        train_entry = train_sources[uid]
+        val_entry = val_sources[uid]
+        source_overlap_examples.append(
+            {
+                "source_uid": uid,
+                "train_record_uids": sorted(train_entry["record_uids"]),
+                "val_record_uids": sorted(val_entry["record_uids"]),
+                "train_hr_first": train_entry.get("source_hr_first"),
+                "val_hr_first": val_entry.get("source_hr_first"),
+            }
+        )
+
+    source_overlap_count = len(source_overlap_uids)
     return {
-        "train_records": len(train_uids),
-        "val_records": len(val_uids),
-        "overlap_records": len(overlap),
-        "overlap_record_uids": overlap,
+        "source_identity_method": SOURCE_IDENTITY_METHOD,
+        "train_records": len(train_record_uids),
+        "val_records": len(val_record_uids),
+        "record_uid_collisions": len(record_uid_collisions),
+        "record_uid_collision_values": record_uid_collisions,
+        "train_sources": len(train_sources),
+        "val_sources": len(val_sources),
+        "source_overlap_records": source_overlap_count,
+        "source_overlap_uids": source_overlap_uids,
+        "source_overlap_examples": source_overlap_examples,
+        # Compatibility for the existing inspector/trainer. These now mean true
+        # source overlap, not record_uid string collision.
+        "overlap_records": source_overlap_count,
+        "overlap_record_uids": source_overlap_uids,
         "reference_checkpoint_match": (
             train_metadata.get("reference_checkpoint")
             == val_metadata.get("reference_checkpoint")
@@ -152,7 +330,8 @@ def cache_overlap_report(
         "reae_sha256_match": (
             train_metadata.get("reae_sha256") == val_metadata.get("reae_sha256")
         ),
-        "timestep_match": train_metadata.get("timestep") == val_metadata.get("timestep"),
+        "timestep_match": train_metadata.get("timestep")
+        == val_metadata.get("timestep"),
     }
 
 
