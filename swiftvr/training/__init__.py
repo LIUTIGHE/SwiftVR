@@ -9,6 +9,7 @@ from .checkpoint import (
     trainable_named_parameters,
 )
 from .distillation import (
+    GT_LOSS_MODES,
     DeterministicTripletViewDataset,
     DistillationMetricAccumulator,
     SwiftVRVelocityDistillationForward,
@@ -17,6 +18,7 @@ from .distillation import (
     decode_student_prediction,
     decode_teacher_prediction,
     distillation_sample_identity,
+    gt_reconstruction_constraint,
     velocity_distillation_objective,
 )
 from .forward import (
@@ -53,6 +55,7 @@ from .stage3 import (
 )
 
 __all__ = [
+    "GT_LOSS_MODES",
     "DeterministicTripletViewDataset",
     "DistillationMetricAccumulator",
     "SwiftVRTrainingForward",
@@ -75,6 +78,7 @@ __all__ = [
     "distillation_sample_identity",
     "encode_reae_clip",
     "forward_prompt_free_no_time_training",
+    "gt_reconstruction_constraint",
     "load_delta_checkpoint",
     "load_trainer_state",
     "optimizer_state_summary",
