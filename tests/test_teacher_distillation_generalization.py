@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from torch.utils.data import Dataset
 
@@ -87,23 +90,99 @@ class SelectionTests(unittest.TestCase):
 
 class CacheRelationshipTests(unittest.TestCase):
     @staticmethod
-    def _metadata(uids: list[str]) -> dict[str, object]:
+    def _metadata(pairs: list[tuple[str, str]]) -> dict[str, object]:
         return {
             "reference_checkpoint": "/teacher",
             "prompt_embedding_sha256": "prompt",
             "reae_sha256": "reae",
             "timestep": 1000.0,
-            "samples": [{"record_uid": uid} for uid in uids],
+            "samples": [
+                {"record_uid": record_uid, "source_uid": source_uid}
+                for record_uid, source_uid in pairs
+            ],
         }
 
-    def test_overlap_report(self) -> None:
+    def test_name_collision_without_source_overlap_is_warning_only(self) -> None:
         report = cache_overlap_report(
-            self._metadata(["a", "b"]),
-            self._metadata(["b", "c"]),
+            self._metadata([("plain:dup", "source-train")]),
+            self._metadata([("plain:dup", "source-val")]),
         )
+        self.assertEqual(report["record_uid_collisions"], 1)
+        self.assertEqual(report["record_uid_collision_values"], ["plain:dup"])
+        self.assertEqual(report["source_overlap_records"], 0)
+        self.assertEqual(report["overlap_records"], 0)
+
+    def test_same_source_with_different_names_is_true_overlap(self) -> None:
+        report = cache_overlap_report(
+            self._metadata([("plain:train-name", "same-source")]),
+            self._metadata([("plain:val-name", "same-source")]),
+        )
+        self.assertEqual(report["record_uid_collisions"], 0)
+        self.assertEqual(report["source_overlap_records"], 1)
+        self.assertEqual(report["source_overlap_uids"], ["same-source"])
         self.assertEqual(report["overlap_records"], 1)
-        self.assertEqual(report["overlap_record_uids"], ["b"])
         self.assertTrue(report["timestep_match"])
+
+    def test_legacy_cache_reconstructs_source_from_full_hr_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_manifest = root / "plain_train.jsonl"
+            val_manifest = root / "plain_val.jsonl"
+
+            def write_manifest(path: Path, split: str, suffix: str) -> None:
+                indices = list(range(13))
+                payload = {
+                    "sample_id": "same-basename",
+                    "split": split,
+                    "variant": "plain",
+                    "frame_indices": indices,
+                    "hr_frames": [
+                        f"dataset/{split}/video/frame_comp0_{index:06d}_{suffix}.png"
+                        for index in indices
+                    ],
+                    "hq_frames": [
+                        f"dataset/{split}/hq/frame_comp0_{index:06d}_{suffix}.png"
+                        for index in indices
+                    ],
+                    "lr_frames": [
+                        f"dataset/{split}/lr/frame_comp0_{index:06d}_{suffix}.png"
+                        for index in indices
+                    ],
+                }
+                path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+            write_manifest(train_manifest, "train", "train-content")
+            write_manifest(val_manifest, "val", "val-content")
+
+            def metadata(manifest: Path, split: str) -> dict[str, object]:
+                return {
+                    "reference_checkpoint": "/teacher",
+                    "prompt_embedding_sha256": "prompt",
+                    "reae_sha256": "reae",
+                    "timestep": 1000.0,
+                    "manifests": [str(manifest)],
+                    "split": split,
+                    "clip_length": 13,
+                    "views_per_record": 1,
+                    "base_record_count": 1,
+                    "samples": [
+                        {
+                            "record_uid": "plain:same-basename",
+                            "sample_id": "same-basename",
+                            "variant": "plain",
+                            "distillation_index": 0,
+                        }
+                    ],
+                }
+
+            report = cache_overlap_report(
+                metadata(train_manifest, "train"),
+                metadata(val_manifest, "val"),
+                train_path_root=root,
+                val_path_root=root,
+            )
+            self.assertEqual(report["record_uid_collisions"], 1)
+            self.assertEqual(report["source_overlap_records"], 0)
 
     def test_resume_fingerprint_detects_change(self) -> None:
         validate_resume_fingerprint({"a": 1}, {"a": 1})
