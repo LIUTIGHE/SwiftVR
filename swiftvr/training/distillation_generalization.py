@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -16,7 +17,7 @@ from torch.utils.data import Dataset, Subset
 
 from swiftvr.data import TripletSequenceRecord, read_triplet_manifests
 
-SELECTION_MODES = frozenset({"all", "prefix", "random"})
+SELECTION_MODES = frozenset({"all", "prefix", "random", "source_balanced"})
 SOURCE_IDENTITY_METHOD = "resolved_hr_frame_paths_sha256_v1"
 
 
@@ -25,14 +26,84 @@ def _sha256_json(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _source_balanced_indices(
+    source_uids: Sequence[str],
+    *,
+    views_per_record: int,
+    count: int,
+    seed: int,
+) -> tuple[int, ...]:
+    """Round-robin candidates so every HR source is covered before repeats.
+
+    A source may correspond to several manifest records (for example plain/text
+    degradation variants) and every record may expose several deterministic views.
+    Candidate order inside each source and source traversal order are shuffled by a
+    CPU generator, making the selection reproducible without favoring manifest order.
+    """
+
+    views = int(views_per_record)
+    if views <= 0:
+        raise ValueError("views_per_record must be positive for source_balanced mode")
+    if not source_uids:
+        raise ValueError("source_uids must not be empty for source_balanced mode")
+    normalized_uids = tuple(str(uid) for uid in source_uids)
+    if any(not uid for uid in normalized_uids):
+        raise ValueError("source_uids must contain non-empty strings")
+
+    candidates: dict[str, list[int]] = defaultdict(list)
+    for record_index, source_uid in enumerate(normalized_uids):
+        start = record_index * views
+        candidates[source_uid].extend(range(start, start + views))
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+
+    source_keys = sorted(candidates)
+    source_permutation = torch.randperm(len(source_keys), generator=generator).tolist()
+    source_order = [source_keys[index] for index in source_permutation]
+    for source_uid in source_order:
+        values = candidates[source_uid]
+        permutation = torch.randperm(len(values), generator=generator).tolist()
+        candidates[source_uid] = [values[index] for index in permutation]
+
+    positions = {source_uid: 0 for source_uid in source_order}
+    selected: list[int] = []
+    while len(selected) < count:
+        added = False
+        for source_uid in source_order:
+            position = positions[source_uid]
+            values = candidates[source_uid]
+            if position >= len(values):
+                continue
+            selected.append(values[position])
+            positions[source_uid] = position + 1
+            added = True
+            if len(selected) == count:
+                break
+        if not added:
+            raise RuntimeError(
+                f"Source-balanced selection exhausted {len(selected)} candidates, "
+                f"expected {count}"
+            )
+    return tuple(selected)
+
+
 def select_distillation_indices(
     dataset_length: int,
     *,
     max_samples: int | None,
     mode: str = "all",
     seed: int = 0,
+    source_uids: Sequence[str] | None = None,
+    views_per_record: int | None = None,
 ) -> tuple[int, ...]:
-    """Select stable full-dataset indices for an offline teacher cache."""
+    """Select stable full-dataset indices for an offline teacher cache.
+
+    ``source_balanced`` requires one source UID per base manifest record plus the
+    deterministic ``views_per_record`` multiplier. It covers distinct HR sources
+    before taking additional degradation variants or views from an already covered
+    source.
+    """
 
     length = int(dataset_length)
     if length <= 0:
@@ -57,6 +128,23 @@ def select_distillation_indices(
         return tuple(range(length))
     if normalized_mode == "prefix":
         return tuple(range(count))
+    if normalized_mode == "source_balanced":
+        if source_uids is None or views_per_record is None:
+            raise ValueError(
+                "source_balanced mode requires source_uids and views_per_record"
+            )
+        expected_length = len(source_uids) * int(views_per_record)
+        if expected_length != length:
+            raise ValueError(
+                "source_balanced dataset length mismatch: "
+                f"dataset_length={length}, records*views={expected_length}"
+            )
+        return _source_balanced_indices(
+            source_uids,
+            views_per_record=int(views_per_record),
+            count=count,
+            seed=int(seed),
+        )
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
