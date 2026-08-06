@@ -48,10 +48,10 @@ complete resolved HR source identity overlaps, or when a cache tensor is missing
 or when the teacher checkpoint, prompt embedding, ReAE, or endpoint timestep
 differ. Do not permit true HR-source overlap in a generalization experiment.
 
-## Resumable DDP trainer
+## Validated baseline trainer
 
-Use `tools/train_teacher_distillation_generalization_ddp.py`. It inherits the
-validated arguments from `train_teacher_distillation_ddp.py` and adds:
+`tools/train_teacher_distillation_generalization_ddp.py` is the validated
+synchronous-input baseline. It provides:
 
 - `--resume latest` or an explicit checkpoint directory;
 - arbitrary selected cache indices rather than a contiguous prefix;
@@ -72,16 +72,52 @@ The validated four-GPU baseline uses per-GPU batch 1, accumulation 2, global
 effective batch 8, BF16 runtime, velocity MSE/cosine weights 1.0/1.0, and GT guard
 weights 0.10/0.05.
 
+## Prefetched throughput trainer
+
+`tools/train_teacher_distillation_throughput_ddp.py` wraps the validated trainer
+and changes only the training input path. It does not duplicate or modify the
+loss, model forward, optimizer, validation, checkpoint, or DDP reduction logic.
+It adds:
+
+- `--num-workers N` with positive worker counts;
+- `--prefetch-factor N` for each worker;
+- `--persistent-workers` for the active epoch iterator;
+- training-time HQ decoding disabled by default, because the current velocity
+  objective and GT guard use LR and HR but not HQ;
+- `--load-train-hq` for a compatibility diagnostic;
+- worker and HQ-loading settings in the strict resume fingerprint.
+
+Validation keeps loading the complete triplet. The deterministic view identity is
+still derived from `(view_seed, record_index, view_index)`, so worker scheduling
+must not change the sampled temporal window, crop, or flips. Nevertheless, treat
+positive-worker exact resume as a new gate: compare a continuous 0-to-75 run with
+a 0-to-50 plus 50-to-75 resumed run before formal training.
+
+Start with:
+
+```text
+num_workers       = 2 per rank
+prefetch_factor    = 2
+persistent_workers = true
+load_train_hq      = false
+```
+
+Use `tools/benchmark_distillation_input_pipeline.py` to compare the synchronous
+baseline and candidate worker settings on the same cache. The benchmark reports
+triplet decode time separately from teacher-cache loading. Run enough warm-up
+samples that worker startup and filesystem page-cache transients do not dominate.
+
 ## Formal-scale selection and stopping
 
-Prefer one deterministic view per record initially so large-scale expansion adds
-source diversity rather than many crops from a small set of videos. When a cache
-must be capped, use `source_balanced`. Choose training length by the planner's
-exact optimizer steps per epoch rather than by copying the 500-step gate. Start
-with eight effective epochs, validate every quarter to half epoch, and continue
-only when the independent validation curve still improves.
+The 1987-source baseline uses two deterministic views per source. Increasing to
+four or eight views should add unique temporal/spatial views rather than merely
+extend the number of epochs over the same fixed views. Select the final view count
+after the prefetched input gate, because offline-cache construction should not be
+expanded while image decoding leaves the GPUs idle.
 
-Select checkpoints primarily by validation velocity relative L2, then compare
-velocity cosine, student/teacher and student/GT PSNR/SSIM, GT guard violations,
-and fixed full-video visual results. Keep both the distillation-best checkpoint
-and any nearby GT-favored checkpoint until the final benchmark is complete.
+Choose training length by the planner's exact optimizer steps per epoch rather
+than by copying the 500-step gate. Select checkpoints primarily by validation
+velocity relative L2, then compare velocity cosine, student/teacher and student/GT
+PSNR/SSIM, GT guard violations, and fixed full-video visual results. Keep both the
+distillation-best checkpoint and any nearby GT-favored checkpoint until the final
+benchmark is complete.
