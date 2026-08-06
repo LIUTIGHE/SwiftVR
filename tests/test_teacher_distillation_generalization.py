@@ -56,6 +56,54 @@ class SelectionTests(unittest.TestCase):
                 5, max_samples=3, mode="all", seed=0
             )
 
+    def test_source_balanced_covers_unique_sources_before_repeats(self) -> None:
+        source_uids = ["A", "A", "B", "C"]
+        selected = select_distillation_indices(
+            8,
+            max_samples=3,
+            mode="source_balanced",
+            seed=19,
+            source_uids=source_uids,
+            views_per_record=2,
+        )
+        selected_sources = {source_uids[index // 2] for index in selected}
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected_sources, {"A", "B", "C"})
+
+    def test_source_balanced_is_deterministic_and_then_round_robins(self) -> None:
+        source_uids = ["A", "A", "B", "C"]
+        first = select_distillation_indices(
+            8,
+            max_samples=6,
+            mode="source_balanced",
+            seed=23,
+            source_uids=source_uids,
+            views_per_record=2,
+        )
+        second = select_distillation_indices(
+            8,
+            max_samples=6,
+            mode="source_balanced",
+            seed=23,
+            source_uids=source_uids,
+            views_per_record=2,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(set(first)), 6)
+        first_round_sources = {source_uids[index // 2] for index in first[:3]}
+        self.assertEqual(first_round_sources, {"A", "B", "C"})
+
+    def test_source_balanced_validates_mapping(self) -> None:
+        with self.assertRaises(ValueError):
+            select_distillation_indices(
+                5,
+                max_samples=3,
+                mode="source_balanced",
+                seed=0,
+                source_uids=["A", "B"],
+                views_per_record=2,
+            )
+
     def test_cache_backed_subset_preserves_selected_order(self) -> None:
         class DummyDataset(Dataset):
             def __len__(self):
