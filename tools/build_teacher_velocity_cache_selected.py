@@ -25,6 +25,8 @@ from swiftvr.training.distillation import (
 )
 from swiftvr.training.distillation_generalization import (
     SELECTION_MODES,
+    SOURCE_IDENTITY_METHOD,
+    record_source_uid,
     select_distillation_indices,
     selected_indices_sha256,
 )
@@ -56,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--selection-mode",
         choices=tuple(sorted(SELECTION_MODES)),
         default="all",
+        help=(
+            "source_balanced covers distinct resolved HR sources before taking "
+            "additional degradation records or views from the same source"
+        ),
     )
     parser.add_argument("--selection-seed", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -113,6 +119,7 @@ def main() -> int:
 
     reference_root = args.reference_checkpoint.expanduser().resolve()
     output = args.output_dir.expanduser().resolve()
+    path_root = args.path_root.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         if not args.overwrite:
             raise FileExistsError(f"Teacher cache is not empty: {output}")
@@ -130,7 +137,7 @@ def main() -> int:
         horizontal_flip_probability=args.horizontal_flip_probability,
         vertical_flip_probability=args.vertical_flip_probability,
         drop_short_sequences=True,
-        path_root=args.path_root,
+        path_root=path_root,
         verify_paths=args.verify_paths,
     )
     full_dataset = DeterministicTripletViewDataset(
@@ -138,12 +145,21 @@ def main() -> int:
         views_per_record=args.views_per_record,
         view_seed=args.view_seed,
     )
+    record_source_uids = tuple(record_source_uid(record) for record in base_dataset.records)
     selected_indices = select_distillation_indices(
         len(full_dataset),
         max_samples=args.max_samples,
         mode=args.selection_mode,
         seed=args.selection_seed,
+        source_uids=record_source_uids,
+        views_per_record=args.views_per_record,
     )
+    selected_record_indices = {
+        int(index) // int(args.views_per_record) for index in selected_indices
+    }
+    selected_source_uids = {
+        record_source_uids[index] for index in selected_record_indices
+    }
     dataset = Subset(full_dataset, list(selected_indices))
     loader = DataLoader(
         dataset,
@@ -190,20 +206,38 @@ def main() -> int:
 
         for local_index in range(int(velocities.shape[0])):
             identity = distillation_sample_identity(batch_cpu, local_index)
+            distillation_index = int(identity["distillation_index"])
+            record_index = distillation_index // int(args.views_per_record)
+            if record_index >= len(base_dataset.records):
+                raise RuntimeError(
+                    f"distillation_index={distillation_index} maps beyond "
+                    f"{len(base_dataset.records)} records"
+                )
+            record = base_dataset.records[record_index]
+            source_uid = record_source_uids[record_index]
             velocity = velocities[local_index].detach().to(
                 device="cpu", dtype=torch.float16
             ).contiguous()
             relative_file = (
-                f"samples/{identity['distillation_index']:08d}_"
+                f"samples/{distillation_index:08d}_"
                 f"{identity['key']}.safetensors"
             )
             save_file({"velocity": velocity}, str(output / relative_file))
-            saved_samples.append({**identity, "file": relative_file})
+            saved_samples.append(
+                {
+                    **identity,
+                    "source_uid": source_uid,
+                    "source_hr_first": record.hr_paths[0],
+                    "source_hr_last": record.hr_paths[-1],
+                    "file": relative_file,
+                }
+            )
             processed += 1
             print(
                 f"cached {processed}/{len(selected_indices)}: "
-                f"dataset_index={identity['distillation_index']} "
-                f"{identity['record_uid']} view={identity['view_index']}",
+                f"dataset_index={distillation_index} "
+                f"{identity['record_uid']} view={identity['view_index']} "
+                f"source={source_uid[:12]}",
                 flush=True,
             )
 
@@ -226,6 +260,7 @@ def main() -> int:
         "attention_backend": args.attention_backend,
         "manifests": [str(path) for path in manifests],
         "manifest_sha256": {str(path): sha256_file(path) for path in manifests},
+        "path_root": str(path_root),
         "split": args.split,
         "clip_length": int(args.clip_length),
         "crop_size": int(args.crop_size),
@@ -235,11 +270,15 @@ def main() -> int:
         "horizontal_flip_probability": float(args.horizontal_flip_probability),
         "vertical_flip_probability": float(args.vertical_flip_probability),
         "base_record_count": len(base_dataset),
+        "unique_source_count": len(set(record_source_uids)),
         "full_dataset_length": len(full_dataset),
         "selection_mode": args.selection_mode,
         "selection_seed": int(args.selection_seed),
         "selected_indices": list(selected_indices),
         "selected_indices_sha256": selected_indices_sha256(selected_indices),
+        "selected_record_count": len(selected_record_indices),
+        "selected_unique_source_count": len(selected_source_uids),
+        "source_identity_method": SOURCE_IDENTITY_METHOD,
         "sample_count": processed,
         "elapsed_seconds": time.perf_counter() - started,
         "samples": saved_samples,
