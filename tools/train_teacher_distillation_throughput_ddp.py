@@ -2,7 +2,7 @@
 """Prefetched DDP teacher distillation with optional HQ decoding disabled.
 
 This entry point deliberately wraps the validated generalization trainer rather
-than duplicating its optimization loop.  It changes only the train Dataset and
+than duplicating its optimization loop. It changes only the train Dataset and
 DataLoader path, while retaining the existing loss, checkpoint, validation,
 DDP, and same-world-size exact-resume implementation.
 """
@@ -26,7 +26,10 @@ from swiftvr.training.distillation import (
     TeacherVelocityCache,
 )
 from swiftvr.training.distillation_generalization import build_cache_backed_subset
-from swiftvr.training.input_pipeline import dataloader_worker_kwargs
+from swiftvr.training.input_pipeline import (
+    dataloader_worker_kwargs,
+    skip_prefetched_batches,
+)
 
 
 _ORIGINAL_BUILD_PARSER = base.build_parser
@@ -211,7 +214,7 @@ def _fingerprint(
 def main() -> int:
     global _RUNTIME_ARGS
 
-    # Parse once to configure the wrapped Dataset path.  The baseline main then
+    # Parse once to configure the wrapped Dataset path. The baseline main then
     # parses the same argv through this parser and owns all execution afterward.
     _RUNTIME_ARGS = build_parser().parse_args()
     base.build_parser = build_parser
@@ -219,6 +222,10 @@ def main() -> int:
     base._build_cached_dataset = _build_cached_dataset
     base._make_train_loader = _make_train_loader
     base._fingerprint = _fingerprint
+    # The baseline fast-skip helper directly advances DataLoader._sampler_iter.
+    # Multiprocessing prefetch has already advanced that private iterator before
+    # resume starts, so use the prefetch-aware wrapper for this trainer only.
+    base.skip_batches = skip_prefetched_batches
     return base.main()
 
 
