@@ -82,6 +82,15 @@ def build_parser() -> argparse.ArgumentParser:
             "otherwise make waiting ranks hit PyTorch's 600-second default timeout."
         ),
     )
+    parser.add_argument(
+        "--validation-visual-videos",
+        action="store_true",
+        help=(
+            "Also encode MP4 validation comparisons. Off by default because ffmpeg "
+            "runs inside a rank-0-only synchronized validation section and can block "
+            "other DDP ranks for a long time. PNG/TensorBoard visuals remain enabled."
+        ),
+    )
     return parser
 
 
@@ -154,12 +163,16 @@ def _timed_validate_rank0(*args, **kwargs):
 
 
 def _timed_export_validation_visuals(*args, **kwargs):
+    if _RUNTIME_ARGS is None:
+        raise RuntimeError("Throughput trainer runtime arguments are not initialized")
     step = kwargs.get("step", "unknown")
+    kwargs["write_videos"] = bool(_RUNTIME_ARGS.validation_visual_videos)
     started = time.perf_counter()
-    print(f"validation visuals step={step}: start", flush=True)
+    mode = "PNG+MP4" if _RUNTIME_ARGS.validation_visual_videos else "PNG-only"
+    print(f"validation visuals step={step} ({mode}): start", flush=True)
     result = _ORIGINAL_EXPORT_VALIDATION_VISUALS(*args, **kwargs)
     print(
-        f"validation visuals step={step}: done in "
+        f"validation visuals step={step} ({mode}): done in "
         f"{time.perf_counter() - started:.3f}s",
         flush=True,
     )
@@ -296,8 +309,9 @@ def _fingerprint(
             "load_train_hq": bool(args.load_train_hq),
         }
     )
-    # Validation batching and process-group timeout are deliberately excluded:
-    # neither changes the training sample sequence, loss, optimizer, or model state.
+    # Validation batching, visual file format, and process-group timeout are
+    # deliberately excluded: none changes the training sample sequence, loss,
+    # optimizer, or model state.
     return result
 
 
