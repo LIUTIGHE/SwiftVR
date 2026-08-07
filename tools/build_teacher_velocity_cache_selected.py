@@ -31,6 +31,7 @@ from swiftvr.training.distillation_generalization import (
     selected_indices_sha256,
 )
 from swiftvr.training.forward import prepare_training_batch
+from swiftvr.training.input_pipeline import dataloader_worker_kwargs
 from swiftvr.training.reference import sha256_file
 
 DTYPES = {
@@ -66,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-seed", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--persistent-workers", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="float16")
     parser.add_argument("--attention-backend", default="sdpa")
@@ -99,6 +103,11 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.views_per_record <= 0 or args.batch_size <= 0:
         raise ValueError("views-per-record and batch-size must be positive")
+    worker_kwargs = dataloader_worker_kwargs(
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+    )
     for name, value in (
         ("horizontal-flip-probability", args.horizontal_flip_probability),
         ("vertical-flip-probability", args.vertical_flip_probability),
@@ -127,6 +136,9 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     (output / "samples").mkdir()
 
+    # HQ is not consumed by the endpoint teacher-velocity forward. Keep HR loaded
+    # because prepare_training_batch uses the target geometry to construct the
+    # exact same LQ input used by distillation training.
     base_dataset = TripletVideoDataset(
         args.manifest,
         split=args.split,
@@ -134,6 +146,7 @@ def main() -> int:
         clip_length=args.clip_length,
         crop_size=args.crop_size,
         scale=args.scale,
+        load_hq=False,
         horizontal_flip_probability=args.horizontal_flip_probability,
         vertical_flip_probability=args.vertical_flip_probability,
         drop_short_sequences=True,
@@ -166,8 +179,8 @@ def main() -> int:
         batch_size=args.batch_size,
         shuffle=False,
         drop_last=False,
-        num_workers=0,
         pin_memory=device.type == "cuda",
+        **worker_kwargs,
     )
 
     prompt_path = reference_root / args.prompt_embedding_filename
@@ -278,13 +291,28 @@ def main() -> int:
         "selected_indices_sha256": selected_indices_sha256(selected_indices),
         "selected_record_count": len(selected_record_indices),
         "selected_unique_source_count": len(selected_source_uids),
-        "source_identity_method": SOURCE_IDENTITY_METHOD,
-        "sample_count": processed,
-        "elapsed_seconds": time.perf_counter() - started,
+        "sample_count": len(saved_samples),
         "samples": saved_samples,
     }
     _write_json(output / TEACHER_CACHE_METADATA_FILENAME, metadata)
-    print(json.dumps({k: v for k, v in metadata.items() if k != "samples"}, indent=2))
+    elapsed = time.perf_counter() - started
+    print(
+        json.dumps(
+            {
+                "cache_root": str(output),
+                "selected_samples": len(saved_samples),
+                "selected_records": len(selected_record_indices),
+                "selected_unique_sources": len(selected_source_uids),
+                "full_dataset_length": len(full_dataset),
+                "selection_mode": args.selection_mode,
+                "selected_indices_sha256": metadata["selected_indices_sha256"],
+                "storage_dtype": metadata["storage_dtype"],
+                "elapsed_seconds": elapsed,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
     return 0
 
 
