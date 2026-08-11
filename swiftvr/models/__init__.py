@@ -1,6 +1,7 @@
-"""Model definitions for SwiftVR: the DiT backbone and the autoencoder."""
+"""Model definitions for SwiftVR: the DiT backbone and autoencoder/decoder paths."""
 
 from .reae import ReAE, MemBlock, TPool, TGrow, Clamp
+from .tiny_conditional_decoder import TinyConditionalDecoder, pack_rgb_condition
 from .transformer import (
     WanTransformer3DModel,
     enable_shifted_window_self_attention,
