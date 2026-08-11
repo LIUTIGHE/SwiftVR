@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Profile steady-state Stage-A SwiftVR compute on one streaming MIDDLE chunk.
 
-The profiler uses the real SwiftVR streaming ReAE path and counts the actually
-executed Linear/Conv/attention MACs. Conditional-teacher and prompt-free/no-time
-student architectures are measured on the same input chunks and output geometry.
-Student delta checkpoints do not change architecture/MACs, so the prompt-free
-architecture is profiled once and reused for init/step992/long-run audit rows.
+The profiler uses the real SwiftVR streaming ReAE and DiT implementations and
+counts the actually executed Linear/Conv/attention MACs. Conditional-teacher and
+prompt-free/no-time student architectures are measured on the same input chunks
+and output geometry. Student delta checkpoints do not change architecture/MACs,
+so the prompt-free architecture is profiled once and reused for init/step992/
+long-run audit rows.
 
 Primary reporting convention:
   * GMACs per emitted output frame;
@@ -41,9 +42,8 @@ from swiftvr.models import ReAE
 from swiftvr.models.transformer_prompt_free_no_time import (
     WanTransformer3DModelPromptFreeNoTime,
 )
-from swiftvr.streaming import StreamingTAE
+from swiftvr.streaming import StreamingDiTPromptFreeNoTime, StreamingTAE
 from swiftvr.streaming.chunk import ChunkType
-from swiftvr.training.reference import extract_transformer_sample
 from tools.runtime_macs import RuntimeMacCounter
 
 
@@ -291,13 +291,7 @@ def _profile_teacher(
 
 
 class PromptFreeMiddleSession:
-    """Minimal streaming wrapper used only for architecture MAC profiling.
-
-    ReAE state follows the real StreamingTAE path. The prompt-free/no-time DiT is
-    applied once to each emitted latent chunk. With ``dit_overlap=0`` its MACs are
-    identical to a dedicated streaming wrapper; the temporal RoPE offset changes
-    values but not operation count, so no quality claim is made from this helper.
-    """
+    """Real ReAE + StreamingDiTPromptFreeNoTime profiling session."""
 
     def __init__(
         self,
@@ -310,11 +304,13 @@ class PromptFreeMiddleSession:
         out_h: int,
         pad_w: int,
         pad_h: int,
+        overlap: int,
         upscale_mode: str = "bilinear",
     ):
         self.reae = reae
         self.transformer = transformer
         self.tae = StreamingTAE(reae)
+        self.dit = StreamingDiTPromptFreeNoTime(transformer, overlap=overlap)
         self.device = device
         self.dtype = dtype
         self.out_w = out_w
@@ -323,6 +319,7 @@ class PromptFreeMiddleSession:
         self.pad_h = pad_h
         self.upscale_mode = upscale_mode
         self.tae.reset()
+        self.dit.reset()
 
     @torch.inference_mode()
     def step(self, frames_uint8: torch.Tensor) -> torch.Tensor | None:
@@ -340,15 +337,8 @@ class PromptFreeMiddleSession:
         if z is None:
             return None
         z_bcfhw = z.permute(0, 2, 1, 3, 4).contiguous()
-        velocity = extract_transformer_sample(
-            self.transformer(z_bcfhw, return_dict=True)
-        )
-        if velocity.shape != z_bcfhw.shape:
-            raise RuntimeError(
-                f"Prompt-free velocity shape mismatch: {tuple(velocity.shape)} vs "
-                f"{tuple(z_bcfhw.shape)}"
-            )
-        z_den = (z_bcfhw - velocity).permute(0, 2, 1, 3, 4).contiguous()
+        z_den_bcfhw = self.dit.denoise(z_bcfhw)
+        z_den = z_den_bcfhw.permute(0, 2, 1, 3, 4).contiguous()
         rgb = self.tae.decode_chunk(z_den)
         return crop_spatial_padding_ntchw(rgb, self.pad_h, self.pad_w)
 
@@ -384,6 +374,7 @@ def _profile_student(
         out_h=int(geometry["out_h"]),
         pad_w=int(geometry["pad_w"]),
         pad_h=int(geometry["pad_h"]),
+        overlap=args.dit_overlap,
     )
     counter = RuntimeMacCounter()
     counter.add_module("encoder", reae.encoder)
@@ -409,6 +400,8 @@ def _print_model_summary(record: dict[str, object]) -> None:
     assert isinstance(macs, dict)
     roots = macs["by_root_gmacs_per_output_frame"]
     assert isinstance(roots, dict)
+    params = record["parameters"]
+    assert isinstance(params, dict)
     print(f"\n========== {record['label']} ==========", flush=True)
     print(f"Output frames          : {record['output_frames']}")
     print(f"Encoder GMAC/frame     : {float(roots['encoder']):.3f}")
@@ -419,7 +412,7 @@ def _print_model_summary(record: dict[str, object]) -> None:
         "GFLOPs/frame (2/MAC) : "
         f"{float(macs['gflops_per_output_frame_if_1mac_2flops']):.3f}"
     )
-    print(f"Params                 : {int(record['parameters']['total_params']):,}")
+    print(f"Params                 : {int(params['total_params']):,}")
     print("==========================================", flush=True)
 
 
@@ -454,12 +447,13 @@ def main() -> int:
     print(f"Clip length         : {args.clip_len}")
     print(f"Warmup MIDDLE       : {args.warmup_middle}")
     print(f"Attention backend   : {args.attention_backend}")
-    print(f"MAC convention      : 1 MAC = multiply-accumulate; FLOP view uses 2/MAC")
+    print("MAC convention      : 1 MAC = multiply-accumulate; FLOP view uses 2/MAC")
     print("===================================================", flush=True)
 
     teacher = _profile_teacher(args, geometry, device=device, dtype=dtype)
     _print_model_summary(teacher)
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     student = _profile_student(args, geometry, device=device, dtype=dtype)
     _print_model_summary(student)
@@ -496,6 +490,7 @@ def main() -> int:
             "convention. Latency is supplementary and hardware-dependent."
         ),
     }
+    args.output_json = args.output_json.expanduser().resolve()
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
