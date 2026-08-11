@@ -17,8 +17,8 @@ introduced:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Mapping
@@ -42,7 +42,12 @@ from swiftvr.models.tiny_conditional_decoder import TinyConditionalDecoder
 from swiftvr.models.transformer_prompt_free_no_time import (
     WanTransformer3DModelPromptFreeNoTime,
 )
-from swiftvr.training import cast_trainable_parameters, load_delta_checkpoint
+from swiftvr.training import (
+    build_fp32_adamw,
+    build_grad_scaler,
+    cast_trainable_parameters,
+    load_delta_checkpoint,
+)
 from swiftvr.training.distillation import (
     DeterministicTripletViewDataset,
     SwiftVRVelocityDistillationForward,
@@ -52,13 +57,6 @@ from swiftvr.training.perceptual_review import make_comparison_frame
 from swiftvr.training.reference import extract_transformer_sample
 from swiftvr.training.stage3 import VideoMetricAccumulator
 from swiftvr.training.tiny_decoder import LPIPSAlexLoss, tiny_decoder_objective
-
-
-DTYPE_NAMES = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
 
 
 def _csv_ints(value: str, *, length: int) -> tuple[int, ...]:
@@ -194,9 +192,7 @@ def _source_targets(
     with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
         z_lq_ntchw = encode_reae_clip(source.reae, lq_input, require_4k_plus_1=True)
         z_lq = z_lq_ntchw.permute(0, 2, 1, 3, 4).contiguous()
-        velocity = extract_transformer_sample(
-            source.transformer(z_lq, return_dict=True)
-        )
+        velocity = extract_transformer_sample(source.transformer(z_lq, return_dict=True))
         if velocity.shape != z_lq.shape:
             raise RuntimeError(
                 f"source velocity shape {tuple(velocity.shape)} != latent {tuple(z_lq.shape)}"
@@ -301,6 +297,12 @@ def main() -> int:
     print("[3/5] Computing z_SR and frozen ReAE decoder target once...", flush=True)
     source_targets = _source_targets(source, batch, device=device, dtype=dtype)
 
+    # The 3.8B source is not needed after z_SR/ReAE-target creation. Releasing it
+    # before LPIPS/tiny-decoder allocation keeps the smoke gate bounded in memory.
+    del source
+    gc.collect()
+    torch.cuda.empty_cache()
+
     channels = _csv_ints(args.decoder_channels, length=4)
     blocks = _csv_ints(args.blocks_per_stage, length=4)
     tiny = TinyConditionalDecoder(
@@ -321,13 +323,13 @@ def main() -> int:
         perceptual = LPIPSAlexLoss().to(device=device)
         perceptual.eval()
 
-    optimizer = torch.optim.AdamW(
-        tiny.parameters(),
-        lr=args.learning_rate,
+    optimizer = build_fp32_adamw(
+        tiny,
+        learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         eps=1e-8,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
+    scaler = build_grad_scaler(device, dtype)
     autocast_enabled = dtype in (torch.float16, torch.bfloat16)
 
     def predict() -> torch.Tensor:
@@ -347,9 +349,14 @@ def main() -> int:
         source_targets["target"],
         source_targets["reae_teacher"],
     )
-    _save_visuals(output_dir, prefix="initial", tiny=initial_prediction, **{
-        key: source_targets[key] for key in ("lq_input", "target", "reae_teacher")
-    })
+    _save_visuals(
+        output_dir,
+        prefix="initial",
+        tiny=initial_prediction,
+        lq_input=source_targets["lq_input"],
+        target=source_targets["target"],
+        reae_teacher=source_targets["reae_teacher"],
+    )
     del initial_prediction
 
     print("[4/5] Overfitting Tiny Conditional Decoder...", flush=True)
@@ -411,9 +418,14 @@ def main() -> int:
         source_targets["target"],
         source_targets["reae_teacher"],
     )
-    _save_visuals(output_dir, prefix="final", tiny=final_prediction, **{
-        key: source_targets[key] for key in ("lq_input", "target", "reae_teacher")
-    })
+    _save_visuals(
+        output_dir,
+        prefix="final",
+        tiny=final_prediction,
+        lq_input=source_targets["lq_input"],
+        target=source_targets["target"],
+        reae_teacher=source_targets["reae_teacher"],
+    )
 
     summary = {
         "kind": "swiftvr_stage_b1_tiny_decoder_smoke",
