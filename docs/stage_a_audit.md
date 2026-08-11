@@ -9,6 +9,12 @@ The cached conditional teacher is the quality reference. Student checkpoints are
 loaded one at a time on top of the same folded prompt-free/no-time base, so the
 audit does not require multiple 5B models in GPU memory simultaneously.
 
+`tools/finalize_stage_a_audit_flops.py` then reconstructs the original conditional
+teacher directly from the immutable teacher-cache metadata and profiles its ReAE
+encoder, conditional Wan DiT, ReAE decoder and full endpoint path on the exact same
+validation clip. It augments the same JSON report and rewrites the Markdown report
+with FLOPs as the primary compute comparison.
+
 ## What is reported
 
 For every student:
@@ -21,17 +27,32 @@ For every student:
 - optional LPIPS when `--lpips` is requested and the external `lpips` package is
   available;
 - total/trainable parameters and delta-checkpoint size;
-- measured ReAE encoder, prompt-free DiT, ReAE decoder, and end-to-end latency;
-- effective clip FPS and peak allocated CUDA memory;
-- optional operator-reported FLOPs via `torch.utils.flop_counter`.
+- operator-reported ReAE encoder, DiT, ReAE decoder and end-to-end FLOPs;
+- measured latency/FPS/VRAM only as supplementary hardware information.
 
-FLOP counting is diagnostic only: fused/custom operators can be absent from the
-counter. Wall-clock latency is the deployment-facing source of truth.
+The finalized primary compute table contains both the original conditional teacher
+and every Stage-A student:
+
+`Model | Params | Encoder TFLOPs | DiT TFLOPs | Decoder TFLOPs | E2E TFLOPs |
+GFLOPs/frame | FLOPs / Teacher | Reduction vs Teacher`.
+
+All teacher/student FLOPs use the same deterministic input clip, dtype, attention
+backend and PyTorch operator counter. Fused/custom operators can still be absent
+from `torch.utils.flop_counter`, so the finalizer refuses to accept any row whose
+encoder/DiT/decoder/end-to-end count is missing or non-positive. The JSON retains
+component-level counter errors for inspection. Quantitative claims should only be
+made after checking that the relevant components are represented sensibly.
+
+Stage-A student checkpoints use one prompt-free/no-time architecture, so `init`,
+`step992` and `long` should have identical FLOPs. Their quality differences measure
+distillation progress rather than architectural compute changes. The conditional
+teacher is profiled separately so removal of prompt/timestep conditioning is
+measured rather than inferred.
 
 The output directory contains:
 
 - `stage_a_audit.json`: machine-readable baseline for later Stage-B comparisons;
-- `stage_a_audit.md`: compact quality/compute tables;
+- `stage_a_audit.md`: compact quality and FLOP-primary compute tables;
 - `visuals/.../comparison.mp4`: LQ / GT / teacher / all student outputs;
 - `visuals/.../differences.mp4`: per-student teacher/GT absolute differences;
 - selected comparison/difference PNG frames.
@@ -45,7 +66,7 @@ best delta-checkpoint directory.
 export BASE=/data1/a/SwiftVR/checkpoints_prompt_free_no_time
 export VAL_CACHE=/data1/a/SwiftVR/outputs/teacher_velocity_cache_val13
 export STEP992=/data1/a/SwiftVR/outputs/distill_formal_v8_bs16_bf16/checkpoints/step_00000992
-export LONG_CKPT=/path/to/long_run/checkpoints/step_00170000
+export LONG_CKPT=/path/to/long_run/checkpoints/step_XXXXXXXX
 export AUDIT=/data1/a/SwiftVR/outputs/stage_a_audit
 
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
@@ -77,7 +98,29 @@ python tools/audit_stage_a_distillation.py \
   --latency-repeats 10 \
   --profile-flops \
   --output-dir "$AUDIT"
+
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+python tools/finalize_stage_a_audit_flops.py \
+  --audit-dir "$AUDIT" \
+  --manifest manifests/vsr_triplets_plain_val13_newserver.jsonl \
+  --path-root . \
+  --split val \
+  --clip-length 13 \
+  --crop-size 128 \
+  --scale 3 \
+  --views-per-record 1 \
+  --view-seed 9000001 \
+  --batch-size 1 \
+  --num-workers 0 \
+  --pin-memory \
+  --dtype bfloat16 \
+  --allow-dtype-mismatch \
+  --attention-backend sdpa
 ```
+
+The finalizer reads the original conditional checkpoint, prompt embedding and fixed
+timestep from the teacher-cache metadata, so no separate teacher path should be
+manually guessed.
 
 Do not add `--lpips` to the first gate unless the environment already contains the
 optional package. LPIPS will become a deliberate Stage-B decoder-training
