@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -43,6 +45,27 @@ class TinyDecoderSparsityTests(unittest.TestCase):
             expected = dense(z, cond, output_frames=5)
             actual = sparse(z, cond, output_frames=5)
         self.assertTrue(torch.equal(expected, actual))
+
+    def test_legacy_v1_dense_checkpoint_still_loads(self):
+        torch.manual_seed(111)
+        dense = make_dense().eval()
+        z = torch.randn(1, 2, 6, 2, 2)
+        cond = torch.randn(1, 5, 3, 32, 32)
+        with torch.no_grad():
+            reference = dense(z, cond, output_frames=5)
+        with tempfile.TemporaryDirectory() as directory:
+            dense.save_pretrained(directory)
+            config_path = Path(directory) / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["format_version"] = 1
+            config.pop("block_mode", None)
+            config.pop("block_internal_channels", None)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            loaded = TinyConditionalDecoder.from_pretrained(directory).eval()
+            self.assertEqual(loaded.block_mode, "dense")
+            with torch.no_grad():
+                actual = loaded(z, cond, output_frames=5)
+        self.assertTrue(torch.equal(reference, actual))
 
     def test_gate_penalty_backpropagates(self):
         torch.manual_seed(12)
