@@ -1,144 +1,155 @@
-# Stage B1 structured-sparsity Tiny Decoder gate
+# Stage B1 structured-sparsity Tiny Decoder
 
-This gate runs **before** the formal z_SR cache and decoder DDP training.  The dense
-Tiny Conditional Decoder already passed one-sample L2/LPIPS overfit and measured
-82.002 GMAC/frame at the frozen 1080p protocol.  The purpose here is to reduce that
-compute again without deleting causal blocks or TGrow stages.
+Stage B1 first replaced the original ReAE decoder with a SwiftVR-specific Tiny
+Conditional Decoder, then applied structured hidden-channel sparsity before the
+one-time formal decoder training.
 
-## What is pruned
+## Frozen compact topology
 
-Only the hidden channels inside each Tiny Decoder MemBlock are structured-pruned.
-The stage/interface widths remain `192,128,64,32`, block counts remain `2,2,2,1`,
-and condition projection, transition convolutions, TGrow operations, residual
-interfaces, temporal/spatial compression, and output PixelShuffle mapping are kept.
+The dense Tiny Decoder used stage widths `192,128,64,32` and block counts
+`2,2,2,1`. Structured sparsity is applied only inside causal MemBlocks. The
+stage/interface widths, block counts, TGrow stages, condition projection,
+transition convolutions, residual interfaces, temporal/spatial compression and
+output PixelShuffle mapping remain unchanged.
 
-A dense MemBlock uses approximately
+A dense MemBlock uses
 
 ```
 2C -> C -> C -> C
 ```
 
-for its three 3x3 convolutions.  The materialized compact block uses
+for its three 3x3 convolutions. The selected compact block uses
 
 ```
 2C -> K -> K -> C
 ```
 
-with the same residual C-dimensional state.  For `r=K/C`, the dominant per-block
-channel-product term changes from `4 C^2` to `(3r+r^2) C^2`.
+while preserving the same C-dimensional causal residual state. A gated same-width
+supernet first learned channel importance; top-k channels were then materialized as
+ordinary smaller dense Conv2d tensors. No runtime speedup is claimed from merely
+zero-valued weights.
 
-The implementation deliberately does not claim speedup from zero-valued weights.
-A gated same-width supernet learns channel importance, then top-k channels are
-sliced into ordinary smaller dense Conv2d tensors.  The standard Stage-A MAC
-counter therefore measures the actual compact topology.
+The measured candidates were:
 
-## Candidate ratios
+- keep 0.75: internal widths `144,96,48,24`, 66.106 GMAC/frame;
+- keep 0.55: internal widths `104,72,32,16`, 52.722 GMAC/frame;
+- **keep 0.40: internal widths `80,48,24,16`, 47.945 GMAC/frame**.
 
-The first gate exports three candidates, aligning hidden widths to multiples of 8:
+The keep-0.40 candidate is frozen for formal Stage-B1 training. It showed no clear
+single-sample recovery capacity cliff relative to keep-0.55 while reducing the
+original 343.108-GMAC/frame ReAE decoder by about 86%.
 
-- keep 0.75: `144,96,48,24`;
-- keep 0.55: rounded hardware-aligned widths derived by the tool;
-- keep 0.40: `80,48,24,16`.
+## Formal z_SR caches
 
-No ratio is selected before the measured quality/MAC tradeoff is available.
+The formal train cache uses the full plain+text training set with the same v8
+coverage used by Stage A:
 
-## Static gate
+```
+1987 source records x 8 deterministic views = 15896 z_SR samples
+```
 
-Run from the repository root:
+with `view_seed=20260805`, horizontal flip probability 0.5 and no vertical flip.
+The primary validation cache remains the fixed val13 x 1-view protocol with
+`view_seed=9000001` and no flips.
+
+The cached target is FP16 `z_SR`. The long-run Stage-A encoder and DiT therefore do
+not run during formal Tiny Decoder training.
+
+## Formal DDP trainer
+
+`tools/train_tiny_decoder_formal_ddp.py` trains only the materialized keep-0.40
+Tiny Decoder. A frozen ReAE decoder renders the same cached `z_SR` online to form
+the decoder-teacher RGB target. The objective remains
+
+```
+MSE(Tiny, GT)
++ MSE(Tiny, ReAE(z_SR))
++ 2 * LPIPS(Tiny, GT)
++ 2 * LPIPS(Tiny, ReAE(z_SR)).
+```
+
+Temporal MSE remains a validation diagnostic rather than an optimization term.
+The trainer performs epoch-boundary checkpointing/resume, validates on val13 after
+every epoch, and selects the best checkpoint by minimum validation dual-objective
+loss while retaining pixel, perceptual and temporal metrics.
+
+The default formal recipe is BF16, four GPUs, local batch 4, learning rate 5e-5 and
+8 epochs. If local batch 4 is too large, restart a fresh run with a smaller local
+batch; batch size is part of the resume fingerprint and must not change within a
+run.
+
+Static check:
 
 ```bash
 python -m py_compile \
-  swiftvr/models/tiny_conditional_decoder.py \
-  swiftvr/models/tiny_decoder_sparsity.py \
-  tools/smoke_structured_sparse_tiny_decoder.py \
-  tests/test_tiny_decoder_sparsity.py
+  tools/train_tiny_decoder_formal_ddp.py \
+  tests/test_tiny_decoder_formal.py
 
-python -m unittest \
-  tests.test_tiny_conditional_decoder \
-  tests.test_tiny_decoder_sparsity -v
+python -m unittest tests.test_tiny_decoder_formal -v
 ```
 
-The tests cover exact dense-to-unit-gate conversion, legacy v1 dense checkpoint
-loading, gate gradients, channel alignment, compact materialization, forward/backward,
-streaming first/middle semantics, parameter reduction, and compact save/reload.
-
-## One-sample structured-sparsity gate
-
-Use the same deterministic source sample and long-run Stage-A checkpoint that were
-used for the successful LPIPS smoke.  `--dense-decoder` should point to that
-successful LPIPS smoke's `tiny_decoder/` directory.
+Formal launch:
 
 ```bash
 export BASE=/data1/a/SwiftVR/checkpoints_prompt_free_no_time
-export LONG=/path/to/long_run/checkpoints/step_XXXXXXXX
-export DENSE=/data1/a/SwiftVR/outputs/stage_b1_tiny_decoder_smoke_lpips/tiny_decoder
-export SPARSE_OUT=/data1/a/SwiftVR/outputs/stage_b1_tiny_decoder_structured_sparse
+export INIT_DECODER=/data1/a/SwiftVR/outputs/stage_b1_tiny_decoder_structured_sparse/keep_040/tiny_decoder
+export TRAIN_CACHE=/data1/a/SwiftVR/outputs/stage_b1_zsr_cache_train_v8
+export VAL_CACHE=/data1/a/SwiftVR/outputs/stage_b1_zsr_cache_val13
+export OUT=/data1/a/SwiftVR/outputs/stage_b1_tiny_decoder_formal_keep040_bf16
 
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
-python tools/smoke_structured_sparse_tiny_decoder.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 \
+torchrun --standalone --nproc_per_node=4 tools/train_tiny_decoder_formal_ddp.py \
   --base-checkpoint "$BASE" \
-  --source-checkpoint "$LONG" \
-  --dense-decoder "$DENSE" \
+  --init-decoder "$INIT_DECODER" \
+  --train-cache "$TRAIN_CACHE" \
+  --val-cache "$VAL_CACHE" \
   --manifest /data1/a/SwiftVR/manifests/vsr_triplets_plain_train_newserver.jsonl \
+  --manifest /data1/a/SwiftVR/manifests/vsr_triplets_text_train_newserver.jsonl \
+  --val-manifest /data1/a/SwiftVR/manifests/vsr_triplets_plain_val13_newserver.jsonl \
+  --output-dir "$OUT" \
   --path-root /data1/a/SwiftVR \
   --split train \
+  --val-split val \
   --clip-length 13 \
   --crop-size 128 \
+  --val-crop-size 128 \
   --scale 3 \
-  --view-seed 20260811 \
-  --sample-index 0 \
-  --dtype bfloat16 \
-  --allow-dtype-mismatch \
-  --attention-backend sdpa \
-  --gate-steps 50 \
-  --gate-learning-rate 5e-3 \
-  --sparsity-weight 0.05 \
-  --keep-ratios 0.75,0.55,0.40 \
-  --channel-multiple 8 \
-  --recovery-steps 50 \
-  --recovery-learning-rate 5e-5 \
+  --views-per-record 8 \
+  --view-seed 20260805 \
+  --val-views-per-record 1 \
+  --val-view-seed 9000001 \
+  --horizontal-flip-probability 0.5 \
+  --vertical-flip-probability 0 \
+  --val-horizontal-flip-probability 0 \
+  --val-vertical-flip-probability 0 \
+  --batch-size 4 \
+  --val-batch-size 1 \
+  --num-workers 8 \
+  --val-num-workers 4 \
+  --prefetch-factor 2 \
+  --persistent-workers \
+  --pin-memory \
+  --epochs 8 \
+  --learning-rate 5e-5 \
   --gt-l2-weight 1 \
   --teacher-l2-weight 1 \
   --lpips-weight 2 \
+  --lpips-microbatch-frames 16 \
   --max-grad-norm 1 \
-  --output-dir "$SPARSE_OUT"
+  --dtype bfloat16 \
+  --log-every 20 \
+  --ddp-timeout-seconds 1800
 ```
 
-The run first checks that dense -> sparse-supernet initialization has
-`dense_sparse_max_abs <= 1e-5`.  Only gate parameters are updated during gate
-learning.  Each top-k compact candidate is then recovered independently for 50
-steps and saved under `keep_075/`, `keep_055/`, and `keep_040/`.
-
-## 1080p MAC comparison
-
-Profile the three materialized checkpoints with the existing frozen protocol:
+Resume only from an epoch-boundary checkpoint:
 
 ```bash
-export STAGEA_MAC=/data1/a/SwiftVR/outputs/stage_a_streaming_macs_1080p.json
-
-for K in 075 055 040; do
-  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
-  python tools/profile_tiny_decoder_streaming_macs.py \
-    --input /data1/a/SwiftVR/assets/27_1_lq.mp4 \
-    --student-checkpoint "$BASE" \
-    --tiny-decoder "$SPARSE_OUT/keep_${K}/tiny_decoder" \
-    --resolution 1920x1080 \
-    --upscale 4 \
-    --clip-len 24 \
-    --dit-overlap 0 \
-    --warmup-middle 1 \
-    --dtype bfloat16 \
-    --attention-backend sdpa \
-    --stage-a-macs-json "$STAGEA_MAC" \
-    --output-json "/data1/a/SwiftVR/outputs/stage_b1_sparse_keep_${K}_macs_1080p.json"
-done
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 \
+torchrun --standalone --nproc_per_node=4 tools/train_tiny_decoder_formal_ddp.py \
+  <same arguments as the original run> \
+  --resume latest
 ```
 
-The dense Tiny Decoder reference is 82.002 GMAC/frame.  A candidate is interesting
-only if the profiler shows a real decoder-MAC reduction and its short recovery does
-not collapse GT/teacher L2 or LPIPS.  The intended range is roughly 35--50
-GMAC/frame, but the measured quality/MAC Pareto point decides which candidate enters
-the one-time formal cache/training stage.
-
-Do not build the formal 3974-view z_SR cache until this gate selects the final
-compact topology.
+After formal Stage-B1 converges, freeze its best Tiny Decoder and move to aggressive
+DiT compression. Encoder compression is intentionally deferred until after the DiT
+budget is reduced, because changing the encoder changes the latent input contract.
