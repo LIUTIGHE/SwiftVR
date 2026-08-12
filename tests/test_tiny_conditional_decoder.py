@@ -49,6 +49,25 @@ class TinyConditionalDecoderTests(unittest.TestCase):
             output = model(latents, condition, output_frames=13)
         self.assertEqual(tuple(output.shape), (1, 13, 3, 32, 32))
 
+    def test_default_topology_backward_is_autograd_safe(self):
+        torch.manual_seed(11)
+        model = TinyConditionalDecoder().train()
+        condition = torch.randn(1, 13, 3, 32, 32)
+        latents = torch.randn(1, 4, 48, 2, 2)
+        output = model(latents, condition, output_frames=13)
+        loss = output.float().square().mean()
+        loss.backward()
+        gradients = [
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+        self.assertTrue(gradients)
+        self.assertTrue(all(gradient is not None for gradient in gradients))
+        self.assertTrue(
+            all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
+        )
+
     def test_condition_changes_prediction(self):
         torch.manual_seed(2)
         model = make_model().eval()
