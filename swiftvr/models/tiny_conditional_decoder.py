@@ -193,10 +193,14 @@ class TinyConditionalDecoder(nn.Module):
         )
 
         c0, c1, c2, c3 = self.channels
+        # Keep explicit activations out-of-place. MemBlock already ends in an
+        # in-place ReLU for checkpoint compatibility with ReAE; applying another
+        # in-place ReLU to a MemBlock output would mutate the tensor saved by
+        # ReluBackward0 and invalidate autograd's version counter.
         layers: list[nn.Module] = [
             Clamp(),
             _conv(self.latent_channels + self.condition_channels, c0),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         ]
         layers.extend(MemBlock(c0, c0) for _ in range(self.blocks_per_stage[0]))
         layers.extend(
@@ -225,7 +229,7 @@ class TinyConditionalDecoder(nn.Module):
         layers.extend(MemBlock(c3, c3) for _ in range(self.blocks_per_stage[3]))
         layers.extend(
             [
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 _conv(c3, 3 * self.patch_size**2),
             ]
         )
