@@ -53,6 +53,7 @@ from .stage3 import (
     temporal_difference_mse,
     video_ssim,
 )
+from .tiny_decoder_cache import TinyDecoderLatentCache
 
 __all__ = [
     "GT_LOSS_MODES",
@@ -61,6 +62,7 @@ __all__ = [
     "SwiftVRTrainingForward",
     "SwiftVRVelocityDistillationForward",
     "TeacherVelocityCache",
+    "TinyDecoderLatentCache",
     "TrainingCursor",
     "VideoMetricAccumulator",
     "WanShiftWindow2DTrainProcessor",
