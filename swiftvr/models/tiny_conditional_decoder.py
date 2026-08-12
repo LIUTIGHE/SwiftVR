@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -27,11 +27,14 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 from .reae import Clamp, MemBlock, TGrow
+from .tiny_decoder_sparsity import CompactMemBlock, StructuredSparseMemBlock
 
 
 CONFIG_FILENAME = "config.json"
 WEIGHTS_FILENAME = "model.safetensors"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2})
+BLOCK_MODES = frozenset({"dense", "sparse", "compact"})
 
 
 def _conv(in_channels: int, out_channels: int, **kwargs) -> nn.Conv2d:
@@ -115,6 +118,8 @@ def _apply_video_stack(stack: nn.Sequential, video: torch.Tensor) -> torch.Tenso
     hidden = video.reshape(batch * frames, channels, height, width)
 
     for index, layer in enumerate(stack):
+        # StructuredSparseMemBlock and CompactMemBlock subclass MemBlock so the
+        # exact same causal previous-frame execution and streaming protocol apply.
         if isinstance(layer, MemBlock):
             _, channels, height, width = hidden.shape
             current = hidden.reshape(batch, frames, channels, height, width)
@@ -143,7 +148,18 @@ def _apply_video_stack(stack: nn.Sequential, video: torch.Tensor) -> torch.Tenso
 
 
 class TinyConditionalDecoder(nn.Module):
-    """Causal RGB-condition + SR-latent decoder for the SwiftVR latent contract."""
+    """Causal RGB-condition + SR-latent decoder for the SwiftVR latent contract.
+
+    ``block_mode`` controls only MemBlock internals:
+
+    * ``dense``: original same-width MemBlock;
+    * ``sparse``: same-width gated supernet used to learn channel importance;
+    * ``compact``: materialized ``2C -> K -> K -> C`` blocks with real smaller
+      dense convolutions.
+
+    Stage widths, block counts, TGrow topology, residual interfaces, condition
+    projection, and output mapping are unchanged across modes.
+    """
 
     def __init__(
         self,
@@ -156,6 +172,8 @@ class TinyConditionalDecoder(nn.Module):
         spatial_factor: int = 16,
         patch_size: int = 2,
         frames_to_trim: int = 3,
+        block_mode: str = "dense",
+        block_internal_channels: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         self.latent_channels = int(latent_channels)
@@ -166,15 +184,40 @@ class TinyConditionalDecoder(nn.Module):
         self.spatial_factor = int(spatial_factor)
         self.patch_size = int(patch_size)
         self.frames_to_trim = int(frames_to_trim)
+        self.block_mode = str(block_mode).lower()
+        if block_internal_channels is None:
+            self.block_internal_channels = tuple(self.channels)
+        else:
+            self.block_internal_channels = tuple(
+                int(value) for value in block_internal_channels
+            )
 
         if self.latent_channels <= 0 or self.condition_channels <= 0:
             raise ValueError("latent/condition channels must be positive")
         if len(self.channels) != 4 or len(self.blocks_per_stage) != 4:
             raise ValueError("channels and blocks_per_stage must each contain four stages")
+        if len(self.block_internal_channels) != 4:
+            raise ValueError("block_internal_channels must contain four stages")
         if any(value <= 0 for value in self.channels):
             raise ValueError("all decoder stage widths must be positive")
         if any(value < 0 for value in self.blocks_per_stage):
             raise ValueError("blocks_per_stage values must be non-negative")
+        if self.block_mode not in BLOCK_MODES:
+            raise ValueError(
+                f"Unsupported block_mode={block_mode!r}; expected {sorted(BLOCK_MODES)}"
+            )
+        if any(value <= 0 for value in self.block_internal_channels):
+            raise ValueError("all block internal widths must be positive")
+        if any(
+            internal > interface
+            for internal, interface in zip(self.block_internal_channels, self.channels)
+        ):
+            raise ValueError("block internal width cannot exceed its stage interface width")
+        if self.block_mode != "compact" and self.block_internal_channels != self.channels:
+            raise ValueError(
+                "dense/sparse modes require full internal widths; only compact mode "
+                "can use narrower block_internal_channels"
+            )
         if self.temporal_factor != 4:
             raise ValueError("The initial SwiftVR tiny decoder requires temporal_factor=4")
         if self.spatial_factor != 16:
@@ -192,6 +235,14 @@ class TinyConditionalDecoder(nn.Module):
             bias=True,
         )
 
+        def block(stage: int) -> nn.Module:
+            width = self.channels[stage]
+            if self.block_mode == "dense":
+                return MemBlock(width, width)
+            if self.block_mode == "sparse":
+                return StructuredSparseMemBlock(width)
+            return CompactMemBlock(width, self.block_internal_channels[stage])
+
         c0, c1, c2, c3 = self.channels
         # Keep explicit activations out-of-place. MemBlock already ends in an
         # in-place ReLU for checkpoint compatibility with ReAE; applying another
@@ -202,7 +253,7 @@ class TinyConditionalDecoder(nn.Module):
             _conv(self.latent_channels + self.condition_channels, c0),
             nn.ReLU(inplace=False),
         ]
-        layers.extend(MemBlock(c0, c0) for _ in range(self.blocks_per_stage[0]))
+        layers.extend(block(0) for _ in range(self.blocks_per_stage[0]))
         layers.extend(
             [
                 nn.Upsample(scale_factor=2, mode="nearest"),
@@ -210,7 +261,7 @@ class TinyConditionalDecoder(nn.Module):
                 _conv(c0, c1, bias=False),
             ]
         )
-        layers.extend(MemBlock(c1, c1) for _ in range(self.blocks_per_stage[1]))
+        layers.extend(block(1) for _ in range(self.blocks_per_stage[1]))
         layers.extend(
             [
                 nn.Upsample(scale_factor=2, mode="nearest"),
@@ -218,7 +269,7 @@ class TinyConditionalDecoder(nn.Module):
                 _conv(c1, c2, bias=False),
             ]
         )
-        layers.extend(MemBlock(c2, c2) for _ in range(self.blocks_per_stage[2]))
+        layers.extend(block(2) for _ in range(self.blocks_per_stage[2]))
         layers.extend(
             [
                 nn.Upsample(scale_factor=2, mode="nearest"),
@@ -226,7 +277,7 @@ class TinyConditionalDecoder(nn.Module):
                 _conv(c2, c3, bias=False),
             ]
         )
-        layers.extend(MemBlock(c3, c3) for _ in range(self.blocks_per_stage[3]))
+        layers.extend(block(3) for _ in range(self.blocks_per_stage[3]))
         layers.extend(
             [
                 nn.ReLU(inplace=False),
@@ -248,6 +299,8 @@ class TinyConditionalDecoder(nn.Module):
             "spatial_factor": self.spatial_factor,
             "patch_size": self.patch_size,
             "frames_to_trim": self.frames_to_trim,
+            "block_mode": self.block_mode,
+            "block_internal_channels": list(self.block_internal_channels),
         }
 
     def project_condition(self, condition: torch.Tensor) -> torch.Tensor:
@@ -341,7 +394,8 @@ class TinyConditionalDecoder(nn.Module):
         config_path = root / CONFIG_FILENAME
         weights_path = root / WEIGHTS_FILENAME
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        if int(config.get("format_version", -1)) != FORMAT_VERSION:
+        version = int(config.get("format_version", -1))
+        if version not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(f"Unsupported tiny-decoder format: {config.get('format_version')}")
         kwargs = {
             key: config[key]
@@ -356,6 +410,15 @@ class TinyConditionalDecoder(nn.Module):
                 "frames_to_trim",
             )
         }
+        if version >= 2:
+            kwargs["block_mode"] = config.get("block_mode", "dense")
+            kwargs["block_internal_channels"] = config.get(
+                "block_internal_channels", config["channels"]
+            )
+        else:
+            # v1 is the already-trained dense Tiny Decoder smoke checkpoint.
+            kwargs["block_mode"] = "dense"
+            kwargs["block_internal_channels"] = config["channels"]
         model = cls(**kwargs)
         weights = load_file(str(weights_path), device="cpu")
         model.load_state_dict(weights, strict=True)
