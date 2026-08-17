@@ -317,7 +317,10 @@ class _LayerTrace:
             if isinstance(hidden, torch.Tensor):
                 self.features["decoder_concat_input"].update(hidden)
 
-        self.handles.append(model.decoder.register_forward_pre_hook(pre_hook))
+        # _apply_video_stack invokes each Sequential child directly, so a hook on
+        # the Sequential container itself would never fire. Layer 0 (Clamp) sees
+        # the flattened concat input before any learned decoder operation.
+        self.handles.append(model.decoder[0].register_forward_pre_hook(pre_hook))
         for index, name in self.names.items():
             layer = model.decoder[index]
 
@@ -456,8 +459,6 @@ def _print_summary(result: Mapping[str, object]) -> None:
     print(f"[{name}] layer phase trace", flush=True)
     for layer_name, payload in layers.items():
         checker = float(payload["basis"]["checkerboard"]["rms"])
-        horizontal = float(payload["basis"]["horizontal"]["rms"])
-        vertical = float(payload["basis"]["vertical"]["rms"])
         norm = payload["normalized_rms"]
         chw = payload["last_chw"]
         print(
