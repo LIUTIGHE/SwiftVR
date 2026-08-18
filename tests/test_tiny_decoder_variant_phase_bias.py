@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 from tools import diagnose_tiny_decoder_variant_phase_bias as audit
@@ -36,7 +38,8 @@ class TinyDecoderVariantPhaseBiasTests(unittest.TestCase):
 
     def test_decoder_spec_requires_label_and_path(self):
         parser = audit.build_parser()
-        with self.assertRaises(SystemExit):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
             parser.parse_args(
                 [
                     "--base-checkpoint", "base",
@@ -46,6 +49,7 @@ class TinyDecoderVariantPhaseBiasTests(unittest.TestCase):
                     "--output-dir", "out",
                 ]
             )
+        self.assertIn("--decoder expects LABEL=PATH", stderr.getvalue())
 
     def test_checkpoint_class_routing_accepts_both_variants(self):
         with tempfile.TemporaryDirectory() as temp:
