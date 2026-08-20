@@ -5,6 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from swiftvr.models.reae_slim_decoder import AGGRESSIVE_CHANNELS, SLIM100_CHANNELS, TEACHER_CHANNELS
 
@@ -25,9 +31,6 @@ def estimate_reae_decoder_macs(
     h2, w2 = output_height // 4, output_width // 4
     h3, w3 = output_height // 2, output_width // 2
 
-    # Per output frame: stage0/stage1 run at 1/4 temporal rate, stage2 at 1/2,
-    # and stage3/output at full rate.  Each same-width MemBlock contains three
-    # 3x3 convs with channel products 2C*C + C*C + C*C = 4C^2; there are 3 blocks.
     values = {
         "input_conv": h0 * w0 * latent_channels * c0 * 9 * 0.25,
         "stage0_memblocks": h0 * w0 * 108 * c0 * c0 * 0.25,
