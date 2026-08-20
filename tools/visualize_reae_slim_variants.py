@@ -13,6 +13,7 @@ from pathlib import Path
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
