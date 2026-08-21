@@ -25,16 +25,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
-from .reae import ReAE
+from .reae import MemBlock, ReAE, TPool
 from .reae_slim_decoder import SlimReAEDecoder, TEACHER_CHANNELS
-from ..streaming.tae import apply_parallel_with_boundary
 
 
 CONFIG_FILENAME = "config.json"
@@ -42,12 +40,44 @@ WEIGHTS_FILENAME = "model.safetensors"
 FORMAT_VERSION = 1
 
 
+def _apply_encoder_stack(stack: nn.Sequential, video: torch.Tensor) -> torch.Tensor:
+    """Whole-clip ReAE encoder execution with causal MemBlock semantics."""
+    if video.ndim != 5:
+        raise ValueError(f"encoder input must be [B,T,C,H,W], got {tuple(video.shape)}")
+    batch, frames, channels, height, width = video.shape
+    hidden = video.reshape(batch * frames, channels, height, width)
+
+    for index, layer in enumerate(stack):
+        if isinstance(layer, MemBlock):
+            _, channels, height, width = hidden.shape
+            current = hidden.reshape(batch, frames, channels, height, width)
+            past = torch.cat([torch.zeros_like(current[:, :1]), current[:, :-1]], dim=1)
+            hidden = layer(hidden, past.reshape(batch * frames, channels, height, width))
+        elif isinstance(layer, TPool):
+            if frames % int(layer.stride):
+                raise RuntimeError(
+                    f"encoder TPool layer {index} stride={layer.stride} cannot consume T={frames}"
+                )
+            hidden = layer(hidden)
+            frames //= int(layer.stride)
+        else:
+            hidden = layer(hidden)
+        if hidden.shape[0] != batch * frames:
+            raise RuntimeError(
+                f"encoder layer {index} produced leading dimension {hidden.shape[0]} "
+                f"for batch={batch}, frames={frames}"
+            )
+
+    _, channels, height, width = hidden.shape
+    return hidden.reshape(batch, frames, channels, height, width)
+
+
 class SharedVideoAutoencoder(nn.Module):
     """Deterministic causal video autoencoder for a shared latent space.
 
     ``encoder`` is the original ReAE encoder. ``decoder`` is a
-    :class:`SlimReAEDecoder`, normally the Stage-B1 Slim100 model.  All methods
-    preserve autograd.  Call :meth:`freeze` when the codec should stay fixed;
+    :class:`SlimReAEDecoder`, normally the Stage-B1 Slim100 model. All methods
+    preserve autograd. Call :meth:`freeze` when the codec should stay fixed;
     gradients can still flow through the frozen decoder into an upstream
     task-specific Transformer/UNet output latent.
     """
@@ -67,7 +97,6 @@ class SharedVideoAutoencoder(nn.Module):
 
     @property
     def spatial_compression(self) -> int:
-        # Pixel-unshuffle(2) + three stride-2 encoder convolutions.
         return 16
 
     @property
@@ -125,9 +154,6 @@ class SharedVideoAutoencoder(nn.Module):
         No latent normalization or stochastic sampling is applied.
         """
         _, frames, _, _, _ = self._validate_video(video)
-
-        # SwiftVR fixed whole-clip semantics: a 4k+1 clip receives three copies
-        # of its final frame so both temporal pooling stages see complete groups.
         padded = torch.cat([video, video[:, -1:].expand(-1, 3, -1, -1, -1)], dim=1)
 
         if self.patch_size > 1:
@@ -138,9 +164,7 @@ class SharedVideoAutoencoder(nn.Module):
             )
             padded = shuffled.reshape(batch, padded_frames, *shuffled.shape[1:])
 
-        latents, _ = apply_parallel_with_boundary(self.encoder, padded, state=None)
-        if latents is None:
-            raise RuntimeError("ReAE encoder emitted no latent frames")
+        latents = _apply_encoder_stack(self.encoder, padded)
         expected = (frames + 3) // self.temporal_compression
         if int(latents.shape[1]) != expected:
             raise RuntimeError(
@@ -158,7 +182,7 @@ class SharedVideoAutoencoder(nn.Module):
     ) -> torch.Tensor:
         """Decode a latent clip back to RGB.
 
-        ``output_frames`` is useful after a task-specific latent network.  For a
+        ``output_frames`` is useful after a task-specific latent network. For a
         latent obtained from :meth:`encode`, pass the original RGB frame count.
         """
         self._validate_latent(latents)
@@ -176,6 +200,18 @@ class SharedVideoAutoencoder(nn.Module):
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         return self
+
+    @staticmethod
+    def _move_model(
+        model: "SharedVideoAutoencoder",
+        device: str | torch.device,
+        dtype: torch.dtype | None,
+    ) -> "SharedVideoAutoencoder":
+        if dtype is None:
+            model.to(device=device)
+        else:
+            model.to(device=device, dtype=dtype)
+        return model
 
     @classmethod
     def from_component_checkpoints(
@@ -223,9 +259,7 @@ class SharedVideoAutoencoder(nn.Module):
         if int(decoder.frames_to_trim) != int(base.frames_to_trim):
             raise ValueError("encoder/decoder temporal-trim mismatch")
 
-        model = cls(base.encoder, decoder)
-        model.to(device=device, dtype=dtype)
-        return model
+        return cls._move_model(cls(base.encoder, decoder), device, dtype)
 
     def save_pretrained(self, output_dir: str | Path) -> Path:
         """Export encoder + decoder into one portable codec checkpoint folder."""
@@ -276,5 +310,4 @@ class SharedVideoAutoencoder(nn.Module):
         decoder.pruning_metadata = dict(config.get("decoder_pruning_metadata", {}))
         model = cls(template.encoder, decoder)
         model.load_state_dict(load_file(str(root / WEIGHTS_FILENAME), device="cpu"), strict=True)
-        model.to(device=device, dtype=dtype)
-        return model
+        return cls._move_model(model, device, dtype)
