@@ -1,6 +1,7 @@
 """Model definitions for SwiftVR: the DiT backbone and autoencoder/decoder paths."""
 
 from .reae import ReAE, MemBlock, TPool, TGrow, Clamp
+from .shared_video_autoencoder import SharedVideoAutoencoder
 from .tiny_conditional_decoder import TinyConditionalDecoder, pack_rgb_condition
 from .tiny_decoder_sparsity import (
     CompactMemBlock,
