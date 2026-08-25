@@ -167,7 +167,7 @@ class ActivationImportanceCollector:
         for index, raw_block in enumerate(transformer.blocks):
             block = _base_block(raw_block)
             _, ffn_down = _linear_pair(block.ffn, self.hidden_dim, self.ffn_dim)
-            self._handles.append(block.register_forward_pre_hook(self._hidden_hook(index)))
+            self._handles.append(block.norm1.register_forward_pre_hook(self._hidden_hook(index)))
             self._handles.append(block.attn1.to_out[0].register_forward_pre_hook(self._head_hook(index)))
             self._handles.append(ffn_down.register_forward_pre_hook(self._ffn_hook(index)))
 
@@ -404,3 +404,152 @@ def build_compact_transformer_from_teacher(
         folded_timestep=float(getattr(cfg, "folded_timestep", 1000.0)),
         time_condition_folded=True,
     )
+
+
+def forward_b2a_compact_transformer_training(
+    transformer: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    gradient_checkpointing: bool = True,
+) -> torch.Tensor:
+    """Autograd-safe B2-A forward with optional per-block activation checkpointing.
+
+    This intentionally mirrors ``forward_prompt_free_no_time_training`` while
+    keeping the checkpointing policy local to B2-A.  It does not alter the
+    locked Stage-A training helper or the inference forward.
+    """
+
+    from torch.utils.checkpoint import checkpoint as activation_checkpoint
+    from .forward import (
+        _forward_prompt_free_no_time_block_training,
+        _transformer_patch_size,
+    )
+
+    if hidden_states.ndim != 5:
+        raise ValueError(
+            "Transformer input must have shape [B,C,F,H,W], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+
+    batch, _, frames, height, width = hidden_states.shape
+    patch_t, patch_h, patch_w = _transformer_patch_size(transformer)
+    if frames % patch_t or height % patch_h or width % patch_w:
+        raise ValueError(
+            f"Latent size {frames}x{height}x{width} must be divisible by "
+            f"transformer patch_size={(patch_t, patch_h, patch_w)}"
+        )
+
+    patched_frames = frames // patch_t
+    patched_height = height // patch_h
+    patched_width = width // patch_w
+    rotary_emb = transformer.rope(hidden_states)
+    tokens = (
+        transformer.patch_embedding(hidden_states)
+        .flatten(2)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    thw = (patched_frames, patched_height, patched_width)
+
+    for index, raw_block in enumerate(transformer.blocks):
+        block = _base_block(raw_block)
+        if not all(
+            hasattr(block, name)
+            for name in (
+                "attn1",
+                "norm1",
+                "norm3",
+                "prompt_free_adapter",
+                "ffn",
+                "scale_shift_table",
+            )
+        ):
+            raise TypeError(f"Block {index} is not compatible with B2-A training")
+        block.attn1._thw = thw
+        if gradient_checkpointing and torch.is_grad_enabled():
+            def block_forward(value, *, _block=block):
+                return _forward_prompt_free_no_time_block_training(
+                    _block,
+                    value,
+                    rotary_emb,
+                )
+
+            tokens = activation_checkpoint(
+                block_forward,
+                tokens,
+                use_reentrant=False,
+            )
+        else:
+            tokens = _forward_prompt_free_no_time_block_training(
+                block,
+                tokens,
+                rotary_emb,
+            )
+
+    hidden_dtype = tokens.dtype
+    shift, scale = transformer.scale_shift_table.to(hidden_dtype).chunk(2, dim=1)
+    tokens = transformer.norm_out(tokens)
+    tokens = tokens * (1.0 + scale) + shift
+    tokens = transformer.proj_out(tokens)
+    tokens = tokens.reshape(
+        batch,
+        patched_frames,
+        patched_height,
+        patched_width,
+        patch_t,
+        patch_h,
+        patch_w,
+        -1,
+    )
+    tokens = tokens.permute(0, 7, 1, 4, 2, 5, 3, 6)
+    return tokens.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+
+class B2ACompactVelocityDistillationForward(nn.Module):
+    """Encode LQ and run the compact DiT; no decoder is used in training."""
+
+    def __init__(
+        self,
+        reae: nn.Module,
+        transformer: nn.Module,
+        *,
+        attention_backend: str = "sdpa",
+        gradient_checkpointing: bool = True,
+    ) -> None:
+        super().__init__()
+        from .forward import prepare_prompt_free_no_time_transformer_for_training
+
+        self.reae = reae
+        self.transformer = transformer
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        prepare_prompt_free_no_time_transformer_for_training(
+            self.transformer,
+            attention_backend=attention_backend,
+        )
+
+    def forward(self, batch) -> dict[str, torch.Tensor]:
+        from .forward import encode_reae_clip, prepare_training_batch
+
+        prepared = prepare_training_batch(batch)
+        lq_input = prepared["lq_input"]
+        target = prepared["target"]
+        if not isinstance(lq_input, torch.Tensor) or not isinstance(target, torch.Tensor):
+            raise TypeError("Prepared batch is missing lq_input/target tensors")
+        z_lq_ntchw = encode_reae_clip(self.reae, lq_input, require_4k_plus_1=True)
+        z_lq = z_lq_ntchw.permute(0, 2, 1, 3, 4).contiguous()
+        velocity = forward_b2a_compact_transformer_training(
+            self.transformer,
+            z_lq,
+            gradient_checkpointing=self.gradient_checkpointing,
+        )
+        if velocity.shape != z_lq.shape:
+            raise ValueError(
+                f"B2-A velocity shape {tuple(velocity.shape)} does not match "
+                f"input latent shape {tuple(z_lq.shape)}"
+            )
+        return {
+            "velocity": velocity,
+            "z_lq": z_lq,
+            "target": target,
+            "lq_input": lq_input,
+        }
