@@ -144,8 +144,8 @@ def export_validation_visuals(
                     (
                         ("LQ bicubic", videos["lq_input"][frame_index]),
                         ("GT", videos["target"][frame_index]),
-                        ("Conditional teacher", videos["teacher_prediction"][frame_index]),
-                        ("Prompt-free student", videos["student_prediction"][frame_index]),
+                        ("Teacher", videos["teacher_prediction"][frame_index]),
+                        ("Student", videos["student_prediction"][frame_index]),
                     )
                 )
             )
