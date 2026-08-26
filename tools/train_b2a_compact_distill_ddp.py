@@ -103,6 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr-warmup-steps", type=int, default=100)
     p.add_argument("--min-lr-ratio", type=float, default=0.10)
     p.add_argument("--no-gradient-checkpointing", action="store_true")
+    p.add_argument(
+        "--max-amp-overflow-retries",
+        type=int,
+        default=8,
+        help=(
+            "Maximum GradScaler backoff retries for the same optimizer batch. "
+            "Only applies to FP16; BF16/FP32 still fail immediately on non-finite gradients."
+        ),
+    )
     p.add_argument("--max-steps", type=int, required=True)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--validate-every", type=int, default=500)
@@ -176,6 +185,8 @@ def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
         raise ValueError("velocity loss weights must be non-negative")
     if args.velocity_mse_weight == 0 and args.velocity_cosine_weight == 0:
         raise ValueError("At least one velocity loss weight must be nonzero")
+    if args.max_amp_overflow_retries < 0:
+        raise ValueError("max-amp-overflow-retries must be non-negative")
     if args.visual_validation_samples < 0:
         raise ValueError("visual-validation-samples must be non-negative")
     if args.visual_video_fps <= 0 or args.visual_difference_scale <= 0:
@@ -468,6 +479,7 @@ def main() -> int:
             eps=args.optimizer_eps,
         )
         scaler = build_grad_scaler(device, dtype)
+        initial_grad_scale = float(scaler.get_scale())
         ddp_model = DistributedDataParallel(
             closure,
             device_ids=[local_rank],
@@ -485,7 +497,7 @@ def main() -> int:
             and visualize_every > 0
         )
         run_config = {
-            "trainer": "b2a_wan13_velocity_distill_ddp_v1",
+            "trainer": "b2a_wan13_velocity_distill_ddp_v2_amp_retry",
             "base_checkpoint": str(base_root),
             "student_init": str(student_root),
             "student_shape": shape,
@@ -514,6 +526,10 @@ def main() -> int:
             "lr_warmup_steps": args.lr_warmup_steps,
             "min_lr_ratio": args.min_lr_ratio,
             "gradient_checkpointing": not args.no_gradient_checkpointing,
+            "amp_dynamic_loss_scaling": bool(scaler.is_enabled()),
+            "amp_initial_scale": initial_grad_scale,
+            "amp_overflow_policy": "backoff_and_retry_same_optimizer_batch",
+            "max_amp_overflow_retries": args.max_amp_overflow_retries,
             "decoder_in_training_loss": False,
             "validation_decoder": "original_frozen_reae",
             "visuals_enabled": visuals_enabled,
@@ -528,10 +544,12 @@ def main() -> int:
 
         train_log = run_dir / "train_log.jsonl"
         val_log = run_dir / "val_log.jsonl"
+        amp_overflow_log = run_dir / "amp_overflow_log.jsonl"
         best_relative_l2 = float("inf")
         best_step: int | None = None
         global_step = 0
         epoch = 0
+        amp_overflow_count = 0
         last_record: dict[str, object] = {}
         started = time.perf_counter()
 
@@ -611,105 +629,158 @@ def main() -> int:
             iterator = iter(loader)
 
             while global_step < args.max_steps:
-                optimizer.zero_grad(set_to_none=True)
-                sums: dict[str, float] = {}
                 step_started = time.perf_counter()
-                consumed = 0
                 next_step = global_step + 1
                 current_lr = _lr_for_step(args, next_step)
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
 
-                for micro_index in range(args.gradient_accumulation_steps):
+                micro_batches_cpu: list[Mapping[str, object]] = []
+                for _ in range(args.gradient_accumulation_steps):
                     try:
                         batch_cpu = next(iterator)
                     except StopIteration:
                         break
-                    consumed += 1
-                    teacher_velocity = train_cache.load_batch(
-                        batch_cpu, device=device, dtype=dtype
-                    )
-                    batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
-                    synchronize = micro_index + 1 == args.gradient_accumulation_steps
-                    sync_context = nullcontext() if synchronize else ddp_model.no_sync()
-                    with sync_context:
-                        with torch.autocast(
-                            "cuda", dtype=dtype,
-                            enabled=device.type == "cuda" and autocast_enabled,
-                        ):
-                            output = ddp_model(batch)
-                        objective = velocity_distillation_objective(
-                            output["velocity"],
-                            teacher_velocity,
-                            velocity_mse_weight=args.velocity_mse_weight,
-                            velocity_cosine_weight=args.velocity_cosine_weight,
-                            output_l1_weight=0.0,
-                            output_temporal_weight=0.0,
-                            gt_loss_mode="none",
-                            gt_pixel_weight=0.0,
-                            gt_temporal_weight=0.0,
-                            epsilon=args.loss_epsilon,
-                        )
-                        scaled_loss = objective["loss"] / args.gradient_accumulation_steps
-                        if not torch.isfinite(objective["loss"].detach()).item():
-                            raise FloatingPointError("Non-finite B2-A distillation loss")
-                        if scaler.is_enabled():
-                            scaler.scale(scaled_loss).backward()
-                        else:
-                            scaled_loss.backward()
-                    for key in (
-                        "loss",
-                        "velocity_mse",
-                        "velocity_normalized_mse",
-                        "velocity_cosine",
-                        "velocity_cosine_loss",
-                        "teacher_velocity_power",
-                    ):
-                        sums[key] = sums.get(key, 0.0) + float(
-                            objective[key].detach().float().item()
-                        )
-
-                if consumed != args.gradient_accumulation_steps:
+                    micro_batches_cpu.append(batch_cpu)
+                if len(micro_batches_cpu) != args.gradient_accumulation_steps:
                     optimizer.zero_grad(set_to_none=True)
                     break
 
-                if scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                gradients = gradient_summary(closure.named_parameters())
-                if int(gradients["gradient_tensors"]) == 0:
-                    raise RuntimeError("Backward produced no trainable gradients")
-                if int(gradients["nonfinite_elements"]) != 0:
-                    raise FloatingPointError("Backward produced non-finite gradients")
-                if int(gradients["missing_gradient_count"]) != 0:
-                    raise RuntimeError(
-                        f"Missing gradients: {gradients['missing_gradient_examples']}"
-                    )
-                grad_norm = float(gradients["global_l2"])
-                if args.max_grad_norm > 0:
-                    grad_norm = float(
-                        torch.nn.utils.clip_grad_norm_(
-                            [parameter for _, parameter in trainable_named_parameters(closure)],
-                            max_norm=args.max_grad_norm,
-                            error_if_nonfinite=True,
-                        ).float().item()
-                    )
+                amp_retry = 0
+                while True:
+                    optimizer.zero_grad(set_to_none=True)
+                    sums: dict[str, float] = {}
 
-                scale_before = float(scaler.get_scale())
-                if scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                scale_after = float(scaler.get_scale())
-                overflow = torch.tensor(
-                    [1 if scaler.is_enabled() and scale_after < scale_before else 0],
-                    device=device,
-                    dtype=torch.int32,
-                )
-                dist.all_reduce(overflow, op=dist.ReduceOp.MAX)
-                if int(overflow.item()) != 0:
-                    raise FloatingPointError("At least one rank skipped an optimizer step")
-                optimizer.zero_grad(set_to_none=True)
+                    for micro_index, batch_cpu in enumerate(micro_batches_cpu):
+                        teacher_velocity = train_cache.load_batch(
+                            batch_cpu, device=device, dtype=dtype
+                        )
+                        batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
+                        synchronize = micro_index + 1 == args.gradient_accumulation_steps
+                        sync_context = nullcontext() if synchronize else ddp_model.no_sync()
+                        with sync_context:
+                            with torch.autocast(
+                                "cuda", dtype=dtype,
+                                enabled=device.type == "cuda" and autocast_enabled,
+                            ):
+                                output = ddp_model(batch)
+                            objective = velocity_distillation_objective(
+                                output["velocity"],
+                                teacher_velocity,
+                                velocity_mse_weight=args.velocity_mse_weight,
+                                velocity_cosine_weight=args.velocity_cosine_weight,
+                                output_l1_weight=0.0,
+                                output_temporal_weight=0.0,
+                                gt_loss_mode="none",
+                                gt_pixel_weight=0.0,
+                                gt_temporal_weight=0.0,
+                                epsilon=args.loss_epsilon,
+                            )
+                            scaled_loss = objective["loss"] / args.gradient_accumulation_steps
+                            if not torch.isfinite(objective["loss"].detach()).item():
+                                raise FloatingPointError("Non-finite B2-A distillation loss")
+                            if scaler.is_enabled():
+                                scaler.scale(scaled_loss).backward()
+                            else:
+                                scaled_loss.backward()
+                        for key in (
+                            "loss",
+                            "velocity_mse",
+                            "velocity_normalized_mse",
+                            "velocity_cosine",
+                            "velocity_cosine_loss",
+                            "teacher_velocity_power",
+                        ):
+                            sums[key] = sums.get(key, 0.0) + float(
+                                objective[key].detach().float().item()
+                            )
+
+                    scale_before = float(scaler.get_scale())
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                    gradients = gradient_summary(closure.named_parameters())
+                    if int(gradients["gradient_tensors"]) == 0:
+                        raise RuntimeError("Backward produced no trainable gradients")
+                    if int(gradients["missing_gradient_count"]) != 0:
+                        raise RuntimeError(
+                            f"Missing gradients: {gradients['missing_gradient_examples']}"
+                        )
+
+                    local_nonfinite = int(gradients["nonfinite_elements"])
+                    nonfinite_flag = torch.tensor(
+                        [1 if local_nonfinite else 0],
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
+                    global_nonfinite = int(nonfinite_flag.item()) != 0
+
+                    if global_nonfinite and not scaler.is_enabled():
+                        raise FloatingPointError(
+                            "Backward produced non-finite gradients without FP16 GradScaler"
+                        )
+
+                    grad_norm = float("nan")
+                    if not global_nonfinite:
+                        grad_norm = float(gradients["global_l2"])
+                        if args.max_grad_norm > 0:
+                            grad_norm = float(
+                                torch.nn.utils.clip_grad_norm_(
+                                    [
+                                        parameter
+                                        for _, parameter in trainable_named_parameters(closure)
+                                    ],
+                                    max_norm=args.max_grad_norm,
+                                    error_if_nonfinite=True,
+                                ).float().item()
+                            )
+
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    scale_after = float(scaler.get_scale())
+
+                    if global_nonfinite:
+                        if not scale_after < scale_before:
+                            raise FloatingPointError(
+                                "FP16 gradients were non-finite but GradScaler did not back off: "
+                                f"scale_before={scale_before}, scale_after={scale_after}"
+                            )
+                        amp_overflow_count += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        if rank == 0:
+                            append_jsonl(
+                                amp_overflow_log,
+                                {
+                                    "attempted_global_step": next_step,
+                                    "epoch": epoch,
+                                    "retry_index": amp_retry + 1,
+                                    "scale_before": scale_before,
+                                    "scale_after": scale_after,
+                                    "max_amp_overflow_retries": args.max_amp_overflow_retries,
+                                },
+                            )
+                            print(
+                                f"AMP overflow before step={next_step}: "
+                                f"scale {scale_before:g} -> {scale_after:g}; "
+                                f"retrying same optimizer batch "
+                                f"({amp_retry + 1}/{args.max_amp_overflow_retries})",
+                                flush=True,
+                            )
+                        if amp_retry >= args.max_amp_overflow_retries:
+                            raise FloatingPointError(
+                                "Exceeded max AMP overflow retries for one optimizer batch: "
+                                f"step={next_step}, retries={amp_retry + 1}, "
+                                f"current_scale={scale_after}"
+                            )
+                        amp_retry += 1
+                        continue
+
+                    optimizer.zero_grad(set_to_none=True)
+                    break
+
                 global_step += 1
 
                 keys = tuple(sums)
@@ -740,6 +811,9 @@ def main() -> int:
                     "velocity_relative_l2": relative_l2,
                     "gradient_norm": grad_norm_global,
                     "learning_rate": current_lr,
+                    "grad_scale": float(scaler.get_scale()),
+                    "amp_retries_this_step": amp_retry,
+                    "amp_overflow_count": amp_overflow_count,
                     "step_seconds": step_seconds,
                     "peak_allocated_gb_per_rank": torch.cuda.max_memory_allocated(device) / 1024**3,
                 }
@@ -751,6 +825,8 @@ def main() -> int:
                             f"rel_l2={relative_l2:.6f} "
                             f"cos={averages['velocity_cosine']:.6f} "
                             f"lr={current_lr:.3e} grad={grad_norm_global:.4f} "
+                            f"scale={last_record['grad_scale']:.0f} "
+                            f"amp_retry={amp_retry} "
                             f"time={step_seconds:.3f}s "
                             f"peak={last_record['peak_allocated_gb_per_rank']:.2f}GB",
                             flush=True,
@@ -796,7 +872,7 @@ def main() -> int:
                             runtime_dtype=dtype,
                             transformer_subfolder=args.transformer_subfolder,
                             metadata={
-                                "trainer": "b2a_wan13_velocity_distill_ddp_v1",
+                                "trainer": "b2a_wan13_velocity_distill_ddp_v2_amp_retry",
                                 "global_step": global_step,
                                 "source_student_init": str(student_root),
                                 "velocity_relative_l2_train": relative_l2,
@@ -805,6 +881,8 @@ def main() -> int:
                                 ),
                                 "best_validation_step": best_step,
                                 "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
+                                "grad_scale": float(scaler.get_scale()),
+                                "amp_overflow_count": amp_overflow_count,
                                 "optimizer_state_saved": False,
                             },
                         )
@@ -832,6 +910,9 @@ def main() -> int:
                 "student_shape": shape,
                 "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
                 "world_size": world_size,
+                "amp_initial_scale": initial_grad_scale,
+                "amp_final_scale": float(scaler.get_scale()),
+                "amp_overflow_count": amp_overflow_count,
             }
             _write_json(run_dir / "summary.json", summary)
             print(json.dumps(summary, indent=2))
