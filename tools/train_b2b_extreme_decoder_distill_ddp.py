@@ -19,6 +19,16 @@ B1-specific arguments only when they are not already present.
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+# When this file is executed directly (``python tools/...`` or via torchrun),
+# Python puts ``tools/`` rather than the repository root on sys.path.  Add the
+# repo root explicitly so ``from tools import ...`` works the same way as the
+# other standalone scripts in this repository.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tools import train_reae_slim_teacher_distill_ddp as base
 
