@@ -18,10 +18,29 @@ class B2BExtremeDecoderDistillTest(unittest.TestCase):
             "swiftvr_b2b0c_extreme_decoder_teacher_distill_ddp_v1",
         )
 
-    def test_base_parser_accepts_extreme_variant(self) -> None:
-        parser = b2b.base.build_parser()
+    def test_wrapper_parser_accepts_extreme_without_duplicate_options(self) -> None:
+        parser = b2b.build_parser()
         variant_action = next(action for action in parser._actions if action.dest == "variant")
         self.assertIn("extreme", tuple(variant_action.choices))
+        self.assertIn("--teacher-l2-weight", parser._option_string_actions)
+        self.assertIn("--teacher-lpips-weight", parser._option_string_actions)
+        self.assertIn("--teacher-temporal-weight", parser._option_string_actions)
+
+        # argparse itself rejects duplicate option strings, so reaching this
+        # point already verifies the original conflict is gone. Check the
+        # intended B2B/B1-compatible defaults as an additional regression guard.
+        self.assertEqual(
+            parser._option_string_actions["--teacher-l2-weight"].default,
+            10.0,
+        )
+        self.assertEqual(
+            parser._option_string_actions["--teacher-lpips-weight"].default,
+            0.1,
+        )
+        self.assertEqual(
+            parser._option_string_actions["--teacher-temporal-weight"].default,
+            1.0,
+        )
 
 
 if __name__ == "__main__":
