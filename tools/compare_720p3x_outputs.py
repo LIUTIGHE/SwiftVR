@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Create research-oriented visual comparisons for 720p -> 3x restoration.
 
-Inputs may be video files or image-sequence directories.  For publication-quality
+Inputs may be video files or image-sequence directories. For publication-quality
 inspection, prefer PNG directories from SwiftVR ``--png`` inference so codec
-artifacts cannot hide or invent high-frequency detail.  The tool writes a compact
+artifacts cannot hide or invent high-frequency detail. The tool writes a compact
 2-column comparison video, selected-frame PNGs, and optional native target-space
 crop strips.
+
+The historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` interface is
+kept for backward compatibility. Labels are configurable so later compression
+stages (for example B2-A + B1 Slim100) can reuse the same comparison tool without
+mislabeling the candidate. An optional GT source can be included when a paired
+real/test sample is available.
 """
 
 from __future__ import annotations
@@ -150,9 +156,17 @@ def _crop_strip(method_frames: list[tuple[str, np.ndarray]], crop, label_height:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--lq", type=Path, required=True, help="Original 720p LQ video or image directory.")
+    p.add_argument("--gt", type=Path, default=None,
+                   help="Optional paired GT video/image directory at target resolution.")
+    p.add_argument("--gt-label", default="GT")
     p.add_argument("--original-swiftvr", type=Path, required=True)
-    p.add_argument("--b1", type=Path, required=True, help="B1 Slim100 video or image directory.")
-    p.add_argument("--avernet", type=Path, default=None, help="Optional external AVerNet video/image directory.")
+    p.add_argument("--original-label", default="Original SwiftVR")
+    p.add_argument("--b1", type=Path, required=True,
+                   help="Required candidate video/image directory; historically B1 Slim100.")
+    p.add_argument("--b1-label", default="B1 Slim100")
+    p.add_argument("--avernet", type=Path, default=None,
+                   help="Optional additional method video/image directory.")
+    p.add_argument("--avernet-label", default="AVerNet")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--panel-width", type=int, default=960)
     p.add_argument("--fps", type=float, default=None)
@@ -177,14 +191,20 @@ def main() -> int:
     b1 = FrameSource(args.b1, fallback_fps=original.fps)
     target_w, target_h = original.width, original.height
     if (b1.width, b1.height) != (target_w, target_h):
-        raise ValueError(f"B1 resolution {b1.width}x{b1.height} != Original {target_w}x{target_h}")
+        raise ValueError(f"candidate resolution {b1.width}x{b1.height} != Original {target_w}x{target_h}")
 
-    methods: list[tuple[str, FrameSource]] = [("Original SwiftVR", original), ("B1 Slim100", b1)]
+    methods: list[tuple[str, FrameSource]] = []
+    if args.gt is not None:
+        gt = FrameSource(args.gt, fallback_fps=original.fps)
+        if (gt.width, gt.height) != (target_w, target_h):
+            raise ValueError(f"GT resolution {gt.width}x{gt.height} != target {target_w}x{target_h}")
+        methods.append((args.gt_label, gt))
+    methods.extend(((args.original_label, original), (args.b1_label, b1)))
     if args.avernet is not None:
         avernet = FrameSource(args.avernet, fallback_fps=original.fps)
         if (avernet.width, avernet.height) != (target_w, target_h):
-            raise ValueError(f"AVerNet resolution {avernet.width}x{avernet.height} != target {target_w}x{target_h}")
-        methods.append(("AVerNet", avernet))
+            raise ValueError(f"additional method resolution {avernet.width}x{avernet.height} != target {target_w}x{target_h}")
+        methods.append((args.avernet_label, avernet))
 
     sources = [("LQ", lq)] + methods
     frame_counts = {label: len(source) for label, source in sources}
@@ -233,9 +253,16 @@ def main() -> int:
 
     metadata = {
         "lq": str(lq.path),
+        "gt": None if args.gt is None else str(args.gt.expanduser().resolve()),
         "original_swiftvr": str(original.path),
         "b1": str(b1.path),
         "avernet": None if args.avernet is None else str(args.avernet.expanduser().resolve()),
+        "labels": {
+            "gt": args.gt_label if args.gt is not None else None,
+            "original_swiftvr": args.original_label,
+            "b1": args.b1_label,
+            "avernet": args.avernet_label if args.avernet is not None else None,
+        },
         "source_kinds": {label: source.kind for label, source in sources},
         "lq_resolution": [lq.width, lq.height],
         "target_resolution": [target_w, target_h],
