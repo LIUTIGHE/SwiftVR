@@ -33,7 +33,8 @@ class B2BJointTest(unittest.TestCase):
         torch.manual_seed(7)
         student_velocity = torch.randn(2, 3, 2, 4, 4, requires_grad=True)
         teacher_velocity = torch.randn_like(student_velocity)
-        student_rgb = torch.sigmoid(torch.randn(2, 5, 3, 8, 8, requires_grad=True))
+        student_rgb_source = torch.randn(2, 5, 3, 8, 8, requires_grad=True)
+        student_rgb = torch.sigmoid(student_rgb_source)
         teacher_rgb = torch.rand_like(student_rgb)
         target = torch.rand_like(student_rgb)
         objective = b2b_joint_objective(
@@ -46,9 +47,9 @@ class B2BJointTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(objective["loss"]))
         objective["loss"].backward()
         self.assertIsNotNone(student_velocity.grad)
-        # sigmoid makes student_rgb non-leaf; retain_grad is not needed to prove
-        # the RGB branch participates because its source leaf receives gradient.
+        self.assertIsNotNone(student_rgb_source.grad)
         self.assertGreater(float(student_velocity.grad.abs().sum()), 0.0)
+        self.assertGreater(float(student_rgb_source.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":
