@@ -52,6 +52,11 @@ class B2BJointRecoveryProtocolTest(unittest.TestCase):
             source,
         )
 
+    def test_validation_uses_no_grad_not_inference_mode(self) -> None:
+        source = inspect.getsource(recovery._validate_rank0)
+        self.assertIn("with torch.no_grad():", source)
+        self.assertNotIn("with torch.inference_mode():", source)
+
 
 if __name__ == "__main__":
     unittest.main()
