@@ -15,8 +15,17 @@ introducing a second training implementation.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Mapping
+
+# Direct execution (``python tools/...`` or ``torchrun tools/...``) places the
+# tools directory rather than the repository root on sys.path. Add the root
+# before importing the top-level ``tools`` package, matching the other standalone
+# SwiftVR training scripts.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tools import train_b2b_joint_recovery_ddp as base
 from swiftvr.models.reae_slim_decoder import AGGRESSIVE_CHANNELS
