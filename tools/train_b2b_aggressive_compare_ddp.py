@@ -7,9 +7,9 @@ Both branches use the same D768/F4080/L30 DiT, the same aggressive decoder
 (256,128,64,32), the same losses/data/validation path, and the same DDP code.
 
 ``--freeze-decoder`` implements the staged branch by forcing the decoder optimizer
-learning rate to exactly zero after argument validation.  Decoder gradients are
+learning rate to exactly zero after argument validation. Decoder gradients are
 still computed so the validated DDP/autograd path is unchanged, but decoder
-parameters cannot update.  This is deliberate: it isolates update policy without
+parameters cannot update. This is deliberate: it isolates update policy without
 introducing a second training implementation.
 """
 
@@ -82,13 +82,16 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
     _original_write_json(path, payload)
 
 
-# Patch only this wrapper process.  The validated B2B-1B source remains intact.
-base.build_parser = build_parser
-base._validate_args = _validate_args
-base._write_json = _write_json
-base.B2B_EXTREME_DECODER_CHANNELS = tuple(AGGRESSIVE_CHANNELS)
-base.b2b_compute_budget = b2b_aggressive_compute_budget
+def main() -> int:
+    # Patch only while this wrapper is executed. Merely importing this module for
+    # tests or tooling leaves the validated B2B-1B module untouched.
+    base.build_parser = build_parser
+    base._validate_args = _validate_args
+    base._write_json = _write_json
+    base.B2B_EXTREME_DECODER_CHANNELS = tuple(AGGRESSIVE_CHANNELS)
+    base.b2b_compute_budget = b2b_aggressive_compute_budget
+    return base.main()
 
 
 if __name__ == "__main__":
-    raise SystemExit(base.main())
+    raise SystemExit(main())
