@@ -21,7 +21,7 @@ class B2BJointRecoveryProtocolTest(unittest.TestCase):
         self.assertAlmostEqual(defaults["teacher_rgb_l1_weight"], 1.0)
         self.assertAlmostEqual(defaults["gt_rgb_l1_weight"], 0.5)
 
-    def test_lr_multiplier_warms_then_decays(self) -> None:
+    def test_lr_scale_warms_then_decays(self) -> None:
         parser = recovery.build_parser()
         args = parser.parse_args(
             [
@@ -35,10 +35,10 @@ class B2BJointRecoveryProtocolTest(unittest.TestCase):
                 "--output-dir", "out",
             ]
         )
-        self.assertAlmostEqual(recovery._lr_multiplier(args, 1), 1.0 / 50.0)
-        self.assertAlmostEqual(recovery._lr_multiplier(args, 50), 1.0)
-        self.assertLess(recovery._lr_multiplier(args, 500), 1.0)
-        self.assertAlmostEqual(recovery._lr_multiplier(args, 500), 0.1)
+        self.assertAlmostEqual(recovery._lr_scale(args, 1), 1.0 / 50.0)
+        self.assertAlmostEqual(recovery._lr_scale(args, 50), 1.0)
+        self.assertLess(recovery._lr_scale(args, 500), 1.0)
+        self.assertAlmostEqual(recovery._lr_scale(args, 500), 0.1)
 
 
 if __name__ == "__main__":
