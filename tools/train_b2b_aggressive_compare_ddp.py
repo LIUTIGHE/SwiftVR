@@ -6,6 +6,11 @@ and joint experiments differ only in whether decoder parameters are updated.
 Both branches use the same D768/F4080/L30 DiT, the same aggressive decoder
 (256,128,64,32), the same losses/data/validation path, and the same DDP code.
 
+Deployment priority is teacher-behavior preservation rather than GT-regression.
+Student->Teacher RGB fidelity remains the checkpoint-selection criterion; GT
+metrics are diagnostics, and any non-zero GT loss weight should be treated as an
+explicit diagnostic/training choice rather than the default long-run objective.
+
 ``--freeze-decoder`` implements the staged branch by forcing the decoder optimizer
 learning rate to exactly zero after argument validation. Decoder gradients are
 still computed so the validated DDP/autograd path is unchanged, but decoder
@@ -88,6 +93,9 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
             "frozen_zero_lr" if _freeze_decoder_updates else "joint_trainable"
         )
         payload["freeze_decoder"] = _freeze_decoder_updates
+        payload["deployment_priority"] = "teacher_behavior"
+        payload["checkpoint_selection_metric"] = "student_teacher_psnr"
+        payload["gt_role"] = "diagnostic_or_explicit_optional_loss"
     _original_write_json(path, payload)
 
 
