@@ -489,7 +489,10 @@ def main() -> int:
                 )
             return validation
 
-        validation_configured = val_loader is not None and val_cache is not None
+        # This flag must be identical on every rank.  val_loader is intentionally
+        # rank-0-only, so deriving the flag from val_loader would make rank 0 enter
+        # validation barriers while the other ranks enter DDP gradient all-reduce.
+        validation_configured = bool(args.val_manifest and args.val_teacher_cache)
         if args.validate_at_start and validation_configured:
             dist.barrier()
             if rank == 0:
