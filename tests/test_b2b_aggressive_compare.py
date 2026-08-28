@@ -15,6 +15,8 @@ class B2BAggressiveCompareTest(unittest.TestCase):
                 "--decoder-init", "decoder",
                 "--teacher-cache", "train_cache",
                 "--manifest", "train.jsonl",
+                "--val-teacher-cache", "val_cache",
+                "--val-manifest", "val.jsonl",
                 "--output-dir", "out",
                 *extra,
             ]
