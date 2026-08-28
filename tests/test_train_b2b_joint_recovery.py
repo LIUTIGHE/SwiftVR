@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 
 from tools import train_b2b_joint_recovery_ddp as recovery
@@ -39,6 +40,17 @@ class B2BJointRecoveryProtocolTest(unittest.TestCase):
         self.assertAlmostEqual(recovery._lr_scale(args, 50), 1.0)
         self.assertLess(recovery._lr_scale(args, 500), 1.0)
         self.assertAlmostEqual(recovery._lr_scale(args, 500), 0.1)
+
+    def test_validation_gate_is_rank_invariant(self) -> None:
+        source = inspect.getsource(recovery.main)
+        self.assertIn(
+            "validation_configured = bool(args.val_manifest and args.val_teacher_cache)",
+            source,
+        )
+        self.assertNotIn(
+            "validation_configured = val_loader is not None and val_cache is not None",
+            source,
+        )
 
 
 if __name__ == "__main__":
