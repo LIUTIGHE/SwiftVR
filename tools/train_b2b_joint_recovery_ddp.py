@@ -259,7 +259,12 @@ def _validate_rank0(
     batches = 0
     autocast_enabled = device.type == "cuda" and dtype == torch.bfloat16
     try:
-        with torch.inference_mode():
+        # Do not use torch.inference_mode() here.  The attention path lazily
+        # creates and caches indexing tensors during validation; inference-mode
+        # tensors cannot later participate in an autograd-tracked training
+        # forward.  no_grad() still avoids graph construction while keeping any
+        # persistent caches as ordinary tensors safe for subsequent training.
+        with torch.no_grad():
             for batch_cpu in loader:
                 teacher_velocity = cache.load_batch(batch_cpu, device=device, dtype=dtype)
                 batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
