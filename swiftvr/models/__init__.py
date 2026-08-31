@@ -22,3 +22,10 @@ from .transformer import (
 )
 from .transformer_prompt_free import WanTransformer3DModelPromptFree
 from .transformer_prompt_free_no_time import WanTransformer3DModelPromptFreeNoTime
+from .transformer_prompt_free_no_time_moe import (
+    SparseMoEFFN,
+    SparseMoEExpert,
+    SparseMoERouterStats,
+    WanTransformerBlockPromptFreeNoTimeMoE,
+    WanTransformer3DModelPromptFreeNoTimeMoE,
+)
