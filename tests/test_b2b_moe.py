@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -103,6 +105,22 @@ class MoETransformerTests(unittest.TestCase):
         stats = model.router_stats()
         self.assertEqual(len(stats), 2)
         self.assertTrue(all(item is not None for item in stats))
+
+    def test_checkpoint_round_trip_preserves_moe_config(self):
+        torch.manual_seed(0)
+        model = self._tiny_model().eval()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            model.save_pretrained(path, safe_serialization=True)
+            loaded = WanTransformer3DModelPromptFreeNoTimeMoE.from_pretrained(
+                path,
+                low_cpu_mem_usage=True,
+            ).eval()
+            self.assertEqual(transformer_moe_shape(loaded), transformer_moe_shape(model))
+            self.assertEqual(int(loaded.config.shared_expert_dim), 16)
+            self.assertEqual(int(loaded.config.normal_expert_dim), 4)
+            self.assertEqual(int(loaded.config.num_experts), 4)
+            self.assertEqual(int(loaded.config.top_k), 2)
 
 
 if __name__ == "__main__":
