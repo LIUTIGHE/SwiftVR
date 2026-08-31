@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -19,6 +20,12 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Subset
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS_ROOT = ROOT / "tools"
+for search_root in (ROOT, TOOLS_ROOT):
+    if str(search_root) not in sys.path:
+        sys.path.insert(0, str(search_root))
 
 from tools import build_b2a_stage_a_teacher_cache as cache_base
 from smoke_training_forward import move_video_batch, resolve_runtime_dtype, validate_folded_checkpoint
