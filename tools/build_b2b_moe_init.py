@@ -46,6 +46,7 @@ from swiftvr.training.b2a_width import (
     ActivationImportanceCollector,
     B2ACompactVelocityDistillationForward,
     B2AWidthSpec,
+    _base_block,
 )
 from swiftvr.training.b2b_moe import (
     MOE_ARCHITECTURES,
@@ -139,7 +140,15 @@ def _score_stats(value: torch.Tensor) -> dict[str, float]:
 
 
 class BlockRedundancyCollector:
-    """Accumulate block input/output residual and cosine statistics on device."""
+    """Measure block input/output change without relying on block.forward hooks.
+
+    The B2-A training path manually expands each block rather than invoking
+    ``block.forward``.  It does invoke ``block.norm1`` once at the start of every
+    block. Therefore norm1 pre-hooks expose the ordered block inputs; input of
+    block l+1 is output of block l. The input to transformer.norm_out is the final
+    block output. This collector reconstructs all 30 input/output pairs from those
+    boundaries without changing the validated forward implementation.
+    """
 
     def __init__(self, transformer: torch.nn.Module) -> None:
         self.num_layers = len(transformer.blocks)
@@ -147,32 +156,66 @@ class BlockRedundancyCollector:
         self.output_sq: list[torch.Tensor | None] = [None] * self.num_layers
         self.cross: list[torch.Tensor | None] = [None] * self.num_layers
         self.delta_sq: list[torch.Tensor | None] = [None] * self.num_layers
+        self._current_inputs: list[torch.Tensor | None] = [None] * self.num_layers
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
-        for index, block in enumerate(transformer.blocks):
-            self._handles.append(block.register_forward_hook(self._hook(index)))
+        for index, raw_block in enumerate(transformer.blocks):
+            block = _base_block(raw_block)
+            self._handles.append(
+                block.norm1.register_forward_pre_hook(self._block_input_hook(index))
+            )
+        self._handles.append(
+            transformer.norm_out.register_forward_pre_hook(self._final_output_hook())
+        )
 
     @staticmethod
     def _add(current: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
         value = value.detach()
         return value if current is None else current + value
 
-    def _hook(self, index: int):
-        def hook(_module, inputs, output):
-            if not inputs or not isinstance(inputs[0], torch.Tensor):
-                raise TypeError(f"Block {index} redundancy hook expected tensor input")
-            if not isinstance(output, torch.Tensor):
-                raise TypeError(f"Block {index} redundancy hook expected tensor output")
-            x = inputs[0].detach().float()
-            y = output.detach().float()
-            if x.shape != y.shape:
-                raise ValueError(
-                    f"Block {index} input/output shapes differ: {tuple(x.shape)} vs {tuple(y.shape)}"
-                )
-            delta = y - x
-            self.input_sq[index] = self._add(self.input_sq[index], x.square().sum())
-            self.output_sq[index] = self._add(self.output_sq[index], y.square().sum())
-            self.cross[index] = self._add(self.cross[index], (x * y).sum())
-            self.delta_sq[index] = self._add(self.delta_sq[index], delta.square().sum())
+    @staticmethod
+    def _first_tensor(inputs, *, name: str) -> torch.Tensor:
+        if not inputs or not isinstance(inputs[0], torch.Tensor):
+            raise TypeError(f"{name} redundancy hook expected tensor input")
+        return inputs[0].detach().float()
+
+    def _record_pair(self, index: int, x: torch.Tensor, y: torch.Tensor) -> None:
+        if x.shape != y.shape:
+            raise ValueError(
+                f"Block {index} input/output shapes differ: {tuple(x.shape)} vs {tuple(y.shape)}"
+            )
+        delta = y - x
+        self.input_sq[index] = self._add(self.input_sq[index], x.square().sum())
+        self.output_sq[index] = self._add(self.output_sq[index], y.square().sum())
+        self.cross[index] = self._add(self.cross[index], (x * y).sum())
+        self.delta_sq[index] = self._add(self.delta_sq[index], delta.square().sum())
+
+    def _block_input_hook(self, index: int):
+        def hook(_module, inputs):
+            current = self._first_tensor(inputs, name=f"Block {index}")
+            if index > 0:
+                previous = self._current_inputs[index - 1]
+                if previous is None:
+                    raise RuntimeError(
+                        f"Block {index} input arrived before block {index - 1} input"
+                    )
+                self._record_pair(index - 1, previous, current)
+                self._current_inputs[index - 1] = None
+            if self._current_inputs[index] is not None:
+                raise RuntimeError(f"Block {index} input was recorded twice in one forward")
+            self._current_inputs[index] = current
+        return hook
+
+    def _final_output_hook(self):
+        def hook(_module, inputs):
+            final_output = self._first_tensor(inputs, name="norm_out")
+            last = self.num_layers - 1
+            previous = self._current_inputs[last]
+            if previous is None:
+                raise RuntimeError("Final transformer output arrived without last block input")
+            self._record_pair(last, previous, final_output)
+            self._current_inputs[last] = None
+            if any(value is not None for value in self._current_inputs):
+                raise RuntimeError("Block redundancy collector retained stale block inputs")
         return hook
 
     def close(self) -> None:
@@ -184,6 +227,8 @@ class BlockRedundancyCollector:
         groups = (self.input_sq, self.output_sq, self.cross, self.delta_sq)
         if any(any(value is None for value in group) for group in groups):
             raise RuntimeError("Block redundancy calibration did not execute every block")
+        if any(value is not None for value in self._current_inputs):
+            raise RuntimeError("Block redundancy collector ended with incomplete forward state")
         input_sq = torch.stack([value for value in self.input_sq if value is not None]).double().cpu()
         output_sq = torch.stack([value for value in self.output_sq if value is not None]).double().cpu()
         cross = torch.stack([value for value in self.cross if value is not None]).double().cpu()
