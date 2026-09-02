@@ -12,8 +12,11 @@ from swiftvr.models.transformer_prompt_free_no_time_moe import (
 )
 from swiftvr.training.b2b_moe import (
     B2BMoESpec,
+    M7A_MOE_SPEC,
+    expected_moe_shape,
     parameter_accounting,
     partition_ffn_neurons,
+    select_teacher_blocks_by_redundancy,
     transformer_moe_shape,
 )
 
@@ -62,6 +65,44 @@ class SparseMoEFFNTests(unittest.TestCase):
             for right in all_values[i + 1 :]:
                 self.assertFalse(left & right)
         self.assertEqual(set(shared.tolist()), set(range(48, 64)))
+
+
+class M7AArchitectureTests(unittest.TestCase):
+    def test_locked_m7a_shape(self):
+        shape = expected_moe_shape(M7A_MOE_SPEC)
+        self.assertEqual(shape["hidden_dim"], 1152)
+        self.assertEqual(shape["num_heads"], 9)
+        self.assertEqual(shape["head_dim"], 128)
+        self.assertEqual(shape["num_layers"], 25)
+        self.assertEqual(shape["shared_expert_dim"], 1152)
+        self.assertEqual(shape["normal_expert_dim"], 288)
+        self.assertEqual(shape["active_ffn_dim"], 1728)
+        self.assertEqual(shape["total_ffn_dim"], 4608)
+        self.assertAlmostEqual(float(shape["active_expansion"]), 1.5)
+        self.assertAlmostEqual(float(shape["total_expansion"]), 4.0)
+
+    def test_layer_redundancy_selection_protects_edges_and_preserves_order(self):
+        residual = torch.ones(30)
+        cosine = torch.zeros(30)
+        # Make five interior blocks unambiguously redundant.
+        redundant = [3, 7, 11, 18, 25]
+        residual[redundant] = 0.01
+        cosine[redundant] = 0.999
+        # Edge blocks would look even more redundant but must be protected.
+        residual[0] = residual[29] = 0.0
+        cosine[0] = cosine[29] = 1.0
+        result = select_teacher_blocks_by_redundancy(
+            residual,
+            cosine,
+            keep_layers=25,
+            protect_edge_blocks=1,
+        )
+        self.assertEqual(result["pruned_teacher_blocks"], redundant)
+        kept = result["kept_teacher_blocks"]
+        self.assertEqual(len(kept), 25)
+        self.assertEqual(kept, sorted(kept))
+        self.assertIn(0, kept)
+        self.assertIn(29, kept)
 
 
 class MoETransformerTests(unittest.TestCase):
