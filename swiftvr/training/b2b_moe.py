@@ -1,14 +1,18 @@
-"""D1536 teaching-assistant -> D1024 sparse-MoE construction helpers.
+"""D1536 teaching-assistant -> sparse-MoE construction helpers.
 
-The target keeps 30 Transformer blocks and 128-D attention heads but widens the
-D768 residual stream to 1024 while replacing each dense FFN with a 1S12E2A MoE.
-Initialization is teacher-centric:
+Two compute-matched student points are supported:
+
+* M5: D1024 / H8 / L30 / 1S12E2A;
+* M7A: D1152 / H9 / L25 / 1S12E2A.
+
+Both keep 128-D attention heads. Initialization is teacher-centric:
 
 * residual channels and whole heads are selected by activation RMS;
 * the most important dense-TA FFN neurons initialize the shared expert;
 * the next most important neurons are distributed round-robin across routed
   experts so every expert inherits useful dense weights;
-* router weights start from a small deterministic near-uniform projection.
+* router weights start from a small deterministic near-uniform projection;
+* reduced-depth students receive an explicit ordered teacher-block mapping.
 
 No decoder or GT target participates in this transfer.
 """
@@ -56,6 +60,26 @@ class B2BMoESpec:
         return self.shared_expert_dim + self.top_k * self.normal_expert_dim
 
 
+M5_MOE_ARCHITECTURE = "m5-d1024-l30"
+M7A_MOE_ARCHITECTURE = "m7a-d1152-l25"
+M5_MOE_SPEC = B2BMoESpec()
+M7A_MOE_SPEC = B2BMoESpec(
+    hidden_dim=1152,
+    num_heads=9,
+    head_dim=128,
+    num_layers=25,
+    adapter_dim=128,
+    shared_expert_dim=1152,
+    normal_expert_dim=288,
+    num_experts=12,
+    top_k=2,
+)
+MOE_ARCHITECTURES = {
+    M5_MOE_ARCHITECTURE: M5_MOE_SPEC,
+    M7A_MOE_ARCHITECTURE: M7A_MOE_SPEC,
+}
+
+
 EXPECTED_D1536_TA = {
     "hidden_dim": 1536,
     "num_heads": 12,
@@ -64,6 +88,15 @@ EXPECTED_D1536_TA = {
     "num_layers": 30,
     "adapter_dim": 128,
 }
+
+
+def moe_spec_from_name(name: str) -> B2BMoESpec:
+    try:
+        return MOE_ARCHITECTURES[str(name)]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown MoE architecture {name!r}; expected one of {sorted(MOE_ARCHITECTURES)}"
+        ) from exc
 
 
 def transformer_moe_shape(transformer: nn.Module) -> dict[str, int | float]:
@@ -95,7 +128,7 @@ def transformer_moe_shape(transformer: nn.Module) -> dict[str, int | float]:
     }
 
 
-def expected_moe_shape(spec: B2BMoESpec = B2BMoESpec()) -> dict[str, int | float]:
+def expected_moe_shape(spec: B2BMoESpec = M5_MOE_SPEC) -> dict[str, int | float]:
     return {
         "hidden_dim": spec.hidden_dim,
         "num_heads": spec.num_heads,
@@ -133,7 +166,7 @@ def validate_moe_spec(spec: B2BMoESpec) -> None:
 
 def build_moe_transformer_from_teacher(
     teacher: nn.Module,
-    spec: B2BMoESpec = B2BMoESpec(),
+    spec: B2BMoESpec = M5_MOE_SPEC,
 ) -> WanTransformer3DModelPromptFreeNoTimeMoE:
     validate_d1536_ta(teacher)
     validate_moe_spec(spec)
@@ -169,6 +202,56 @@ def build_moe_transformer_from_teacher(
     )
 
 
+def select_teacher_blocks_by_redundancy(
+    residual_ratio: torch.Tensor,
+    cosine_similarity: torch.Tensor,
+    *,
+    keep_layers: int,
+    protect_edge_blocks: int = 1,
+) -> dict[str, object]:
+    """Select an ordered teacher-block subset using calibration redundancy.
+
+    Lower ``residual_ratio + (1-cosine_similarity)`` means a block changes its
+    input less and is therefore a stronger deletion candidate.  Edge protection
+    keeps the earliest/latest blocks out of the deletion candidate set without
+    imposing uniform spacing or any hand-picked layer pattern.
+    """
+
+    residual = residual_ratio.detach().float().cpu().reshape(-1)
+    cosine = cosine_similarity.detach().float().cpu().reshape(-1)
+    if residual.shape != cosine.shape or residual.numel() == 0:
+        raise ValueError("Block redundancy vectors must have the same non-empty shape")
+    if not torch.isfinite(residual).all() or not torch.isfinite(cosine).all():
+        raise ValueError("Block redundancy statistics contain non-finite values")
+    total = int(residual.numel())
+    if not 0 < int(keep_layers) <= total:
+        raise ValueError(f"keep_layers must be in [1,{total}]")
+    protect = int(protect_edge_blocks)
+    if protect < 0 or protect * 2 >= total:
+        raise ValueError("protect_edge_blocks leaves no valid interior")
+
+    prune_count = total - int(keep_layers)
+    redundancy = residual + (1.0 - cosine.clamp(-1.0, 1.0))
+    candidates = list(range(protect, total - protect))
+    if prune_count > len(candidates):
+        raise ValueError(
+            f"Need to prune {prune_count} blocks but only {len(candidates)} are eligible"
+        )
+    ranked = sorted(candidates, key=lambda index: (float(redundancy[index]), index))
+    pruned = sorted(ranked[:prune_count])
+    pruned_set = set(pruned)
+    kept = [index for index in range(total) if index not in pruned_set]
+    return {
+        "teacher_blocks": list(range(total)),
+        "kept_teacher_blocks": kept,
+        "pruned_teacher_blocks": pruned,
+        "residual_ratio": [float(v) for v in residual.tolist()],
+        "cosine_similarity": [float(v) for v in cosine.tolist()],
+        "redundancy_score": [float(v) for v in redundancy.tolist()],
+        "protect_edge_blocks": protect,
+    }
+
+
 def _rank_indices(score: torch.Tensor, count: int) -> torch.Tensor:
     value = score.detach().float().cpu().reshape(-1)
     if count <= 0 or count > int(value.numel()):
@@ -180,14 +263,9 @@ def _rank_indices(score: torch.Tensor, count: int) -> torch.Tensor:
 
 def partition_ffn_neurons(
     score: torch.Tensor,
-    spec: B2BMoESpec = B2BMoESpec(),
+    spec: B2BMoESpec = M5_MOE_SPEC,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Allocate dense-TA FFN neurons to shared and normal experts.
-
-    The shared expert receives the highest-ranked neurons.  The next
-    ``num_experts*normal_expert_dim`` neurons are assigned round-robin by rank,
-    avoiding a systematic importance advantage for expert 0 over expert N.
-    """
+    """Allocate dense-TA FFN neurons to shared and normal experts."""
     total = spec.shared_expert_dim + spec.num_experts * spec.normal_expert_dim
     ranked = _rank_indices(score, total)
     shared = torch.sort(ranked[: spec.shared_expert_dim]).values
@@ -238,7 +316,8 @@ def transfer_d1536_to_moe(
     hidden_indices: torch.Tensor,
     head_indices_by_block: Sequence[torch.Tensor],
     ffn_scores_by_block: torch.Tensor,
-    spec: B2BMoESpec = B2BMoESpec(),
+    teacher_block_indices: Sequence[int] | None = None,
+    spec: B2BMoESpec = M5_MOE_SPEC,
     router_seed: int = 20260831,
     router_init_std: float = 1e-3,
 ) -> dict[str, object]:
@@ -256,8 +335,18 @@ def transfer_d1536_to_moe(
         raise ValueError("hidden_indices must contain unique target hidden channels")
     if int(hidden.min()) < 0 or int(hidden.max()) >= source["hidden_dim"]:
         raise ValueError("hidden_indices out of D1536 range")
+    if teacher_block_indices is None:
+        teacher_blocks = list(range(spec.num_layers))
+    else:
+        teacher_blocks = [int(value) for value in teacher_block_indices]
+    if len(teacher_blocks) != spec.num_layers:
+        raise ValueError("Need one teacher block index per student block")
+    if teacher_blocks != sorted(set(teacher_blocks)):
+        raise ValueError("teacher_block_indices must be unique and strictly increasing")
+    if teacher_blocks and (teacher_blocks[0] < 0 or teacher_blocks[-1] >= source["num_layers"]):
+        raise ValueError("teacher_block_indices out of D1536 range")
     if len(head_indices_by_block) != spec.num_layers:
-        raise ValueError("Need one head selection per block")
+        raise ValueError("Need one head selection per student block")
     if tuple(ffn_scores_by_block.shape) != (spec.num_layers, source["ffn_dim"]):
         raise ValueError(
             f"ffn_scores_by_block must be {(spec.num_layers, source['ffn_dim'])}, "
@@ -275,14 +364,15 @@ def transfer_d1536_to_moe(
         )
 
     expert_allocations: list[dict[str, object]] = []
-    for index, (teacher_raw, student_raw) in enumerate(zip(teacher.blocks, student.blocks)):
-        tb = _base_block(teacher_raw)
+    for student_index, student_raw in enumerate(student.blocks):
+        teacher_index = teacher_blocks[student_index]
+        tb = _base_block(teacher.blocks[teacher_index])
         sb = _base_block(student_raw)
-        heads = head_indices_by_block[index].detach().cpu().long().reshape(-1)
+        heads = head_indices_by_block[student_index].detach().cpu().long().reshape(-1)
         if int(heads.numel()) != spec.num_heads or int(torch.unique(heads).numel()) != spec.num_heads:
-            raise ValueError(f"Block {index}: invalid head selection")
+            raise ValueError(f"Student block {student_index}: invalid head selection")
         if int(heads.min()) < 0 or int(heads.max()) >= source["num_heads"]:
-            raise ValueError(f"Block {index}: head selection out of range")
+            raise ValueError(f"Student block {student_index}: head selection out of range")
         qkv = expand_head_indices(heads, spec.head_dim)
 
         _copy_parameter_(sb.scale_shift_table, _slice(tb.scale_shift_table, (2, hidden)))
@@ -317,10 +407,7 @@ def transfer_d1536_to_moe(
             sb.prompt_free_adapter.down.weight,
             _slice(tb.prompt_free_adapter.down.weight, (1, hidden)),
         )
-        _copy_parameter_(
-            sb.prompt_free_adapter.down.bias,
-            tb.prompt_free_adapter.down.bias.detach(),
-        )
+        _copy_parameter_(sb.prompt_free_adapter.down.bias, tb.prompt_free_adapter.down.bias.detach())
         _copy_parameter_(
             sb.prompt_free_adapter.up.weight,
             _slice(tb.prompt_free_adapter.up.weight, (0, hidden)),
@@ -334,7 +421,7 @@ def transfer_d1536_to_moe(
             tb.ffn, source["hidden_dim"], source["ffn_dim"]
         )
         shared_indices, normal_indices = partition_ffn_neurons(
-            ffn_scores_by_block[index], spec
+            ffn_scores_by_block[student_index], spec
         )
         _copy_expert_from_dense(
             teacher_up=teacher_up,
@@ -355,7 +442,7 @@ def transfer_d1536_to_moe(
             )
 
         generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(router_seed) + index)
+        generator.manual_seed(int(router_seed) + student_index)
         initial_router = torch.randn(
             tuple(sb.ffn.router.weight.shape),
             generator=generator,
@@ -365,7 +452,8 @@ def transfer_d1536_to_moe(
 
         expert_allocations.append(
             {
-                "block": index,
+                "student_block": student_index,
+                "teacher_block": teacher_index,
                 "shared": shared_indices.tolist(),
                 "normal": [value.tolist() for value in normal_indices],
             }
@@ -385,6 +473,7 @@ def transfer_d1536_to_moe(
     return {
         "teacher_shape": source,
         "student_shape": target,
+        "teacher_block_indices": teacher_blocks,
         "hidden_indices": hidden.tolist(),
         "head_indices_by_block": [
             value.detach().cpu().long().tolist() for value in head_indices_by_block
