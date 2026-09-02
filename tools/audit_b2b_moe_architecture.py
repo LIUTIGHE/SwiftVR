@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Audit the D1024 1S12E2A student against the locked D768 compute point.
+"""Audit the supported sparse-MoE students against the locked D768 compute point.
 
-The MAC estimate uses the exact canonical SwiftVR steady-state geometry:
-1920x1088 internal RGB, 24-frame MIDDLE chunk -> 6 latent frames, 2x2 DiT
-spatial patching -> 12,240 tokens/chunk = 510 tokens/output RGB frame.
+The MAC estimate uses the canonical SwiftVR steady-state geometry: 1920x1088
+internal RGB, 24-frame MIDDLE chunk -> 6 latent frames, 2x2 DiT spatial patching
+-> 12,240 tokens/chunk = 510 tokens/output RGB frame.
 
-QKV/out projections, activated FFN linears, and the router are computed directly
-from the MoE shape.  Remaining DiT work (window-attention QK/AV, adapters,
-patch/output projections) is linear in hidden width at this fixed geometry; its
-coefficient is anchored to the three previously validated dense profiles
-(D768/D1536/D3072), which agree to <2e-7 GMAC/frame per hidden channel.
+QKV/out projections, activated FFN linears, and router linears are computed from
+the MoE shape. Remaining per-block hidden-width work is anchored to the validated
+30-layer dense profiles and scaled linearly by depth; this keeps the previous M5
+estimate unchanged while allowing the M7A L25 comparison.
 """
 
 from __future__ import annotations
@@ -22,8 +21,10 @@ from swiftvr.models.transformer_prompt_free_no_time_moe import (
     WanTransformer3DModelPromptFreeNoTimeMoE,
 )
 from swiftvr.training.b2b_moe import (
-    B2BMoESpec,
+    MOE_ARCHITECTURES,
+    M5_MOE_ARCHITECTURE,
     expected_moe_shape,
+    moe_spec_from_name,
     parameter_accounting,
     transformer_moe_shape,
 )
@@ -31,12 +32,18 @@ from swiftvr.training.b2b_moe import (
 
 D768_DIT_GMAC_PER_FRAME = 196.292
 CANONICAL_TOKENS_PER_RGB_FRAME = 510
-DENSE_OTHER_GMAC_PER_HIDDEN = 0.0837388
+DENSE_OTHER_GMAC_PER_HIDDEN_AT_L30 = 0.0837388
+REFERENCE_LAYERS = 30
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, default=None)
+    p.add_argument(
+        "--architecture",
+        choices=tuple(MOE_ARCHITECTURES),
+        default=M5_MOE_ARCHITECTURE,
+    )
     p.add_argument("--transformer-subfolder", default="transformer")
     p.add_argument("--output-json", type=Path, default=None)
     p.add_argument("--expected-max-delta-percent", type=float, default=1.5)
@@ -53,13 +60,18 @@ def canonical_compute(shape: dict[str, int | float]) -> dict[str, float]:
     attention_projection = tokens * layers * 4 * d * d / 1e9
     active_ffn_linear = tokens * layers * 2 * d * active_ffn / 1e9
     router_linear = tokens * layers * d * experts / 1e9
-    dense_other = DENSE_OTHER_GMAC_PER_HIDDEN * d
-    total = attention_projection + active_ffn_linear + router_linear + dense_other
+    other_hidden = (
+        DENSE_OTHER_GMAC_PER_HIDDEN_AT_L30
+        * d
+        * layers
+        / REFERENCE_LAYERS
+    )
+    total = attention_projection + active_ffn_linear + router_linear + other_hidden
     return {
         "attention_qkv_out_projection_gmac_per_frame": attention_projection,
         "active_ffn_linear_gmac_per_frame": active_ffn_linear,
         "router_linear_gmac_per_frame": router_linear,
-        "other_hidden_linear_gmac_per_frame": dense_other,
+        "other_hidden_linear_gmac_per_frame": other_hidden,
         "estimated_dit_gmac_per_frame": total,
         "estimated_dit_gflops_per_frame_2flop_per_mac": 2.0 * total,
         "d768_reference_gmac_per_frame": D768_DIT_GMAC_PER_FRAME,
@@ -73,8 +85,10 @@ def main() -> int:
     if args.expected_max_delta_percent < 0:
         raise ValueError("--expected-max-delta-percent must be non-negative")
 
+    spec = moe_spec_from_name(args.architecture)
+    expected = expected_moe_shape(spec)
     if args.checkpoint is None:
-        shape = expected_moe_shape(B2BMoESpec())
+        shape = expected
         params = None
         checkpoint = None
     else:
@@ -85,16 +99,18 @@ def main() -> int:
             low_cpu_mem_usage=True,
         )
         shape = transformer_moe_shape(transformer)
-        expected = expected_moe_shape(B2BMoESpec())
         if shape != expected:
-            raise ValueError(f"Checkpoint shape differs from locked D1024-MoE: {shape} != {expected}")
+            raise ValueError(
+                f"Checkpoint shape differs from locked {args.architecture}: {shape} != {expected}"
+            )
         params = parameter_accounting(transformer)
         checkpoint = str(checkpoint_path)
 
     compute = canonical_compute(shape)
     passed = abs(float(compute["delta_vs_d768_percent"])) <= args.expected_max_delta_percent
     report = {
-        "kind": "swiftvr_b2b_d1024_moe_architecture_audit",
+        "kind": "swiftvr_b2b_moe_architecture_audit",
+        "architecture": args.architecture,
         "checkpoint": checkpoint,
         "canonical_geometry": {
             "internal_rgb_resolution": [1920, 1088],
@@ -110,7 +126,9 @@ def main() -> int:
         "compute": compute,
         "mac_scope_note": (
             "Linear/GEMM MAC estimate. Softmax, top-k, gather/scatter/index_add and "
-            "kernel-launch overhead are not represented; real latency must be benchmarked."
+            "kernel-launch overhead are not represented; real latency must be benchmarked. "
+            "The residual 'other' term assumes the validated L30 hidden-linear coefficient "
+            "scales linearly with layer count."
         ),
         "pass_tolerance_percent": args.expected_max_delta_percent,
         "status": "PASS" if passed else "FAIL",
@@ -123,7 +141,7 @@ def main() -> int:
         output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     if not passed:
         raise SystemExit(
-            f"Estimated D1024-MoE compute differs from D768 by "
+            f"Estimated {args.architecture} compute differs from D768 by "
             f"{compute['delta_vs_d768_percent']:.3f}%"
         )
     return 0
