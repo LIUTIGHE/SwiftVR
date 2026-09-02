@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Build the D1536-TA initialized D1024 1S12E2A sparse-MoE student.
+"""Build D1536-TA initialized sparse-MoE students for M5 or M7A.
 
-The source is the locked Stage-B2A D1536 checkpoint.  A deterministic calibration
-prefix measures activation-RMS importance.  Residual channels/attention heads are
-selected structurally; dense FFN neurons are repartitioned into shared and routed
-experts.  The output is a reloadable transformer-only checkpoint plus an audit
-report.  No decoder or GT supervision is used.
+A deterministic calibration prefix measures activation-RMS importance. Residual
+channels/attention heads are selected structurally; dense FFN neurons are
+repartitioned into shared and routed experts.
+
+For M7A (D1152/H9/L25), the same calibration also measures each D1536 teacher
+block's normalized residual contribution and input/output cosine similarity. Five
+interior blocks with the smallest ``residual_ratio + (1-cosine)`` are removed,
+and the ordered 25-block teacher subset initializes the student. No uniform layer
+skipping pattern is imposed.
+
+The output is a reloadable transformer-only checkpoint plus an audit report. No
+decoder or GT supervision is used.
 """
 
 from __future__ import annotations
@@ -41,9 +48,12 @@ from swiftvr.training.b2a_width import (
     B2AWidthSpec,
 )
 from swiftvr.training.b2b_moe import (
-    B2BMoESpec,
+    MOE_ARCHITECTURES,
+    M5_MOE_ARCHITECTURE,
     build_moe_transformer_from_teacher,
+    moe_spec_from_name,
     parameter_accounting,
+    select_teacher_blocks_by_redundancy,
     transfer_d1536_to_moe,
     transformer_moe_shape,
     validate_d1536_ta,
@@ -58,6 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-checkpoint", type=Path, required=True)
     p.add_argument("--manifest", type=Path, action="append", required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--architecture",
+        choices=tuple(MOE_ARCHITECTURES),
+        default=M5_MOE_ARCHITECTURE,
+        help="Sparse-MoE student architecture; default preserves the validated M5 path.",
+    )
+    p.add_argument(
+        "--protect-edge-blocks",
+        type=int,
+        default=1,
+        help="For reduced-depth architectures, exclude this many teacher blocks at each edge from pruning.",
+    )
     p.add_argument("--path-root", type=Path, default=Path("."))
     p.add_argument("--split", default="train")
     p.add_argument("--clip-length", type=int, default=13)
@@ -116,6 +138,66 @@ def _score_stats(value: torch.Tensor) -> dict[str, float]:
     }
 
 
+class BlockRedundancyCollector:
+    """Accumulate block input/output residual and cosine statistics on device."""
+
+    def __init__(self, transformer: torch.nn.Module) -> None:
+        self.num_layers = len(transformer.blocks)
+        self.input_sq: list[torch.Tensor | None] = [None] * self.num_layers
+        self.output_sq: list[torch.Tensor | None] = [None] * self.num_layers
+        self.cross: list[torch.Tensor | None] = [None] * self.num_layers
+        self.delta_sq: list[torch.Tensor | None] = [None] * self.num_layers
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        for index, block in enumerate(transformer.blocks):
+            self._handles.append(block.register_forward_hook(self._hook(index)))
+
+    @staticmethod
+    def _add(current: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+        value = value.detach()
+        return value if current is None else current + value
+
+    def _hook(self, index: int):
+        def hook(_module, inputs, output):
+            if not inputs or not isinstance(inputs[0], torch.Tensor):
+                raise TypeError(f"Block {index} redundancy hook expected tensor input")
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(f"Block {index} redundancy hook expected tensor output")
+            x = inputs[0].detach().float()
+            y = output.detach().float()
+            if x.shape != y.shape:
+                raise ValueError(
+                    f"Block {index} input/output shapes differ: {tuple(x.shape)} vs {tuple(y.shape)}"
+                )
+            delta = y - x
+            self.input_sq[index] = self._add(self.input_sq[index], x.square().sum())
+            self.output_sq[index] = self._add(self.output_sq[index], y.square().sum())
+            self.cross[index] = self._add(self.cross[index], (x * y).sum())
+            self.delta_sq[index] = self._add(self.delta_sq[index], delta.square().sum())
+        return hook
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def scores(self) -> dict[str, torch.Tensor]:
+        groups = (self.input_sq, self.output_sq, self.cross, self.delta_sq)
+        if any(any(value is None for value in group) for group in groups):
+            raise RuntimeError("Block redundancy calibration did not execute every block")
+        input_sq = torch.stack([value for value in self.input_sq if value is not None]).double().cpu()
+        output_sq = torch.stack([value for value in self.output_sq if value is not None]).double().cpu()
+        cross = torch.stack([value for value in self.cross if value is not None]).double().cpu()
+        delta_sq = torch.stack([value for value in self.delta_sq if value is not None]).double().cpu()
+        residual_ratio = torch.sqrt(delta_sq / input_sq.clamp_min(1e-24)).float()
+        cosine = (cross / torch.sqrt(input_sq * output_sq).clamp_min(1e-24)).float()
+        redundancy = residual_ratio + (1.0 - cosine.clamp(-1.0, 1.0))
+        return {
+            "block_residual_ratio": residual_ratio,
+            "block_cosine_similarity": cosine,
+            "block_redundancy_score": redundancy,
+        }
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     for name in (
         "clip_length",
@@ -132,12 +214,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-workers must be non-negative")
     if args.router_init_std < 0:
         raise ValueError("--router-init-std must be non-negative")
+    if args.protect_edge_blocks < 0:
+        raise ValueError("--protect-edge-blocks must be non-negative")
 
 
 def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
-    spec = B2BMoESpec()
+    spec = moe_spec_from_name(args.architecture)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
@@ -166,11 +250,7 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
 
     teacher_config = teacher_root / args.transformer_subfolder / "config.json"
-    teacher_weights = (
-        teacher_root
-        / args.transformer_subfolder
-        / "diffusion_pytorch_model.safetensors"
-    )
+    teacher_weights = teacher_root / args.transformer_subfolder / "diffusion_pytorch_model.safetensors"
     if not teacher_config.is_file() or not teacher_weights.is_file():
         raise FileNotFoundError(
             "Teacher checkpoint must contain transformer/config.json and "
@@ -214,6 +294,8 @@ def main() -> int:
         low_cpu_mem_usage=True,
     )
     source_shape = validate_d1536_ta(teacher)
+    if spec.num_layers > source_shape["num_layers"]:
+        raise ValueError("Student cannot have more layers than the D1536 TA source")
     for parameter in reae.parameters():
         parameter.requires_grad_(False)
     for parameter in teacher.parameters():
@@ -229,6 +311,11 @@ def main() -> int:
     closure.reae.eval()
 
     collector = ActivationImportanceCollector(teacher)
+    block_collector = (
+        BlockRedundancyCollector(teacher)
+        if spec.num_layers < source_shape["num_layers"]
+        else None
+    )
     processed = 0
     started = time.perf_counter()
     autocast_enabled = dtype in (torch.float16, torch.bfloat16)
@@ -261,29 +348,60 @@ def main() -> int:
                     )
     finally:
         collector.close()
+        if block_collector is not None:
+            block_collector.close()
 
     if processed != calibration_limit:
         raise RuntimeError(f"Calibration processed {processed}, expected {calibration_limit}")
     scores = collector.scores()
+    block_scores = None if block_collector is None else block_collector.scores()
 
     selection_spec = B2AWidthSpec(
         hidden_dim=spec.hidden_dim,
         num_heads=spec.num_heads,
         head_dim=spec.head_dim,
         ffn_dim=spec.total_ffn_dim,
-        num_layers=spec.num_layers,
+        num_layers=source_shape["num_layers"],
         adapter_dim=spec.adapter_dim,
     )
     selected = collector.select(selection_spec)
 
-    print("building D1024 sparse-MoE student on CPU...", flush=True)
+    if block_scores is None:
+        layer_selection = {
+            "kept_teacher_blocks": list(range(source_shape["num_layers"])),
+            "pruned_teacher_blocks": [],
+            "protect_edge_blocks": args.protect_edge_blocks,
+        }
+    else:
+        layer_selection = select_teacher_blocks_by_redundancy(
+            block_scores["block_residual_ratio"],
+            block_scores["block_cosine_similarity"],
+            keep_layers=spec.num_layers,
+            protect_edge_blocks=args.protect_edge_blocks,
+        )
+    teacher_blocks = [int(value) for value in layer_selection["kept_teacher_blocks"]]
+    if len(teacher_blocks) != spec.num_layers:
+        raise RuntimeError(
+            f"Layer selector kept {len(teacher_blocks)} blocks, expected {spec.num_layers}"
+        )
+    aligned_heads = [selected["heads"][index] for index in teacher_blocks]
+    aligned_ffn_scores = torch.index_select(
+        scores["ffn_by_block"], 0, torch.tensor(teacher_blocks, dtype=torch.long)
+    )
+
+    print(
+        f"building {args.architecture} sparse-MoE student on CPU; "
+        f"kept teacher blocks={teacher_blocks}",
+        flush=True,
+    )
     student = build_moe_transformer_from_teacher(teacher, spec)
     transfer = transfer_d1536_to_moe(
         teacher,
         student,
         hidden_indices=selected["hidden"],
-        head_indices_by_block=selected["heads"],
-        ffn_scores_by_block=scores["ffn_by_block"],
+        head_indices_by_block=aligned_heads,
+        ffn_scores_by_block=aligned_ffn_scores,
+        teacher_block_indices=teacher_blocks,
         spec=spec,
         router_seed=args.router_seed,
         router_init_std=args.router_init_std,
@@ -291,30 +409,37 @@ def main() -> int:
     target_shape = transformer_moe_shape(student)
     params = parameter_accounting(student)
 
+    importance_tensors = {
+        "hidden_global": scores["hidden_global"].contiguous(),
+        "hidden_by_block": scores["hidden_by_block"].contiguous(),
+        "head_by_block": scores["head_by_block"].contiguous(),
+        "ffn_by_block": scores["ffn_by_block"].contiguous(),
+    }
+    if block_scores is not None:
+        importance_tensors.update(
+            {key: value.contiguous() for key, value in block_scores.items()}
+        )
     importance_path = output / "activation_importance.safetensors"
-    save_file(
-        {
-            "hidden_global": scores["hidden_global"].contiguous(),
-            "hidden_by_block": scores["hidden_by_block"].contiguous(),
-            "head_by_block": scores["head_by_block"].contiguous(),
-            "ffn_by_block": scores["ffn_by_block"].contiguous(),
-        },
-        str(importance_path),
-    )
+    save_file(importance_tensors, str(importance_path))
 
     student.to(device="cpu", dtype=dtype)
     transformer_dir = output / args.transformer_subfolder
     student.save_pretrained(str(transformer_dir), safe_serialization=True)
 
     report = {
-        "kind": "swiftvr_b2b_d1024_1s12e2a_moe_init",
-        "method": "d1536_ta_activation_rms_dense_to_sparse_moe",
+        "kind": f"swiftvr_b2b_{args.architecture}_moe_init",
+        "architecture": args.architecture,
+        "method": "d1536_ta_activation_rms_plus_layer_redundancy_dense_to_sparse_moe",
         "design": {
             "shared_expert": "top activation-RMS dense FFN neurons",
             "normal_experts": "next-ranked neurons distributed round-robin",
             "router": "small deterministic near-uniform random projection",
+            "layer_selection": (
+                "residual_ratio_plus_one_minus_cosine"
+                if block_scores is not None
+                else "identity_all_teacher_blocks"
+            ),
             "token_skipping": False,
-            "block_skipping": False,
         },
         "base_checkpoint": str(base_root),
         "teacher_checkpoint": str(teacher_root),
@@ -343,11 +468,23 @@ def main() -> int:
             "hidden_global": _score_stats(scores["hidden_global"]),
             "head_by_block": _score_stats(scores["head_by_block"]),
             "ffn_by_block": _score_stats(scores["ffn_by_block"]),
+            **(
+                {
+                    "block_residual_ratio": _score_stats(block_scores["block_residual_ratio"]),
+                    "block_cosine_similarity": _score_stats(block_scores["block_cosine_similarity"]),
+                    "block_redundancy_score": _score_stats(block_scores["block_redundancy_score"]),
+                }
+                if block_scores is not None
+                else {}
+            ),
         },
         "selection": {
             "hidden_indices": transfer["hidden_indices"],
+            "teacher_block_indices": transfer["teacher_block_indices"],
+            "pruned_teacher_blocks": layer_selection["pruned_teacher_blocks"],
             "head_indices_by_block": transfer["head_indices_by_block"],
             "expert_allocations": transfer["expert_allocations"],
+            "layer_redundancy": layer_selection,
         },
         "artifacts": {
             "transformer": str(transformer_dir),
@@ -359,8 +496,11 @@ def main() -> int:
         json.dumps(
             {
                 "status": "PASS",
+                "architecture": args.architecture,
                 "teacher_shape": source_shape,
                 "student_shape": target_shape,
+                "teacher_block_indices": transfer["teacher_block_indices"],
+                "pruned_teacher_blocks": layer_selection["pruned_teacher_blocks"],
                 "parameter_accounting": params,
                 "calibration_samples": processed,
                 "output": str(output),
