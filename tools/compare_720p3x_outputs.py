@@ -13,13 +13,16 @@ Two interfaces are supported:
    --method "M3 D1536=/path/to/m3" \
    --method "M7-A=/path/to/m7a"
 
-2. Historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` arguments,
-   retained for backward compatibility.
+2. Historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` / ``--basiccnn``
+   arguments, retained for backward compatibility.  BasicCNN is always appended
+   after the other historical methods so a six-panel comparison naturally ends
+   with BasicCNN.
 
 The first restoration method defines the target resolution. The tool writes a
 labeled comparison video, selected-frame PNGs, and optional native target-space
-crop strips.  LQ is bicubic-resized only for visualization; it is never used as
-a quantitative reference.
+crop strips. LQ is bicubic-resized only for visualization; it is never used as
+a quantitative reference. If ``--columns`` is omitted, six-panel comparisons
+use three columns (2x3); all other comparisons use two columns.
 """
 
 from __future__ import annotations
@@ -184,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generic restoration source as LABEL=PATH; repeat for any number of methods.",
     )
 
-    # Backward-compatible historical interface.
+    # Backward-compatible historical interface. Keep BasicCNN last.
     p.add_argument("--original-swiftvr", type=Path, default=None)
     p.add_argument("--original-label", default="Original SwiftVR")
     p.add_argument("--b1", type=Path, default=None,
@@ -193,11 +196,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--avernet", type=Path, default=None,
                    help="Historical optional additional method video/image directory.")
     p.add_argument("--avernet-label", default="AVerNet")
+    p.add_argument("--basiccnn", type=Path, default=None,
+                   help="Optional BasicCNN video/image-sequence directory; appended last.")
+    p.add_argument("--basiccnn-label", default="BasicCNN")
 
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--panel-width", type=int, default=960)
-    p.add_argument("--columns", type=int, default=2,
-                   help="Number of columns in the full-frame comparison montage.")
+    p.add_argument(
+        "--columns",
+        type=int,
+        default=None,
+        help="Full-frame montage columns. Default: 3 for exactly six panels, otherwise 2.",
+    )
     p.add_argument("--fps", type=float, default=None)
     p.add_argument("--frame-indices", type=_csv_ints, default=(0, 8, 16, 24, 32))
     p.add_argument("--crop", type=_parse_crop, action="append", default=[])
@@ -212,6 +222,7 @@ def _collect_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
         (args.original_label, args.original_swiftvr),
         (args.b1_label, args.b1),
         (args.avernet_label, args.avernet),
+        (args.basiccnn_label, args.basiccnn),
     )
     specs.extend((label, path) for label, path in legacy if path is not None)
     if not specs:
@@ -226,8 +237,10 @@ def _collect_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.panel_width <= 0 or args.columns <= 0:
-        raise ValueError("--panel-width/--columns must be positive")
+    if args.panel_width <= 0:
+        raise ValueError("--panel-width must be positive")
+    if args.columns is not None and args.columns <= 0:
+        raise ValueError("--columns must be positive when provided")
     if args.quality <= 0:
         raise ValueError("--quality must be positive")
 
@@ -267,6 +280,9 @@ def main() -> int:
         raise RuntimeError("no common frames")
     output_fps = float(args.fps or methods[0][1].fps or lq.fps)
 
+    panel_count = 1 + len(methods) + (1 if gt is not None else 0)
+    columns = int(args.columns) if args.columns is not None else (3 if panel_count == 6 else 2)
+
     montage_writer = imageio.get_writer(
         str(output / "comparison.mp4"), fps=output_fps, codec="libx264",
         macro_block_size=1, quality=int(args.quality)
@@ -291,7 +307,7 @@ def main() -> int:
 
             montage = _grid(
                 [_labeled_panel(frame, label, args.panel_width) for label, frame in method_frames],
-                columns=args.columns,
+                columns=columns,
             )
             montage_writer.append_data(montage)
             if index in selected:
@@ -323,7 +339,8 @@ def main() -> int:
         "selected_frames": sorted(selected),
         "crops": [list(crop) for crop in args.crop],
         "panel_width": args.panel_width,
-        "columns": args.columns,
+        "panel_count": panel_count,
+        "columns": columns,
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(metadata, indent=2, sort_keys=True))
