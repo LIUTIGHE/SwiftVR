@@ -3,15 +3,23 @@
 
 Inputs may be video files or image-sequence directories. For publication-quality
 inspection, prefer PNG directories from SwiftVR ``--png`` inference so codec
-artifacts cannot hide or invent high-frequency detail. The tool writes a compact
-2-column comparison video, selected-frame PNGs, and optional native target-space
-crop strips.
+artifacts cannot hide or invent high-frequency detail.
 
-The historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` interface is
-kept for backward compatibility. Labels are configurable so later compression
-stages (for example B2-A + B1 Slim100) can reuse the same comparison tool without
-mislabeling the candidate. An optional GT source can be included when a paired
-real/test sample is available.
+Two interfaces are supported:
+
+1. Generic repeated methods (recommended):
+
+   --method "M1 Stage-A=/path/to/m1" \
+   --method "M3 D1536=/path/to/m3" \
+   --method "M7-A=/path/to/m7a"
+
+2. Historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` arguments,
+   retained for backward compatibility.
+
+The first restoration method defines the target resolution. The tool writes a
+labeled comparison video, selected-frame PNGs, and optional native target-space
+crop strips.  LQ is bicubic-resized only for visualization; it is never used as
+a quantitative reference.
 """
 
 from __future__ import annotations
@@ -51,6 +59,13 @@ def _parse_crop(value: str) -> tuple[str, int, int, int, int]:
     if x < 0 or y < 0 or w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError("crop coordinates must be non-negative with positive size")
     return label, x, y, w, h
+
+
+def _parse_method(value: str) -> tuple[str, Path]:
+    label, sep, raw_path = value.partition("=")
+    if not sep or not label.strip() or not raw_path.strip():
+        raise argparse.ArgumentTypeError("method must be LABEL=PATH")
+    return label.strip(), Path(raw_path.strip())
 
 
 def _sort_key(path: Path):
@@ -129,6 +144,8 @@ def _labeled_panel(frame: np.ndarray, label: str, panel_width: int) -> np.ndarra
 def _grid(panels: list[np.ndarray], columns: int = 2) -> np.ndarray:
     if not panels:
         raise ValueError("no panels")
+    if columns <= 0:
+        raise ValueError("columns must be positive")
     ph, pw = max(p.shape[0] for p in panels), max(p.shape[1] for p in panels)
     rows = int(math.ceil(len(panels) / columns))
     canvas = np.zeros((rows * ph, columns * pw, 3), dtype=np.uint8)
@@ -155,20 +172,32 @@ def _crop_strip(method_frames: list[tuple[str, np.ndarray]], crop, label_height:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--lq", type=Path, required=True, help="Original 720p LQ video or image directory.")
+    p.add_argument("--lq", type=Path, required=True, help="Original LQ video or image directory.")
     p.add_argument("--gt", type=Path, default=None,
                    help="Optional paired GT video/image directory at target resolution.")
     p.add_argument("--gt-label", default="GT")
-    p.add_argument("--original-swiftvr", type=Path, required=True)
+    p.add_argument(
+        "--method",
+        type=_parse_method,
+        action="append",
+        default=[],
+        help="Generic restoration source as LABEL=PATH; repeat for any number of methods.",
+    )
+
+    # Backward-compatible historical interface.
+    p.add_argument("--original-swiftvr", type=Path, default=None)
     p.add_argument("--original-label", default="Original SwiftVR")
-    p.add_argument("--b1", type=Path, required=True,
-                   help="Required candidate video/image directory; historically B1 Slim100.")
+    p.add_argument("--b1", type=Path, default=None,
+                   help="Historical candidate video/image directory; typically B1 Slim100.")
     p.add_argument("--b1-label", default="B1 Slim100")
     p.add_argument("--avernet", type=Path, default=None,
-                   help="Optional additional method video/image directory.")
+                   help="Historical optional additional method video/image directory.")
     p.add_argument("--avernet-label", default="AVerNet")
+
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--panel-width", type=int, default=960)
+    p.add_argument("--columns", type=int, default=2,
+                   help="Number of columns in the full-frame comparison montage.")
     p.add_argument("--fps", type=float, default=None)
     p.add_argument("--frame-indices", type=_csv_ints, default=(0, 8, 16, 24, 32))
     p.add_argument("--crop", type=_parse_crop, action="append", default=[])
@@ -177,43 +206,66 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _collect_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    specs = list(args.method)
+    legacy = (
+        (args.original_label, args.original_swiftvr),
+        (args.b1_label, args.b1),
+        (args.avernet_label, args.avernet),
+    )
+    specs.extend((label, path) for label, path in legacy if path is not None)
+    if not specs:
+        raise ValueError(
+            "provide at least one restoration source via --method LABEL=PATH or the legacy arguments"
+        )
+    labels = [label for label, _ in specs]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"method labels must be unique, got {labels}")
+    return specs
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    if args.panel_width <= 0:
-        raise ValueError("--panel-width must be positive")
+    if args.panel_width <= 0 or args.columns <= 0:
+        raise ValueError("--panel-width/--columns must be positive")
+    if args.quality <= 0:
+        raise ValueError("--quality must be positive")
+
     output = args.output_dir.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
     lq = FrameSource(args.lq)
-    original = FrameSource(args.original_swiftvr, fallback_fps=lq.fps)
-    b1 = FrameSource(args.b1, fallback_fps=original.fps)
-    target_w, target_h = original.width, original.height
-    if (b1.width, b1.height) != (target_w, target_h):
-        raise ValueError(f"candidate resolution {b1.width}x{b1.height} != Original {target_w}x{target_h}")
-
+    method_specs = _collect_method_specs(args)
     methods: list[tuple[str, FrameSource]] = []
+    for label, path in method_specs:
+        methods.append((label, FrameSource(path, fallback_fps=lq.fps)))
+
+    target_w, target_h = methods[0][1].width, methods[0][1].height
+    for label, source in methods[1:]:
+        if (source.width, source.height) != (target_w, target_h):
+            raise ValueError(
+                f"{label} resolution {source.width}x{source.height} != "
+                f"first method target {target_w}x{target_h}"
+            )
+
+    gt = None
     if args.gt is not None:
-        gt = FrameSource(args.gt, fallback_fps=original.fps)
+        gt = FrameSource(args.gt, fallback_fps=methods[0][1].fps)
         if (gt.width, gt.height) != (target_w, target_h):
             raise ValueError(f"GT resolution {gt.width}x{gt.height} != target {target_w}x{target_h}")
-        methods.append((args.gt_label, gt))
-    methods.extend(((args.original_label, original), (args.b1_label, b1)))
-    if args.avernet is not None:
-        avernet = FrameSource(args.avernet, fallback_fps=original.fps)
-        if (avernet.width, avernet.height) != (target_w, target_h):
-            raise ValueError(f"additional method resolution {avernet.width}x{avernet.height} != target {target_w}x{target_h}")
-        methods.append((args.avernet_label, avernet))
 
     sources = [("LQ", lq)] + methods
+    if gt is not None:
+        sources.append((args.gt_label, gt))
     frame_counts = {label: len(source) for label, source in sources}
     common = min(frame_counts.values())
     if args.max_frames > 0:
         common = min(common, int(args.max_frames))
     if common <= 0:
         raise RuntimeError("no common frames")
-    output_fps = float(args.fps or original.fps or lq.fps)
+    output_fps = float(args.fps or methods[0][1].fps or lq.fps)
 
     montage_writer = imageio.get_writer(
         str(output / "comparison.mp4"), fps=output_fps, codec="libx264",
@@ -234,9 +286,12 @@ def main() -> int:
             method_frames = [("LQ Bicubic 3x", lq_up)] + [
                 (label, source.frame(index)) for label, source in methods
             ]
+            if gt is not None:
+                method_frames.append((args.gt_label, gt.frame(index)))
+
             montage = _grid(
                 [_labeled_panel(frame, label, args.panel_width) for label, frame in method_frames],
-                columns=2,
+                columns=args.columns,
             )
             montage_writer.append_data(montage)
             if index in selected:
@@ -253,16 +308,11 @@ def main() -> int:
 
     metadata = {
         "lq": str(lq.path),
-        "gt": None if args.gt is None else str(args.gt.expanduser().resolve()),
-        "original_swiftvr": str(original.path),
-        "b1": str(b1.path),
-        "avernet": None if args.avernet is None else str(args.avernet.expanduser().resolve()),
-        "labels": {
-            "gt": args.gt_label if args.gt is not None else None,
-            "original_swiftvr": args.original_label,
-            "b1": args.b1_label,
-            "avernet": args.avernet_label if args.avernet is not None else None,
-        },
+        "gt": None if gt is None else str(gt.path),
+        "methods": [
+            {"label": label, "path": str(source.path), "kind": source.kind}
+            for label, source in methods
+        ],
         "source_kinds": {label: source.kind for label, source in sources},
         "lq_resolution": [lq.width, lq.height],
         "target_resolution": [target_w, target_h],
@@ -272,6 +322,8 @@ def main() -> int:
         "fps": output_fps,
         "selected_frames": sorted(selected),
         "crops": [list(crop) for crop in args.crop],
+        "panel_width": args.panel_width,
+        "columns": args.columns,
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(metadata, indent=2, sort_keys=True))
