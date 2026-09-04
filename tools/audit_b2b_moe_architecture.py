@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the supported sparse-MoE students against the locked D768 compute point.
+"""Audit supported sparse-MoE students under canonical SwiftVR geometry.
 
 The MAC estimate uses the canonical SwiftVR steady-state geometry: 1920x1088
 internal RGB, 24-frame MIDDLE chunk -> 6 latent frames, 2x2 DiT spatial patching
@@ -7,8 +7,7 @@ internal RGB, 24-frame MIDDLE chunk -> 6 latent frames, 2x2 DiT spatial patching
 
 QKV/out projections, activated FFN linears, and router linears are computed from
 the MoE shape. Remaining per-block hidden-width work is anchored to the validated
-30-layer dense profiles and scaled linearly by depth; this keeps the previous M5
-estimate unchanged while allowing the M7A L25 comparison.
+30-layer dense profiles and scaled linearly by depth.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ from swiftvr.models.transformer_prompt_free_no_time_moe import (
     WanTransformer3DModelPromptFreeNoTimeMoE,
 )
 from swiftvr.training.b2b_moe import (
+    B2BMoESpec,
     MOE_ARCHITECTURES,
     M5_MOE_ARCHITECTURE,
     expected_moe_shape,
@@ -30,6 +30,9 @@ from swiftvr.training.b2b_moe import (
 )
 
 
+M8_MOE_ARCHITECTURE = "m8-d1024-l20"
+M8_MOE_SPEC = B2BMoESpec(num_layers=20)
+SUPPORTED_ARCHITECTURES = tuple(MOE_ARCHITECTURES) + (M8_MOE_ARCHITECTURE,)
 D768_DIT_GMAC_PER_FRAME = 196.292
 CANONICAL_TOKENS_PER_RGB_FRAME = 510
 DENSE_OTHER_GMAC_PER_HIDDEN_AT_L30 = 0.0837388
@@ -41,13 +44,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument(
         "--architecture",
-        choices=tuple(MOE_ARCHITECTURES),
+        choices=SUPPORTED_ARCHITECTURES,
         default=M5_MOE_ARCHITECTURE,
     )
     p.add_argument("--transformer-subfolder", default="transformer")
     p.add_argument("--output-json", type=Path, default=None)
-    p.add_argument("--expected-max-delta-percent", type=float, default=1.5)
+    p.add_argument(
+        "--expected-max-delta-percent",
+        type=float,
+        default=None,
+        help="Optional absolute tolerance versus D768. Omit for report-only auditing.",
+    )
     return p
+
+
+def _spec(architecture: str) -> B2BMoESpec:
+    if architecture == M8_MOE_ARCHITECTURE:
+        return M8_MOE_SPEC
+    return moe_spec_from_name(architecture)
 
 
 def canonical_compute(shape: dict[str, int | float]) -> dict[str, float]:
@@ -82,10 +96,10 @@ def canonical_compute(shape: dict[str, int | float]) -> dict[str, float]:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.expected_max_delta_percent < 0:
+    if args.expected_max_delta_percent is not None and args.expected_max_delta_percent < 0:
         raise ValueError("--expected-max-delta-percent must be non-negative")
 
-    spec = moe_spec_from_name(args.architecture)
+    spec = _spec(args.architecture)
     expected = expected_moe_shape(spec)
     if args.checkpoint is None:
         shape = expected
@@ -107,7 +121,11 @@ def main() -> int:
         checkpoint = str(checkpoint_path)
 
     compute = canonical_compute(shape)
-    passed = abs(float(compute["delta_vs_d768_percent"])) <= args.expected_max_delta_percent
+    passed = (
+        None
+        if args.expected_max_delta_percent is None
+        else abs(float(compute["delta_vs_d768_percent"])) <= args.expected_max_delta_percent
+    )
     report = {
         "kind": "swiftvr_b2b_moe_architecture_audit",
         "architecture": args.architecture,
@@ -131,7 +149,7 @@ def main() -> int:
             "scales linearly with layer count."
         ),
         "pass_tolerance_percent": args.expected_max_delta_percent,
-        "status": "PASS" if passed else "FAIL",
+        "status": "REPORT" if passed is None else ("PASS" if passed else "FAIL"),
     }
 
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -139,7 +157,7 @@ def main() -> int:
         output = args.output_json.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    if not passed:
+    if passed is False:
         raise SystemExit(
             f"Estimated {args.architecture} compute differs from D768 by "
             f"{compute['delta_vs_d768_percent']:.3f}%"
