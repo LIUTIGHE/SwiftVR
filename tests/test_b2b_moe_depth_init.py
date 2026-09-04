@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
 
 import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from swiftvr.models.transformer_prompt_free_no_time_moe import (
     WanTransformer3DModelPromptFreeNoTimeMoE,
