@@ -15,6 +15,19 @@ if str(ROOT) not in sys.path:
 from swiftvr.models.reae_slim_decoder import AGGRESSIVE_CHANNELS, SLIM100_CHANNELS, TEACHER_CHANNELS
 
 
+M8_DECODER76_CHANNELS = (128, 96, 64, 64)
+
+
+def _parse_channels(value: str) -> tuple[int, int, int, int]:
+    try:
+        channels = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("channels must be four comma-separated integers") from exc
+    if len(channels) != 4 or any(item <= 0 for item in channels):
+        raise argparse.ArgumentTypeError("channels must contain four positive integers")
+    return channels  # type: ignore[return-value]
+
+
 def estimate_reae_decoder_macs(
     channels,
     *,
@@ -48,6 +61,7 @@ def estimate_reae_decoder_macs(
         "channels": [c0, c1, c2, c3],
         "components_gmac": {key: value / 1e9 for key, value in values.items()},
         "total_gmac": sum(values.values()) / 1e9,
+        "total_gflops_2flop_per_mac": 2.0 * sum(values.values()) / 1e9,
     }
 
 
@@ -55,6 +69,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--height", type=int, default=1088)
     parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument(
+        "--channels",
+        type=_parse_channels,
+        action="append",
+        default=[],
+        help="Optional custom C0,C1,C2,C3 decoder widths; repeat to audit several candidates.",
+    )
     args = parser.parse_args()
     result = {
         "teacher": estimate_reae_decoder_macs(
@@ -66,7 +87,17 @@ def main() -> int:
         "aggressive": estimate_reae_decoder_macs(
             AGGRESSIVE_CHANNELS, output_height=args.height, output_width=args.width
         ),
+        "m8_decoder76": estimate_reae_decoder_macs(
+            M8_DECODER76_CHANNELS, output_height=args.height, output_width=args.width
+        ),
     }
+    if args.channels:
+        result["custom"] = [
+            estimate_reae_decoder_macs(
+                channels, output_height=args.height, output_width=args.width
+            )
+            for channels in args.channels
+        ]
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
