@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Cache-safe sparse-MoE distillation entry point for M5/M6/M7-A.
+"""Cache-safe sparse-MoE distillation entry point for M5/M6/M7-A/M8-A.
 
 Architecture modes:
 
 * default / ``--architecture m5-d1024-l30`` keeps the validated M5
   D1024/H8/L30 1S12E2A student;
 * ``--architecture m7a-d1152-l25`` selects the M7-A D1152/H9/L25 1S12E2A
-  compute-matched width/depth reallocation.
+  compute-matched width/depth reallocation;
+* ``--architecture m8-d1024-l20`` selects the M8-A hardware-oriented
+  D1024/H8/L20 1S12E2A depth-pruned student.
 
-Both architecture modes train from the cached D1536 teaching assistant and
-validate against Stage-A D3072.  ``--stage-a-refine`` remains the M6 direct
-Stage-A-refinement mode and is intentionally restricted to the M5 architecture;
-M7-A must first be compared under the same D1536-TA bootstrap protocol as M5.
+All architecture-gate modes train from the cached D1536 teaching assistant and
+validate against Stage-A D3072. ``--stage-a-refine`` remains the M6 direct
+Stage-A-refinement mode and is intentionally restricted to M5.
 
 Rank-0 validation runs under ``torch.inference_mode()`` while training resumes
 with autograd enabled. SwiftVR shifted-window attention keeps process-local CUDA
@@ -37,12 +38,17 @@ for path in (ROOT, TOOLS):
 from tools import train_b2b_moe_ta_distill_ddp as trainer
 from swiftvr.models import transformer as transformer_ops
 from swiftvr.training.b2b_moe import (
+    B2BMoESpec,
     M5_MOE_ARCHITECTURE,
     M7A_MOE_ARCHITECTURE,
     MOE_ARCHITECTURES,
     moe_spec_from_name,
 )
 
+
+M8_MOE_ARCHITECTURE = "m8-d1024-l20"
+M8_MOE_SPEC = B2BMoESpec(num_layers=20)
+SUPPORTED_ARCHITECTURES = tuple(MOE_ARCHITECTURES) + (M8_MOE_ARCHITECTURE,)
 
 _original_validate_rank0 = trainer.base.validate_rank0
 _original_write_json = trainer.base._write_json
@@ -101,22 +107,37 @@ def _consume_architecture() -> str:
         raise ValueError(f"{_ARCHITECTURE_FLAG} may be specified at most once")
     sys.argv[:] = retained
     architecture = values[0] if values else M5_MOE_ARCHITECTURE
-    if architecture not in MOE_ARCHITECTURES:
+    if architecture not in SUPPORTED_ARCHITECTURES:
         raise ValueError(
             f"Unknown architecture {architecture!r}; expected one of "
-            f"{sorted(MOE_ARCHITECTURES)}"
+            f"{sorted(SUPPORTED_ARCHITECTURES)}"
         )
     return architecture
+
+
+def _spec_for_architecture(architecture: str) -> B2BMoESpec:
+    if architecture == M8_MOE_ARCHITECTURE:
+        return M8_MOE_SPEC
+    return moe_spec_from_name(architecture)
 
 
 def _configure_architecture(architecture: str) -> None:
     """Switch only the locked MoE shape; preserve the validated trainer loop."""
 
-    spec = moe_spec_from_name(architecture)
+    spec = _spec_for_architecture(architecture)
     trainer.LOCKED_SPEC = spec
     if architecture == M5_MOE_ARCHITECTURE:
         return
-    if architecture != M7A_MOE_ARCHITECTURE:
+
+    if architecture == M7A_MOE_ARCHITECTURE:
+        trainer_id = "b2b_m7a_d1152_l25_moe_d1536_ta_distill_ddp_v1"
+        experiment = "m7a_d1152_l25_vs_m5_d1024_l30_compute_matched_race"
+        phase = "M7A_width_depth_architecture_gate"
+    elif architecture == M8_MOE_ARCHITECTURE:
+        trainer_id = "b2b_m8_d1024_l20_moe_d1536_ta_distill_ddp_v1"
+        experiment = "m8_d1024_l20_hardware_oriented_depth_gate"
+        phase = "M8A_d1024_l20_architecture_gate"
+    else:
         raise ValueError(f"Unsupported architecture metadata mode: {architecture}")
 
     def write_json(path: Path, value) -> None:
@@ -124,24 +145,24 @@ def _configure_architecture(architecture: str) -> None:
         if isinstance(payload, dict):
             name = Path(path).name
             if name == "run_config.json":
-                payload["trainer"] = "b2b_m7a_d1152_l25_moe_d1536_ta_distill_ddp_v1"
-                payload["experiment"] = "m7a_d1152_l25_vs_m5_d1024_l30_compute_matched_race"
-                payload["curriculum_phase"] = "M7A_width_depth_architecture_gate"
+                payload["trainer"] = trainer_id
+                payload["experiment"] = experiment
+                payload["curriculum_phase"] = phase
                 payload["architecture"] = architecture
                 payload["training_teacher"] = "b2a_d1536_teaching_assistant"
                 payload["training_teacher_cache_kind"] = trainer.TA_CACHE_KIND
             elif name in {"best.json", "summary.json"}:
                 payload["architecture"] = architecture
-                payload["curriculum_phase"] = "M7A_width_depth_architecture_gate"
+                payload["curriculum_phase"] = phase
         _original_write_json(path, payload)
 
     def save_snapshot(*args, **kwargs):
         metadata = kwargs.get("metadata")
         if isinstance(metadata, dict):
             metadata = dict(metadata)
-            metadata["trainer"] = "b2b_m7a_d1152_l25_moe_d1536_ta_distill_ddp_v1"
+            metadata["trainer"] = trainer_id
             metadata["architecture"] = architecture
-            metadata["curriculum_phase"] = "M7A_width_depth_architecture_gate"
+            metadata["curriculum_phase"] = phase
             metadata["training_teacher"] = "b2a_d1536_teaching_assistant"
             kwargs["metadata"] = metadata
         return _original_save_snapshot(*args, **kwargs)
@@ -192,7 +213,7 @@ def main() -> int:
     if stage_a_refine and architecture != M5_MOE_ARCHITECTURE:
         raise ValueError(
             "--stage-a-refine is intentionally restricted to m5-d1024-l30; "
-            "M7-A must first use the matched D1536-TA bootstrap protocol"
+            "architecture gates must first use the matched D1536-TA bootstrap protocol"
         )
 
     trainer.base.validate_rank0 = _validate_rank0_cache_safe
@@ -206,6 +227,11 @@ def main() -> int:
     elif architecture == M7A_MOE_ARCHITECTURE:
         print(
             "[M7-A] D1152/H9/L25 1S12E2A enabled: training teacher = D1536 TA",
+            flush=True,
+        )
+    elif architecture == M8_MOE_ARCHITECTURE:
+        print(
+            "[M8-A] D1024/H8/L20 1S12E2A enabled: training teacher = D1536 TA",
             flush=True,
         )
     return trainer.main()
