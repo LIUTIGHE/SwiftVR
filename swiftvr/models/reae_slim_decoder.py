@@ -33,9 +33,14 @@ FORMAT_VERSION = 1
 TEACHER_CHANNELS = (512, 256, 128, 64)
 SLIM100_CHANNELS = (256, 128, 64, 64)
 AGGRESSIVE_CHANNELS = (256, 128, 64, 32)
+# M8 keeps both high-resolution stages at width 64 while compressing the two
+# low-resolution stages more aggressively.  All widths are multiples of 32 for
+# hardware-friendly kernels.  Canonical 1920x1088 cost: 76.45175808 GMAC/frame.
+M8_DECODER76_CHANNELS = (128, 96, 64, 64)
 VARIANT_CHANNELS = {
     "slim100": SLIM100_CHANNELS,
     "aggressive": AGGRESSIVE_CHANNELS,
+    "m8decoder76": M8_DECODER76_CHANNELS,
 }
 STAGE_SCORE_LAYER_INDICES = {
     0: (3, 4, 5),
