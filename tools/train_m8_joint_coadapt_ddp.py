@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M8-C decoder-aware joint co-adaptation for D1024/L20 MoE + Decoder76.
 
-The frozen ReAE encoder supplies z_LQ.  Stage-A D3072 cached velocity is the
+The frozen ReAE encoder supplies z_LQ. Stage-A D3072 cached velocity is the
 final-behavior teacher and the frozen original ReAE decoder renders Stage-A RGB.
 GT is diagnostic only and never contributes gradients or checkpoint selection.
 
@@ -38,10 +38,10 @@ for path in (ROOT, TOOLS):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from tools import train_b2a_compact_distill_ddp as base
 from tools import train_teacher_distillation_ddp as stage_a
 from tools.smoke_training_forward import move_video_batch, resolve_runtime_dtype, validate_folded_checkpoint
 from swiftvr.models import ReAE, WanTransformer3DModelPromptFreeNoTimeMoE
+from swiftvr.models import transformer as transformer_ops
 from swiftvr.models.reae_slim_decoder import M8_DECODER76_CHANNELS, SlimReAEDecoder
 from swiftvr.training import (
     DistillationMetricAccumulator,
@@ -69,10 +69,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--base-checkpoint", type=Path, required=True)
     p.add_argument("--transformer-init", type=Path, required=True)
-    p.add_argument("--decoder-init", type=Path, required=True,
-                   help="Decoder76 directory, typically warm-up checkpoint/tiny_decoder")
-    p.add_argument("--teacher-cache", type=Path, required=True,
-                   help="Stage-A D3072 training velocity cache")
+    p.add_argument(
+        "--decoder-init",
+        type=Path,
+        required=True,
+        help="Decoder76 directory, typically warm-up checkpoint/tiny_decoder",
+    )
+    p.add_argument(
+        "--teacher-cache",
+        type=Path,
+        required=True,
+        help="Stage-A D3072 training velocity cache",
+    )
     p.add_argument("--manifest", type=Path, action="append", required=True)
     p.add_argument("--val-teacher-cache", type=Path, required=True)
     p.add_argument("--val-manifest", type=Path, action="append", required=True)
@@ -134,11 +142,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    for name in (
-        "batch_size", "gradient_accumulation_steps", "max_steps", "log_every", "save_every",
-        "transformer_light_learning_rate", "transformer_tail_learning_rate", "decoder_learning_rate",
-        "optimizer_eps", "lpips_microbatch_frames", "loss_epsilon",
-    ):
+    positive = (
+        "batch_size",
+        "gradient_accumulation_steps",
+        "max_steps",
+        "log_every",
+        "save_every",
+        "transformer_light_learning_rate",
+        "transformer_tail_learning_rate",
+        "decoder_learning_rate",
+        "optimizer_eps",
+        "lpips_microbatch_frames",
+        "loss_epsilon",
+    )
+    for name in positive:
         if float(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_','-')} must be positive")
     if args.num_workers < 0:
@@ -150,9 +167,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     if not 0 < args.min_lr_ratio <= 1:
         raise ValueError("--min-lr-ratio must lie in (0,1]")
     for name in (
-        "velocity_nmse_weight", "velocity_cosine_weight", "latent_spatial_weight",
-        "latent_temporal_weight", "teacher_rgb_l1_weight", "teacher_lpips_weight",
-        "teacher_rgb_temporal_weight", "router_balance_weight",
+        "velocity_nmse_weight",
+        "velocity_cosine_weight",
+        "latent_spatial_weight",
+        "latent_temporal_weight",
+        "teacher_rgb_l1_weight",
+        "teacher_lpips_weight",
+        "teacher_rgb_temporal_weight",
+        "router_balance_weight",
     ):
         if float(getattr(args, name)) < 0:
             raise ValueError(f"--{name.replace('_','-')} must be non-negative")
@@ -172,6 +194,7 @@ def _weights(args: argparse.Namespace) -> M8JointLossWeights:
 
 
 def _configure_trainable_scope(transformer, decoder, tail_full_blocks: int):
+    """Freeze the trunk, then open early adapter/router and a fully trainable tail."""
     for parameter in transformer.parameters():
         parameter.requires_grad_(False)
     for parameter in decoder.parameters():
@@ -194,11 +217,23 @@ def _configure_trainable_scope(transformer, decoder, tail_full_blocks: int):
                 light.append(parameter)
                 light_names.append(full_name)
 
-    decoder_params = [p for p in decoder.parameters() if p.requires_grad]
-    groups = {"transformer_light": light, "transformer_tail": tail, "decoder": decoder_params}
-    ids = [{id(p) for p in values} for values in groups.values()]
+    decoder_params = [parameter for parameter in decoder.parameters() if parameter.requires_grad]
+    groups = {
+        "transformer_light": light,
+        "transformer_tail": tail,
+        "decoder": decoder_params,
+    }
+    ids = [{id(parameter) for parameter in values} for values in groups.values()]
     if any(ids[i] & ids[j] for i in range(len(ids)) for j in range(i + 1, len(ids))):
         raise RuntimeError("M8 optimizer groups overlap")
+
+    all_transformer_trainable = {
+        id(parameter) for parameter in transformer.parameters() if parameter.requires_grad
+    }
+    expected_transformer_trainable = ids[0] | ids[1]
+    if all_transformer_trainable != expected_transformer_trainable:
+        raise RuntimeError("M8 transformer trainable scope is not covered exactly by optimizer groups")
+
     return groups, {
         "tail_start_block": tail_start,
         "tail_full_blocks": int(tail_full_blocks),
@@ -223,8 +258,20 @@ def _build_optimizer(groups, args):
         bad = {str(p.dtype) for p in parameters if p.dtype != torch.float32}
         if bad:
             raise RuntimeError(f"optimizer group {name} is not FP32: {sorted(bad)}")
-        param_groups.append({"params": parameters, "lr": rates[name], "base_lr": rates[name], "group_name": name})
-    return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay, eps=args.optimizer_eps, foreach=False)
+        param_groups.append(
+            {
+                "params": parameters,
+                "lr": rates[name],
+                "base_lr": rates[name],
+                "group_name": name,
+            }
+        )
+    return torch.optim.AdamW(
+        param_groups,
+        weight_decay=float(args.weight_decay),
+        eps=float(args.optimizer_eps),
+        foreach=False,
+    )
 
 
 def _lr_scale(args, step: int) -> float:
@@ -238,31 +285,46 @@ def _lr_scale(args, step: int) -> float:
 
 def _write_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(dict(value), indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(dict(value), indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
-def _save_snapshot(root: Path, *, transformer, decoder, metadata: Mapping[str, object], subfolder: str) -> None:
-    temp = root.with_name(root.name + ".tmp")
-    if temp.exists():
-        shutil.rmtree(temp)
-    temp.mkdir(parents=True)
-    transformer.save_pretrained(str(temp / subfolder), safe_serialization=True)
-    decoder.save_pretrained(temp / "tiny_decoder")
-    _write_json(temp / "metadata.json", metadata)
+def _clear_window_caches() -> None:
+    transformer_ops._WindowIndexCache.clear()
+    transformer_ops._WindowRuntimeMetaCache.clear()
+
+
+def _save_snapshot(
+    root: Path,
+    *,
+    transformer,
+    decoder,
+    metadata: Mapping[str, object],
+    subfolder: str,
+) -> None:
+    temporary = root.with_name(root.name + ".tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    transformer.save_pretrained(str(temporary / subfolder), safe_serialization=True)
+    decoder.save_pretrained(temporary / "tiny_decoder")
+    _write_json(temporary / "metadata.json", metadata)
     if root.exists():
         shutil.rmtree(root)
-    temp.replace(root)
+    temporary.replace(root)
 
 
 def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtype, args):
+    # Match the cache-safe M5/M7/M8-A validation rule: rank-0 validation must not
+    # leave shifted-window runtime tensors for the following autograd forward.
+    _clear_window_caches()
     closure.eval()
     closure.reae.eval()
-    vel_acc = DistillationMetricAccumulator()
-    st_acc = VideoMetricAccumulator()
-    sg_acc = VideoMetricAccumulator()
-    tg_acc = VideoMetricAccumulator()
+    velocity_accumulator = DistillationMetricAccumulator()
+    student_teacher = VideoMetricAccumulator()
+    student_gt = VideoMetricAccumulator()
+    teacher_gt = VideoMetricAccumulator()
     sums: dict[str, float] = {}
     samples = 0
     autocast_enabled = dtype in (torch.float16, torch.bfloat16)
@@ -280,28 +342,38 @@ def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtyp
                         output_frames=int(output["target"].shape[1]),
                     )
                     objective = m8_joint_objective(
-                        student_velocity=output["velocity"], teacher_velocity=teacher_velocity,
-                        z_lq=output["z_lq"], student_prediction=output["prediction"],
+                        student_velocity=output["velocity"],
+                        teacher_velocity=teacher_velocity,
+                        z_lq=output["z_lq"],
+                        student_prediction=output["prediction"],
                         teacher_prediction=teacher_prediction,
-                        router_balance_loss=output["router_balance_loss"], perceptual=perceptual,
-                        weights=weights, lpips_microbatch_frames=args.lpips_microbatch_frames,
+                        router_balance_loss=output["router_balance_loss"],
+                        perceptual=perceptual,
+                        weights=weights,
+                        lpips_microbatch_frames=args.lpips_microbatch_frames,
                         epsilon=args.loss_epsilon,
                     )
-                bs = int(output["target"].shape[0])
-                samples += bs
+                batch_size = int(output["target"].shape[0])
+                samples += batch_size
                 for key, value in objective.items():
-                    sums[key] = sums.get(key, 0.0) + float(value.detach().float().item()) * bs
-                vel_acc.update(output["velocity"], teacher_velocity)
-                st_acc.update(output["prediction"], teacher_prediction, clamp=True)
-                sg_acc.update(output["prediction"], output["target"], clamp=True)
-                tg_acc.update(teacher_prediction, output["target"], clamp=True)
+                    sums[key] = sums.get(key, 0.0) + float(value.detach().float().item()) * batch_size
+                velocity_accumulator.update(output["velocity"], teacher_velocity)
+                student_teacher.update(output["prediction"], teacher_prediction, clamp=True)
+                student_gt.update(output["prediction"], output["target"], clamp=True)
+                teacher_gt.update(teacher_prediction, output["target"], clamp=True)
     finally:
         closure.train()
         closure.reae.eval()
+        _clear_window_caches()
+
     result = {key: value / max(samples, 1) for key, value in sums.items()}
-    result.update(vel_acc.compute())
-    for prefix, acc in (("student_teacher", st_acc), ("student_gt", sg_acc), ("teacher_gt", tg_acc)):
-        result.update({f"{prefix}_{k}": v for k, v in acc.compute().items()})
+    result.update(velocity_accumulator.compute())
+    for prefix, accumulator in (
+        ("student_teacher", student_teacher),
+        ("student_gt", student_gt),
+        ("teacher_gt", teacher_gt),
+    ):
+        result.update({f"{prefix}_{key}": value for key, value in accumulator.compute().items()})
     result["samples"] = samples
     return result
 
@@ -310,11 +382,15 @@ def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
     rank, local_rank, world_size, device = stage_a.init_distributed()
-    writer = None
     try:
         effective_batch = world_size * args.batch_size * args.gradient_accumulation_steps
-        if args.expected_global_batch_size is not None and effective_batch != args.expected_global_batch_size:
-            raise ValueError(f"global effective batch={effective_batch}, expected={args.expected_global_batch_size}")
+        if (
+            args.expected_global_batch_size is not None
+            and effective_batch != args.expected_global_batch_size
+        ):
+            raise ValueError(
+                f"global effective batch={effective_batch}, expected={args.expected_global_batch_size}"
+            )
         dtype = DTYPES[args.dtype]
         seed_everything(args.seed + rank)
         if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
@@ -330,61 +406,128 @@ def main() -> int:
         base_root = args.base_checkpoint.expanduser().resolve()
         transformer_root = args.transformer_init.expanduser().resolve()
         decoder_root = args.decoder_init.expanduser().resolve()
-        folded_config = validate_folded_checkpoint(base_root, reae_filename=args.reae_filename,
-                                                    transformer_subfolder=args.transformer_subfolder)
-        runtime_dtype = resolve_runtime_dtype(args.dtype, folded_config, device, allow_mismatch=True)
-        if runtime_dtype != dtype:
-            dtype = runtime_dtype
+        folded_config = validate_folded_checkpoint(
+            base_root,
+            reae_filename=args.reae_filename,
+            transformer_subfolder=args.transformer_subfolder,
+        )
+        dtype = resolve_runtime_dtype(
+            args.dtype,
+            folded_config,
+            device,
+            allow_mismatch=True,
+        )
 
         train_cache = TeacherVelocityCache(args.teacher_cache)
         val_cache = TeacherVelocityCache(args.val_teacher_cache)
-        if train_cache.metadata.get("kind") != STAGE_A_CACHE_KIND or val_cache.metadata.get("kind") != STAGE_A_CACHE_KIND:
-            raise ValueError("M8-C requires Stage-A D3072 velocity caches for both training and validation")
+        if (
+            train_cache.metadata.get("kind") != STAGE_A_CACHE_KIND
+            or val_cache.metadata.get("kind") != STAGE_A_CACHE_KIND
+        ):
+            raise ValueError(
+                "M8-C requires Stage-A D3072 velocity caches for both training and validation"
+            )
         train_dataset = stage_a.build_cached_dataset(
-            args.manifest, train_cache, split=args.split, path_root=args.path_root,
-            clip_length=args.clip_length, crop_size=args.crop_size, scale=args.scale,
-            views_per_record=args.views_per_record, view_seed=args.view_seed,
-            hflip=args.horizontal_flip_probability, vflip=args.vertical_flip_probability,
+            args.manifest,
+            train_cache,
+            split=args.split,
+            path_root=args.path_root,
+            clip_length=args.clip_length,
+            crop_size=args.crop_size,
+            scale=args.scale,
+            views_per_record=args.views_per_record,
+            view_seed=args.view_seed,
+            hflip=args.horizontal_flip_probability,
+            vflip=args.vertical_flip_probability,
             verify_paths=args.verify_paths,
         )
         val_dataset = stage_a.build_cached_dataset(
-            args.val_manifest, val_cache, split=args.val_split, path_root=args.path_root,
-            clip_length=args.clip_length, crop_size=args.val_crop_size, scale=args.scale,
-            views_per_record=args.val_views_per_record, view_seed=args.val_view_seed,
-            hflip=0.0, vflip=0.0, verify_paths=args.verify_paths,
+            args.val_manifest,
+            val_cache,
+            split=args.val_split,
+            path_root=args.path_root,
+            clip_length=args.clip_length,
+            crop_size=args.val_crop_size,
+            scale=args.scale,
+            views_per_record=args.val_views_per_record,
+            view_seed=args.val_view_seed,
+            hflip=0.0,
+            vflip=0.0,
+            verify_paths=args.verify_paths,
         )
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False,
-                                num_workers=0, pin_memory=args.pin_memory) if rank == 0 else None
+        val_loader = (
+            DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+                num_workers=0,
+                pin_memory=args.pin_memory,
+            )
+            if rank == 0
+            else None
+        )
 
         reae = ReAE(str(base_root / args.reae_filename))
         transformer = WanTransformer3DModelPromptFreeNoTimeMoE.from_pretrained(
-            str(transformer_root), subfolder=args.transformer_subfolder,
-            torch_dtype=dtype, low_cpu_mem_usage=True,
+            str(transformer_root),
+            subfolder=args.transformer_subfolder,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         )
         shape = transformer_moe_shape(transformer)
-        if shape != expected_moe_shape(M8_SPEC):
-            raise ValueError(f"M8 transformer shape mismatch: {shape} != {expected_moe_shape(M8_SPEC)}")
-        decoder = SlimReAEDecoder.from_pretrained(decoder_root, device="cpu", dtype=dtype)
+        expected_shape = expected_moe_shape(M8_SPEC)
+        if shape != expected_shape:
+            raise ValueError(f"M8 transformer shape mismatch: {shape} != {expected_shape}")
+        decoder = SlimReAEDecoder.from_pretrained(
+            decoder_root,
+            device="cpu",
+            dtype=dtype,
+        )
         if tuple(decoder.channels) != tuple(M8_DECODER76_CHANNELS):
-            raise ValueError(f"M8 decoder must be {M8_DECODER76_CHANNELS}, got {decoder.channels}")
+            raise ValueError(
+                f"M8 decoder must be {M8_DECODER76_CHANNELS}, got {decoder.channels}"
+            )
 
         reae.to(device=device, dtype=dtype).eval()
         transformer.to(device=device, dtype=dtype)
         decoder.to(device=device, dtype=dtype)
-        groups, scope_report = _configure_trainable_scope(transformer, decoder, args.tail_full_blocks)
+        groups, scope_report = _configure_trainable_scope(
+            transformer,
+            decoder,
+            args.tail_full_blocks,
+        )
         closure = M8JointForward(
-            reae, transformer, decoder, attention_backend=args.attention_backend,
+            reae,
+            transformer,
+            decoder,
+            attention_backend=args.attention_backend,
             gradient_checkpointing=not args.no_gradient_checkpointing,
         ).to(device=device)
         cast_report = cast_trainable_parameters(closure, dtype=torch.float32)
-        # Rebuild group lists after FP32 casting; Parameter identities are preserved.
-        groups, scope_report = _configure_trainable_scope(transformer, decoder, args.tail_full_blocks)
+        # Parameter identities are preserved by the FP32 cast; rebuilding gives
+        # an explicit post-cast exact-coverage assertion before optimizer creation.
+        groups, scope_report = _configure_trainable_scope(
+            transformer,
+            decoder,
+            args.tail_full_blocks,
+        )
         optimizer = _build_optimizer(groups, args)
         scaler = build_grad_scaler(device, dtype)
-        perceptual = LPIPSAlexLoss().to(device=device).eval() if args.teacher_lpips_weight > 0 else None
+        perceptual = (
+            LPIPSAlexLoss().to(device=device).eval()
+            if args.teacher_lpips_weight > 0
+            else None
+        )
         weights = _weights(args)
-        ddp = DDP(closure, device_ids=[local_rank], output_device=local_rank,
-                  broadcast_buffers=False, find_unused_parameters=True, gradient_as_bucket_view=True)
+        ddp = DDP(
+            closure,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+        )
 
         run_config = {
             "trainer": "swiftvr_m8c_decoder_aware_joint_coadapt_ddp_v1",
@@ -422,21 +565,39 @@ def main() -> int:
             nonlocal best_loss, best_step
             if rank != 0 or val_loader is None:
                 return None
-            validation = _validate_rank0(closure, val_loader, val_cache, perceptual, weights,
-                                         device=device, dtype=dtype, args=args)
+            validation = _validate_rank0(
+                closure,
+                val_loader,
+                val_cache,
+                perceptual,
+                weights,
+                device=device,
+                dtype=dtype,
+                args=args,
+            )
             append_jsonl(val_log, {"global_step": step, **validation})
             value = float(validation["loss"])
             if value < best_loss:
-                best_loss, best_step = value, step
-                _write_json(run_dir / "best.json", {
-                    "global_step": step,
-                    "joint_teacher_validation_loss": value,
-                    "velocity_relative_l2": validation["velocity_relative_l2"],
-                    "student_teacher_psnr": validation["student_teacher_psnr"],
-                    "student_teacher_ssim": validation["student_teacher_ssim"],
-                    "note": "GT metrics are diagnostic only.",
-                })
-            print(json.dumps({"phase": "m8_joint_val", "global_step": step, **validation}, sort_keys=True), flush=True)
+                best_loss = value
+                best_step = step
+                _write_json(
+                    run_dir / "best.json",
+                    {
+                        "global_step": step,
+                        "joint_teacher_validation_loss": value,
+                        "velocity_relative_l2": validation["velocity_relative_l2"],
+                        "student_teacher_psnr": validation["student_teacher_psnr"],
+                        "student_teacher_ssim": validation["student_teacher_ssim"],
+                        "note": "GT metrics are diagnostic only.",
+                    },
+                )
+            print(
+                json.dumps(
+                    {"phase": "m8_joint_val", "global_step": step, **validation},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             return validation
 
         if args.validate_at_start:
@@ -446,10 +607,19 @@ def main() -> int:
 
         autocast_enabled = dtype in (torch.float16, torch.bfloat16)
         while global_step < args.max_steps:
-            loader = stage_a.make_train_loader(train_dataset, rank=rank, world_size=world_size, epoch=epoch, args=args)
+            loader = stage_a.make_train_loader(
+                train_dataset,
+                rank=rank,
+                world_size=world_size,
+                epoch=epoch,
+                args=args,
+            )
+            if len(loader) < args.gradient_accumulation_steps:
+                raise RuntimeError("per-rank epoch is shorter than gradient accumulation")
             iterator = iter(loader)
+
             while global_step < args.max_steps:
-                micro_batches = []
+                micro_batches: list[Mapping[str, object]] = []
                 for _ in range(args.gradient_accumulation_steps):
                     try:
                         micro_batches.append(next(iterator))
@@ -459,53 +629,81 @@ def main() -> int:
                     break
 
                 next_step = global_step + 1
-                scale = _lr_scale(args, next_step)
+                learning_rate_scale = _lr_scale(args, next_step)
                 for group in optimizer.param_groups:
-                    group["lr"] = float(group["base_lr"]) * scale
+                    group["lr"] = float(group["base_lr"]) * learning_rate_scale
                 optimizer.zero_grad(set_to_none=True)
                 sums: dict[str, float] = {}
                 started = time.perf_counter()
 
                 for micro_index, batch_cpu in enumerate(micro_batches):
-                    teacher_velocity = train_cache.load_batch(batch_cpu, device=device, dtype=dtype)
+                    teacher_velocity = train_cache.load_batch(
+                        batch_cpu,
+                        device=device,
+                        dtype=dtype,
+                    )
                     batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
-                    sync = micro_index + 1 == len(micro_batches)
-                    context = nullcontext() if sync else ddp.no_sync()
-                    with context:
-                        with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
+                    synchronize = micro_index + 1 == len(micro_batches)
+                    synchronization_context = nullcontext() if synchronize else ddp.no_sync()
+                    with synchronization_context:
+                        with torch.autocast(
+                            "cuda",
+                            dtype=dtype,
+                            enabled=autocast_enabled,
+                        ):
                             output = ddp(batch)
                             with torch.no_grad():
                                 teacher_prediction = decode_teacher_prediction(
-                                    reae=reaa if False else reae,
-                                    z_lq=output["z_lq"], teacher_velocity=teacher_velocity,
+                                    reae=reae,
+                                    z_lq=output["z_lq"],
+                                    teacher_velocity=teacher_velocity,
                                     output_frames=int(output["target"].shape[1]),
                                 )
                             objective = m8_joint_objective(
-                                student_velocity=output["velocity"], teacher_velocity=teacher_velocity,
-                                z_lq=output["z_lq"], student_prediction=output["prediction"],
+                                student_velocity=output["velocity"],
+                                teacher_velocity=teacher_velocity,
+                                z_lq=output["z_lq"],
+                                student_prediction=output["prediction"],
                                 teacher_prediction=teacher_prediction,
-                                router_balance_loss=output["router_balance_loss"], perceptual=perceptual,
-                                weights=weights, lpips_microbatch_frames=args.lpips_microbatch_frames,
+                                router_balance_loss=output["router_balance_loss"],
+                                perceptual=perceptual,
+                                weights=weights,
+                                lpips_microbatch_frames=args.lpips_microbatch_frames,
                                 epsilon=args.loss_epsilon,
                             )
-                            loss = objective["loss"] / args.gradient_accumulation_steps
-                        if not torch.isfinite(loss.detach()).item():
+                            scaled_loss = objective["loss"] / args.gradient_accumulation_steps
+                        if not torch.isfinite(scaled_loss.detach()).item():
                             raise FloatingPointError("non-finite M8 joint loss")
                         if scaler.is_enabled():
-                            scaler.scale(loss).backward()
+                            scaler.scale(scaled_loss).backward()
                         else:
-                            loss.backward()
+                            scaled_loss.backward()
+
                     for key, value in objective.items():
-                        sums[key] = sums.get(key, 0.0) + float(value.detach().float().item()) / len(micro_batches)
+                        sums[key] = (
+                            sums.get(key, 0.0)
+                            + float(value.detach().float().item()) / len(micro_batches)
+                        )
 
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                transformer_params = groups["transformer_light"] + groups["transformer_tail"]
-                decoder_params = groups["decoder"]
-                t_grad = torch.nn.utils.clip_grad_norm_(transformer_params, args.transformer_max_grad_norm)
-                d_grad = torch.nn.utils.clip_grad_norm_(decoder_params, args.decoder_max_grad_norm)
-                if not torch.isfinite(t_grad) or not torch.isfinite(d_grad):
-                    raise FloatingPointError(f"non-finite M8 joint grad norm transformer={t_grad} decoder={d_grad}")
+                transformer_parameters = (
+                    groups["transformer_light"] + groups["transformer_tail"]
+                )
+                decoder_parameters = groups["decoder"]
+                transformer_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    transformer_parameters,
+                    args.transformer_max_grad_norm,
+                )
+                decoder_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    decoder_parameters,
+                    args.decoder_max_grad_norm,
+                )
+                if not torch.isfinite(transformer_grad_norm) or not torch.isfinite(decoder_grad_norm):
+                    raise FloatingPointError(
+                        "non-finite M8 joint grad norm: "
+                        f"transformer={transformer_grad_norm}, decoder={decoder_grad_norm}"
+                    )
                 if scaler.is_enabled():
                     scaler.step(optimizer)
                     scaler.update()
@@ -519,8 +717,8 @@ def main() -> int:
                         "global_step": global_step,
                         "seconds": time.perf_counter() - started,
                         **sums,
-                        "transformer_grad_norm": float(t_grad.detach().item()),
-                        "decoder_grad_norm": float(d_grad.detach().item()),
+                        "transformer_grad_norm": float(transformer_grad_norm.detach().item()),
+                        "decoder_grad_norm": float(decoder_grad_norm.detach().item()),
                         "router_normalized_entropy": route["normalized_entropy"],
                         "router_load_cv": route["load_cv"],
                         "lr_transformer_light": optimizer.param_groups[0]["lr"],
@@ -534,25 +732,39 @@ def main() -> int:
                     dist.barrier()
                     validate(global_step)
                     dist.barrier()
+
                 if global_step % args.save_every == 0 or global_step == args.max_steps:
                     dist.barrier()
                     if rank == 0:
                         checkpoint = run_dir / "checkpoints" / f"step_{global_step:08d}"
-                        _save_snapshot(checkpoint, transformer=transformer, decoder=decoder,
-                                       subfolder=args.transformer_subfolder,
-                                       metadata={"global_step": global_step, "architecture": "m8-d1024-l20+decoder76",
-                                                 "best_step_so_far": best_step, "best_joint_val_loss": best_loss})
-                        write_latest_checkpoint(run_dir, checkpoint, global_step)
+                        _save_snapshot(
+                            checkpoint,
+                            transformer=transformer,
+                            decoder=decoder,
+                            subfolder=args.transformer_subfolder,
+                            metadata={
+                                "global_step": global_step,
+                                "architecture": "m8-d1024-l20+decoder76",
+                                "best_step_so_far": best_step,
+                                "best_joint_val_loss": best_loss,
+                            },
+                        )
+                        write_latest_checkpoint(run_dir, checkpoint)
                     dist.barrier()
             epoch += 1
 
         if rank == 0:
-            _write_json(run_dir / "summary.json", {"status": "PASS", "global_step": global_step,
-                                                    "best_step": best_step, "best_joint_val_loss": best_loss})
+            _write_json(
+                run_dir / "summary.json",
+                {
+                    "status": "PASS",
+                    "global_step": global_step,
+                    "best_step": best_step,
+                    "best_joint_val_loss": best_loss,
+                },
+            )
         return 0
     finally:
-        if writer is not None:
-            writer.close()
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
