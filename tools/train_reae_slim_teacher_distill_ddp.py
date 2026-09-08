@@ -52,6 +52,7 @@ from swiftvr.training.tiny_decoder_cache import TinyDecoderLatentCache
 
 TRAINER_ID = "swiftvr_stage_b1_reae_slim_teacher_distill_ddp_v1"
 VARIANT_GMAC = {"slim100": 98.2228992, "aggressive": 86.79211008}
+MAX_AMP_OVERFLOW_RETRIES = 8
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +117,18 @@ def _teacher_objective(
         "teacher_lpips": teacher_lpips,
         "teacher_temporal_mse": teacher_temporal,
     }
+
+
+def _gradient_nonfinite_elements(module: torch.nn.Module) -> int:
+    """Count non-finite gradient elements after GradScaler unscale_."""
+
+    count = 0
+    for parameter in module.parameters():
+        gradient = parameter.grad
+        if gradient is None or not gradient.is_floating_point():
+            continue
+        count += int((~torch.isfinite(gradient.detach())).sum().item())
+    return count
 
 
 def _calibrate_activation_scores(
@@ -252,6 +265,8 @@ def _fingerprint(
         "lpips_microbatch_frames": int(args.lpips_microbatch_frames),
         "seed": int(args.seed),
         "gt_optimization_weight": 0.0,
+        "amp_overflow_policy": "ddp_global_retry_same_batch_scale_half",
+        "max_amp_overflow_retries": MAX_AMP_OVERFLOW_RETRIES,
     }
 
 
@@ -384,7 +399,7 @@ def main() -> int:
         train_loader = formal._train_loader(train_dataset, sampler, args)
         val_loader = formal._val_loader(val_dataset, args) if rank == 0 else None
 
-        teacher = ReAE(str(base / args.reae_filename)).to(device=device, dtype=dtype).eval()
+        teacher = ReAE(str(base / args.reaae_filename)).to(device=device, dtype=dtype).eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
 
@@ -526,6 +541,7 @@ def main() -> int:
                 )
             dist.barrier()
 
+        amp_overflow_count = 0
         for epoch in range(start_epoch, args.epochs):
             sampler.set_epoch(epoch)
             ddp.train()
@@ -549,27 +565,84 @@ def main() -> int:
                         teacher, z_sr, output_frames=int(target.shape[1]), clamp=False
                     )
 
-                optimizer.zero_grad(set_to_none=True)
-                with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
-                    prediction = ddp(z_sr, output_frames=int(target.shape[1]), clamp=False)
-                objective = _teacher_objective(
-                    prediction,
-                    teacher_rgb,
-                    perceptual=perceptual,
-                    l2_weight=args.teacher_l2_weight,
-                    lpips_weight=args.teacher_lpips_weight,
-                    temporal_weight=args.teacher_temporal_weight,
-                    lpips_microbatch_frames=args.lpips_microbatch_frames,
-                )
-                scaler.scale(objective["loss"]).backward()
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(ddp.parameters(), args.max_grad_norm)
-                if not torch.isfinite(grad_norm):
-                    raise FloatingPointError(
-                        f"non-finite grad norm epoch={epoch+1} batch={batch_index}: {grad_norm}"
+                amp_retry = 0
+                while True:
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
+                        prediction = ddp(z_sr, output_frames=int(target.shape[1]), clamp=False)
+                    objective = _teacher_objective(
+                        prediction,
+                        teacher_rgb,
+                        perceptual=perceptual,
+                        l2_weight=args.teacher_l2_weight,
+                        lpips_weight=args.teacher_lpips_weight,
+                        temporal_weight=args.teacher_temporal_weight,
+                        lpips_microbatch_frames=args.lpips_microbatch_frames,
                     )
-                scaler.step(optimizer)
-                scaler.update()
+                    if not torch.isfinite(objective["loss"].detach()).item():
+                        raise FloatingPointError(
+                            f"non-finite forward loss epoch={epoch+1} batch={batch_index}"
+                        )
+
+                    scale_before = float(scaler.get_scale())
+                    scaler.scale(objective["loss"]).backward()
+                    scaler.unscale_(optimizer)
+
+                    local_nonfinite = _gradient_nonfinite_elements(ddp)
+                    nonfinite_flag = torch.tensor(
+                        [1 if local_nonfinite else 0],
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
+                    global_nonfinite = int(nonfinite_flag.item()) != 0
+
+                    if global_nonfinite:
+                        if not scaler.is_enabled():
+                            raise FloatingPointError(
+                                "non-finite decoder gradients with AMP scaler disabled"
+                            )
+                        if amp_retry >= MAX_AMP_OVERFLOW_RETRIES:
+                            raise FloatingPointError(
+                                "Exceeded decoder AMP overflow retry limit: "
+                                f"epoch={epoch+1} batch={batch_index} "
+                                f"scale={scale_before}"
+                            )
+                        scale_after = scale_before * 0.5
+                        scaler.update(new_scale=scale_after)
+                        optimizer.zero_grad(set_to_none=True)
+                        amp_retry += 1
+                        amp_overflow_count += 1
+                        if rank == 0:
+                            formal._append_jsonl(
+                                run_dir / "amp_overflow_log.jsonl",
+                                {
+                                    "epoch": epoch + 1,
+                                    "batch": batch_index,
+                                    "global_step": global_step,
+                                    "retry_index": amp_retry,
+                                    "scale_before": scale_before,
+                                    "scale_after": scale_after,
+                                    "local_nonfinite_gradient_elements_rank0": local_nonfinite,
+                                },
+                            )
+                            print(
+                                f"AMP overflow epoch={epoch+1} batch={batch_index} "
+                                f"retry={amp_retry}/{MAX_AMP_OVERFLOW_RETRIES} "
+                                f"scale={scale_before:g}->{scale_after:g}; retrying same batch",
+                                flush=True,
+                            )
+                        continue
+
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        ddp.parameters(),
+                        args.max_grad_norm,
+                        error_if_nonfinite=True,
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    break
+
                 global_step += 1
 
                 batch_size = int(target.shape[0])
@@ -597,6 +670,8 @@ def main() -> int:
                             "variant": args.variant,
                             "global_batch_size": args.batch_size * world_size,
                             "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "amp_scale": float(scaler.get_scale()),
+                            "amp_overflow_count": amp_overflow_count,
                             **reduced,
                         }
                         formal._append_jsonl(run_dir / "train_log.jsonl", record)
@@ -674,6 +749,8 @@ def main() -> int:
                 "teacher_l2_weight": float(args.teacher_l2_weight),
                 "teacher_lpips_weight": float(args.teacher_lpips_weight),
                 "teacher_temporal_weight": float(args.teacher_temporal_weight),
+                "amp_overflow_count": amp_overflow_count,
+                "final_amp_scale": float(scaler.get_scale()),
                 "best": best,
             }
             formal._write_json(run_dir / "summary.json", summary)
