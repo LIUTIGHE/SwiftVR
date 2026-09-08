@@ -30,7 +30,29 @@ def test_formal_m8c_profile_defaults_are_locked():
     assert _default(parser, "max_steps") == 5000
     assert _default(parser, "validate_every") == 250
     assert _default(parser, "save_every") == 500
+    assert _default(parser, "validate_at_start") is True
+    assert _default(parser, "visual_validation_samples") == 0
     assert _default(parser, "dtype") == "float16"
+
+
+def test_visual_validation_compatibility_argument_parses():
+    parser = recovery.build_formal_parser()
+    required = {
+        "base_checkpoint": "base",
+        "transformer_init": "transformer",
+        "decoder_init": "decoder",
+        "teacher_cache": "train-cache",
+        "manifest": "train.jsonl",
+        "val_teacher_cache": "val-cache",
+        "val_manifest": "val.jsonl",
+        "output_dir": "out",
+    }
+    argv = []
+    for dest, value in required.items():
+        argv += [f"--{dest.replace('_', '-')}", value]
+    argv += ["--visual-validation-samples", "13"]
+    args = parser.parse_args(argv)
+    assert args.visual_validation_samples == 13
 
 
 def test_safe_selector_rejects_better_loss_when_velocity_drift_is_too_large(tmp_path):
