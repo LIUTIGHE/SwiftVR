@@ -163,8 +163,6 @@ def _calibrate_activation_scores(
             counts[stage] += int(value.shape[0] * value.shape[2] * value.shape[3])
         return _hook
 
-    # Aggregate all MemBlock outputs in the first three stages and the final
-    # stage-3 ReLU.  This avoids selecting channels from only one block state.
     for stage, layer_indices in STAGE_SCORE_LAYER_INDICES.items():
         for layer_index in layer_indices:
             handles.append(teacher.decoder[layer_index].register_forward_hook(hook_for(stage)))
@@ -399,7 +397,7 @@ def main() -> int:
         train_loader = formal._train_loader(train_dataset, sampler, args)
         val_loader = formal._val_loader(val_dataset, args) if rank == 0 else None
 
-        teacher = ReAE(str(base / args.reaae_filename)).to(device=device, dtype=dtype).eval()
+        teacher = ReAE(str(base / args.reae_filename)).to(device=device, dtype=dtype).eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
 
