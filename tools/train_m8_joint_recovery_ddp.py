@@ -80,6 +80,21 @@ def build_formal_parser():
     }
     for dest, value in defaults.items():
         _set_default(parser, dest, value)
+
+    # Compatibility with the M8-A/M8-B launch recipes. The current joint trainer
+    # performs quantitative validation on the whole val set; visual comparisons
+    # are intentionally run post-checkpoint through the existing inference tools.
+    destinations = {action.dest for action in parser._actions}
+    if "visual_validation_samples" not in destinations:
+        parser.add_argument(
+            "--visual-validation-samples",
+            type=int,
+            default=0,
+            help=(
+                "Compatibility option. M8-C records quantitative validation only; "
+                "run post-checkpoint visual comparison separately."
+            ),
+        )
     return parser
 
 
@@ -106,7 +121,8 @@ def main() -> int:
     print(
         "[M8-C] formal profile: D1024/L20 + Decoder76, global batch 64, "
         "LR(light/tail/decoder)=1e-6/2e-6/2e-5, fixed FP16 scale=1, "
-        "step0+250-step validation, save=500, schedule=5000 steps",
+        "step0+250-step validation, save=500, schedule=5000 steps; "
+        "visual-validation-samples is accepted for launch compatibility only",
         flush=True,
     )
     return core.main()
