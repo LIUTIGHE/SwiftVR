@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""M8-C decoder-aware joint co-adaptation for D1024/L20 MoE + Decoder76.
+"""M8-C V2 decoder-aware joint co-adaptation for D1024/L20 MoE + Decoder76.
 
-The frozen ReAE encoder supplies z_LQ. Stage-A D3072 cached velocity is the
-final-behavior teacher and the frozen original ReAE decoder renders Stage-A RGB.
-GT is diagnostic only and never contributes gradients or checkpoint selection.
+The frozen ReAE encoder supplies z_LQ and Stage-A D3072 cached velocity remains
+the final-behavior teacher. V2 explicitly separates gradient responsibilities:
 
-Default trainable scope is deliberately conservative:
-  * Decoder76: fully trainable;
-  * Transformer blocks before the tail: adapter + router only;
-  * last 6 Transformer blocks: fully trainable;
-  * patch/proj/final norm and other early-block parameters: frozen.
+* Transformer recovery: velocity/latent anchors plus RGB losses through the
+  frozen ORIGINAL ReAE decoder, comparing OriginalDecoder(z_M8) against
+  OriginalDecoder(z_StageA). Gradients flow through z_M8 into the Transformer,
+  never into Decoder76.
+* Decoder76 recovery: Decoder76(z_M8.detach()) matches
+  OriginalDecoder(z_M8.detach()) with the validated M8-B same-latent
+  10x-L2 + LPIPS + temporal recipe. These gradients update Decoder76 only.
 
-Loss = Stage-A velocity NMSE/cosine anchors + latent spatial/temporal-detail
-anchors + teacher RGB L1/LPIPS/temporal + router balance.
+This prevents Decoder76 from being forced to compensate for the remaining M8
+Transformer latent gap. GT is diagnostic only and never contributes gradients or
+checkpoint selection.
 """
 
 from __future__ import annotations
@@ -50,13 +52,18 @@ from swiftvr.training import (
     append_jsonl,
     build_grad_scaler,
     cast_trainable_parameters,
+    decode_reae_clip,
     decode_teacher_prediction,
     seed_everything,
     write_latest_checkpoint,
 )
 from swiftvr.training.b2b_moe import B2BMoESpec, expected_moe_shape, transformer_moe_shape
 from swiftvr.training.b2b_moe_training import router_summary
-from swiftvr.training.m8_joint import M8JointForward, M8JointLossWeights, m8_joint_objective
+from swiftvr.training.m8_joint import (
+    M8JointDecoupledLossWeights,
+    M8JointForward,
+    m8_joint_decoupled_objective,
+)
 from swiftvr.training.tiny_decoder import LPIPSAlexLoss
 
 
@@ -110,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tail-full-blocks", type=int, default=6)
     p.add_argument("--transformer-light-learning-rate", type=float, default=1e-6)
     p.add_argument("--transformer-tail-learning-rate", type=float, default=2e-6)
-    p.add_argument("--decoder-learning-rate", type=float, default=3e-5)
+    p.add_argument("--decoder-learning-rate", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--optimizer-eps", type=float, default=1e-8)
     p.add_argument("--transformer-max-grad-norm", type=float, default=1.0)
@@ -120,13 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr-warmup-steps", type=int, default=100)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
 
+    # Transformer/representation anchors.
     p.add_argument("--velocity-nmse-weight", type=float, default=0.25)
     p.add_argument("--velocity-cosine-weight", type=float, default=0.25)
     p.add_argument("--latent-spatial-weight", type=float, default=0.5)
     p.add_argument("--latent-temporal-weight", type=float, default=0.5)
+
+    # Frozen-original-decoder RGB system path -> Transformer only.
     p.add_argument("--teacher-rgb-l1-weight", type=float, default=1.0)
     p.add_argument("--teacher-lpips-weight", type=float, default=0.1)
     p.add_argument("--teacher-rgb-temporal-weight", type=float, default=1.0)
+
+    # Same-latent compact-decoder recovery -> Decoder76 only.
+    p.add_argument("--decoder-teacher-l2-weight", type=float, default=10.0)
+    p.add_argument("--decoder-teacher-lpips-weight", type=float, default=0.1)
+    p.add_argument("--decoder-teacher-temporal-weight", type=float, default=1.0)
+
     p.add_argument("--router-balance-weight", type=float, default=0.01)
     p.add_argument("--lpips-microbatch-frames", type=int, default=16)
     p.add_argument("--loss-epsilon", type=float, default=1e-8)
@@ -174,21 +190,27 @@ def _validate_args(args: argparse.Namespace) -> None:
         "teacher_rgb_l1_weight",
         "teacher_lpips_weight",
         "teacher_rgb_temporal_weight",
+        "decoder_teacher_l2_weight",
+        "decoder_teacher_lpips_weight",
+        "decoder_teacher_temporal_weight",
         "router_balance_weight",
     ):
         if float(getattr(args, name)) < 0:
             raise ValueError(f"--{name.replace('_','-')} must be non-negative")
 
 
-def _weights(args: argparse.Namespace) -> M8JointLossWeights:
-    return M8JointLossWeights(
+def _weights(args: argparse.Namespace) -> M8JointDecoupledLossWeights:
+    return M8JointDecoupledLossWeights(
         velocity_nmse=args.velocity_nmse_weight,
         velocity_cosine=args.velocity_cosine_weight,
         latent_spatial=args.latent_spatial_weight,
         latent_temporal=args.latent_temporal_weight,
-        teacher_rgb_l1=args.teacher_rgb_l1_weight,
-        teacher_lpips=args.teacher_lpips_weight,
-        teacher_rgb_temporal=args.teacher_rgb_temporal_weight,
+        system_rgb_l1=args.teacher_rgb_l1_weight,
+        system_lpips=args.teacher_lpips_weight,
+        system_rgb_temporal=args.teacher_rgb_temporal_weight,
+        decoder_teacher_l2=args.decoder_teacher_l2_weight,
+        decoder_teacher_lpips=args.decoder_teacher_lpips_weight,
+        decoder_teacher_temporal=args.decoder_teacher_temporal_weight,
         router_balance=args.router_balance_weight,
     )
 
@@ -315,14 +337,24 @@ def _save_snapshot(
     temporary.replace(root)
 
 
+def _decode_full_student(reae, z_student: torch.Tensor, output_frames: int) -> torch.Tensor:
+    """Decode non-detached [B,C,F,H,W] student latent with frozen full ReAE."""
+    return decode_reae_clip(
+        reae,
+        z_student.permute(0, 2, 1, 3, 4).contiguous(),
+        output_frames=int(output_frames),
+        clamp=False,
+    )
+
+
 def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtype, args):
-    # Match the cache-safe M5/M7/M8-A validation rule: rank-0 validation must not
-    # leave shifted-window runtime tensors for the following autograd forward.
     _clear_window_caches()
     closure.eval()
     closure.reae.eval()
     velocity_accumulator = DistillationMetricAccumulator()
     student_teacher = VideoMetricAccumulator()
+    full_student_teacher = VideoMetricAccumulator()
+    decoder_same_latent = VideoMetricAccumulator()
     student_gt = VideoMetricAccumulator()
     teacher_gt = VideoMetricAccumulator()
     sums: dict[str, float] = {}
@@ -335,17 +367,23 @@ def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtyp
                 batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
                 with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
                     output = closure(batch)
+                    full_student_prediction = _decode_full_student(
+                        closure.reae,
+                        output["z_student"],
+                        int(output["target"].shape[1]),
+                    )
                     teacher_prediction = decode_teacher_prediction(
                         reae=closure.reae,
                         z_lq=output["z_lq"],
                         teacher_velocity=teacher_velocity,
                         output_frames=int(output["target"].shape[1]),
                     )
-                    objective = m8_joint_objective(
+                    objective = m8_joint_decoupled_objective(
                         student_velocity=output["velocity"],
                         teacher_velocity=teacher_velocity,
                         z_lq=output["z_lq"],
-                        student_prediction=output["prediction"],
+                        compact_prediction=output["prediction"],
+                        full_student_prediction=full_student_prediction,
                         teacher_prediction=teacher_prediction,
                         router_balance_loss=output["router_balance_loss"],
                         perceptual=perceptual,
@@ -359,6 +397,8 @@ def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtyp
                     sums[key] = sums.get(key, 0.0) + float(value.detach().float().item()) * batch_size
                 velocity_accumulator.update(output["velocity"], teacher_velocity)
                 student_teacher.update(output["prediction"], teacher_prediction, clamp=True)
+                full_student_teacher.update(full_student_prediction, teacher_prediction, clamp=True)
+                decoder_same_latent.update(output["prediction"], full_student_prediction, clamp=True)
                 student_gt.update(output["prediction"], output["target"], clamp=True)
                 teacher_gt.update(teacher_prediction, output["target"], clamp=True)
     finally:
@@ -370,6 +410,8 @@ def _validate_rank0(closure, loader, cache, perceptual, weights, *, device, dtyp
     result.update(velocity_accumulator.compute())
     for prefix, accumulator in (
         ("student_teacher", student_teacher),
+        ("full_student_teacher", full_student_teacher),
+        ("decoder_same_latent", decoder_same_latent),
         ("student_gt", student_gt),
         ("teacher_gt", teacher_gt),
     ):
@@ -505,8 +547,6 @@ def main() -> int:
             gradient_checkpointing=not args.no_gradient_checkpointing,
         ).to(device=device)
         cast_report = cast_trainable_parameters(closure, dtype=torch.float32)
-        # Parameter identities are preserved by the FP32 cast; rebuilding gives
-        # an explicit post-cast exact-coverage assertion before optimizer creation.
         groups, scope_report = _configure_trainable_scope(
             transformer,
             decoder,
@@ -516,7 +556,7 @@ def main() -> int:
         scaler = build_grad_scaler(device, dtype)
         perceptual = (
             LPIPSAlexLoss().to(device=device).eval()
-            if args.teacher_lpips_weight > 0
+            if args.teacher_lpips_weight > 0 or args.decoder_teacher_lpips_weight > 0
             else None
         )
         weights = _weights(args)
@@ -530,8 +570,12 @@ def main() -> int:
         )
 
         run_config = {
-            "trainer": "swiftvr_m8c_decoder_aware_joint_coadapt_ddp_v1",
+            "trainer": "swiftvr_m8c_decoder_aware_joint_coadapt_ddp_v2_decoupled",
             "architecture": "m8-d1024-l20+decoder76",
+            "gradient_roles": {
+                "transformer": "stage_a_velocity_latent_plus_frozen_original_decoder_rgb",
+                "decoder76": "same_latent_original_decoder_teacher_only",
+            },
             "transformer_init": str(transformer_root),
             "decoder_init": str(decoder_root),
             "transformer_shape": shape,
@@ -540,7 +584,7 @@ def main() -> int:
             "teacher_cache": str(args.teacher_cache.expanduser().resolve()),
             "validation_teacher_cache": str(args.val_teacher_cache.expanduser().resolve()),
             "gt_role": "diagnostic_only",
-            "checkpoint_selection": "lowest_joint_teacher_validation_loss",
+            "checkpoint_selection": "lowest_joint_teacher_validation_loss_with_safe_velocity_postfilter",
             "loss_weights": vars(weights),
             "trainable_scope": scope_report,
             "trainable_cast": cast_report,
@@ -588,12 +632,14 @@ def main() -> int:
                         "velocity_relative_l2": validation["velocity_relative_l2"],
                         "student_teacher_psnr": validation["student_teacher_psnr"],
                         "student_teacher_ssim": validation["student_teacher_ssim"],
+                        "full_student_teacher_psnr": validation["full_student_teacher_psnr"],
+                        "decoder_same_latent_psnr": validation["decoder_same_latent_psnr"],
                         "note": "GT metrics are diagnostic only.",
                     },
                 )
             print(
                 json.dumps(
-                    {"phase": "m8_joint_val", "global_step": step, **validation},
+                    {"phase": "m8_joint_val_v2", "global_step": step, **validation},
                     sort_keys=True,
                 ),
                 flush=True,
@@ -652,6 +698,16 @@ def main() -> int:
                             enabled=autocast_enabled,
                         ):
                             output = ddp(batch)
+
+                            # Frozen full decoder on non-detached M8 latent: this
+                            # path gives decoder-aware RGB gradients to Transformer.
+                            full_student_prediction = _decode_full_student(
+                                reae,
+                                output["z_student"],
+                                int(output["target"].shape[1]),
+                            )
+
+                            # Stage-A final-behavior RGB target is detached.
                             with torch.no_grad():
                                 teacher_prediction = decode_teacher_prediction(
                                     reae=reae,
@@ -659,11 +715,13 @@ def main() -> int:
                                     teacher_velocity=teacher_velocity,
                                     output_frames=int(output["target"].shape[1]),
                                 )
-                            objective = m8_joint_objective(
+
+                            objective = m8_joint_decoupled_objective(
                                 student_velocity=output["velocity"],
                                 teacher_velocity=teacher_velocity,
                                 z_lq=output["z_lq"],
-                                student_prediction=output["prediction"],
+                                compact_prediction=output["prediction"],
+                                full_student_prediction=full_student_prediction,
                                 teacher_prediction=teacher_prediction,
                                 router_balance_loss=output["router_balance_loss"],
                                 perceptual=perceptual,
@@ -673,7 +731,7 @@ def main() -> int:
                             )
                             scaled_loss = objective["loss"] / args.gradient_accumulation_steps
                         if not torch.isfinite(scaled_loss.detach()).item():
-                            raise FloatingPointError("non-finite M8 joint loss")
+                            raise FloatingPointError("non-finite M8 joint V2 loss")
                         if scaler.is_enabled():
                             scaler.scale(scaled_loss).backward()
                         else:
@@ -701,7 +759,7 @@ def main() -> int:
                 )
                 if not torch.isfinite(transformer_grad_norm) or not torch.isfinite(decoder_grad_norm):
                     raise FloatingPointError(
-                        "non-finite M8 joint grad norm: "
+                        "non-finite M8 joint V2 grad norm: "
                         f"transformer={transformer_grad_norm}, decoder={decoder_grad_norm}"
                     )
                 if scaler.is_enabled():
@@ -745,6 +803,7 @@ def main() -> int:
                             metadata={
                                 "global_step": global_step,
                                 "architecture": "m8-d1024-l20+decoder76",
+                                "trainer": "m8c_v2_decoupled",
                                 "best_step_so_far": best_step,
                                 "best_joint_val_loss": best_loss,
                             },
@@ -758,6 +817,7 @@ def main() -> int:
                 run_dir / "summary.json",
                 {
                     "status": "PASS",
+                    "trainer": "m8c_v2_decoupled",
                     "global_step": global_step,
                     "best_step": best_step,
                     "best_joint_val_loss": best_loss,
