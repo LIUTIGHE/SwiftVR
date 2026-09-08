@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Formal M8-C joint-recovery entrypoint.
+"""Formal M8-C V2 joint-recovery entrypoint.
 
-This intentionally reuses ``train_m8_joint_coadapt_ddp.py`` and only locks the
-validated M8-C operating point:
+This reuses ``train_m8_joint_coadapt_ddp.py`` and locks the formal decoupled
+M8-C operating point:
 
 * M8 D1024/L20 + Decoder76;
-* local batch 4 x 4 GPUs x grad-accum 4 = global effective batch 64;
+* local batch 4 x 4 GPUs x grad-accum 4 = global effective batch 64 by default;
 * early adapter/router LR 1e-6, tail-6 full-block LR 2e-6;
 * warmed Decoder76 LR 2e-5;
+* Transformer system RGB loss through frozen Original ReAE decoder;
+* Decoder76 same-latent recovery: 10x L2 + 0.1 LPIPS + temporal;
 * 5k-step cosine schedule with 100-step warm-up;
 * step-0 validation, then validation every 250 steps;
 * full checkpoint every 500 steps;
 * FP16 GradScaler starts at 1 and does not grow during this short gate.
 
-The fixed low loss scale is deliberate: M8-B empirically converged stably at
-scale=1, while the legacy decoder trainer failed before its first update when the
-default large loss scale overflowed. A genuine non-finite gradient at scale=1 is
-therefore treated as a real numerical failure by the reused core trainer.
+The fixed low loss scale follows the stable M8-B warm-up behavior. A genuine
+non-finite gradient at scale=1 is treated as a numerical failure rather than being
+silently hidden by repeated scale retries.
 """
 
 from __future__ import annotations
@@ -69,6 +70,9 @@ def build_formal_parser():
         "teacher_rgb_l1_weight": 1.0,
         "teacher_lpips_weight": 0.1,
         "teacher_rgb_temporal_weight": 1.0,
+        "decoder_teacher_l2_weight": 10.0,
+        "decoder_teacher_lpips_weight": 0.1,
+        "decoder_teacher_temporal_weight": 1.0,
         "router_balance_weight": 0.01,
         "lpips_microbatch_frames": 16,
         "max_steps": 5000,
@@ -81,9 +85,9 @@ def build_formal_parser():
     for dest, value in defaults.items():
         _set_default(parser, dest, value)
 
-    # Compatibility with the M8-A/M8-B launch recipes. The current joint trainer
-    # performs quantitative validation on the whole val set; visual comparisons
-    # are intentionally run post-checkpoint through the existing inference tools.
+    # Compatibility with the M8-A/M8-B launch recipes. The joint trainer performs
+    # quantitative validation on the complete val set; visual comparisons remain
+    # post-checkpoint to keep the training loop deterministic and lightweight.
     destinations = {action.dest for action in parser._actions}
     if "visual_validation_samples" not in destinations:
         parser.add_argument(
@@ -114,13 +118,12 @@ def _fixed_fp16_grad_scaler(device: torch.device, runtime_dtype: torch.dtype):
 
 
 def main() -> int:
-    # Keep one canonical implementation of the actual joint loop. Only replace
-    # its parser defaults and FP16 scaler policy for the formal M8-C experiment.
     core.build_parser = build_formal_parser
     core.build_grad_scaler = _fixed_fp16_grad_scaler
     print(
-        "[M8-C] formal profile: D1024/L20 + Decoder76, global batch 64, "
-        "LR(light/tail/decoder)=1e-6/2e-6/2e-5, fixed FP16 scale=1, "
+        "[M8-C V2] decoupled profile: D1024/L20 + Decoder76, global batch 64, "
+        "LR(light/tail/decoder)=1e-6/2e-6/2e-5, decoder same-latent "
+        "10xL2+0.1LPIPS+temporal, fixed FP16 scale=1, "
         "step0+250-step validation, save=500, schedule=5000 steps; "
         "visual-validation-samples is accepted for launch compatibility only",
         flush=True,
