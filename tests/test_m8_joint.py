@@ -13,7 +13,12 @@ if str(ROOT) not in sys.path:
 
 from swiftvr.models.reae_slim_decoder import M8_DECODER76_CHANNELS, VARIANT_CHANNELS
 from swiftvr.models.transformer_prompt_free_no_time_moe import WanTransformer3DModelPromptFreeNoTimeMoE
-from swiftvr.training.m8_joint import M8JointLossWeights, m8_joint_objective
+from swiftvr.training.m8_joint import (
+    M8JointDecoupledLossWeights,
+    M8JointLossWeights,
+    m8_joint_decoupled_objective,
+    m8_joint_objective,
+)
 from tools.train_m8_joint_coadapt_ddp import _configure_trainable_scope
 
 
@@ -94,6 +99,88 @@ class M8JointObjectiveTests(unittest.TestCase):
         self.assertIsNotNone(router_balance.grad)
         self.assertTrue(torch.isfinite(student_velocity.grad).all())
         self.assertTrue(torch.isfinite(student_rgb.grad).all())
+
+    def test_decoupled_objective_is_finite_and_has_expected_terms(self):
+        torch.manual_seed(1)
+        student_velocity = torch.randn(2, 4, 3, 5, 6, requires_grad=True)
+        teacher_velocity = torch.randn_like(student_velocity)
+        z_lq = torch.randn_like(student_velocity)
+        compact_rgb = torch.rand(2, 5, 3, 12, 14, requires_grad=True)
+        full_student_rgb = torch.rand_like(compact_rgb, requires_grad=True)
+        teacher_rgb = torch.rand_like(compact_rgb)
+        router_balance = student_velocity.new_tensor(1.02, requires_grad=True)
+        weights = M8JointDecoupledLossWeights(
+            system_lpips=0.0,
+            decoder_teacher_lpips=0.0,
+        )
+
+        objective = m8_joint_decoupled_objective(
+            student_velocity=student_velocity,
+            teacher_velocity=teacher_velocity,
+            z_lq=z_lq,
+            compact_prediction=compact_rgb,
+            full_student_prediction=full_student_rgb,
+            teacher_prediction=teacher_rgb,
+            router_balance_loss=router_balance,
+            perceptual=None,
+            weights=weights,
+        )
+        expected = {
+            "system_rgb_l1",
+            "system_rgb_temporal_mse",
+            "decoder_teacher_l2",
+            "decoder_teacher_temporal_mse",
+        }
+        self.assertTrue(expected.issubset(objective))
+        self.assertNotIn("gt", " ".join(objective.keys()).lower())
+        self.assertTrue(torch.isfinite(objective["loss"]))
+        objective["loss"].backward()
+        self.assertIsNotNone(student_velocity.grad)
+        self.assertIsNotNone(compact_rgb.grad)
+        self.assertIsNotNone(full_student_rgb.grad)
+        self.assertTrue(torch.isfinite(compact_rgb.grad).all())
+        self.assertTrue(torch.isfinite(full_student_rgb.grad).all())
+
+    def test_decoder_same_latent_target_is_detached_from_full_student(self):
+        torch.manual_seed(2)
+        shape_v = (1, 2, 2, 3, 3)
+        shape_rgb = (1, 3, 3, 6, 6)
+        student_velocity = torch.randn(*shape_v, requires_grad=True)
+        teacher_velocity = torch.randn_like(student_velocity)
+        z_lq = torch.randn_like(student_velocity)
+        compact_rgb = torch.rand(*shape_rgb, requires_grad=True)
+        full_student_rgb = torch.rand(*shape_rgb, requires_grad=True)
+        teacher_rgb = torch.rand_like(compact_rgb)
+        router_balance = student_velocity.new_tensor(1.0, requires_grad=True)
+        weights = M8JointDecoupledLossWeights(
+            velocity_nmse=0.0,
+            velocity_cosine=0.0,
+            latent_spatial=0.0,
+            latent_temporal=0.0,
+            system_rgb_l1=0.0,
+            system_lpips=0.0,
+            system_rgb_temporal=0.0,
+            decoder_teacher_l2=1.0,
+            decoder_teacher_lpips=0.0,
+            decoder_teacher_temporal=0.0,
+            router_balance=0.0,
+        )
+        objective = m8_joint_decoupled_objective(
+            student_velocity=student_velocity,
+            teacher_velocity=teacher_velocity,
+            z_lq=z_lq,
+            compact_prediction=compact_rgb,
+            full_student_prediction=full_student_rgb,
+            teacher_prediction=teacher_rgb,
+            router_balance_loss=router_balance,
+            perceptual=None,
+            weights=weights,
+        )
+        objective["loss"].backward()
+        self.assertGreater(float(compact_rgb.grad.abs().sum()), 0.0)
+        # full_student is a detached teacher for the decoder recovery branch.
+        self.assertIsNotNone(full_student_rgb.grad)
+        self.assertEqual(float(full_student_rgb.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":
