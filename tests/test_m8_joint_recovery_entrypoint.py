@@ -27,6 +27,12 @@ def test_formal_m8c_profile_defaults_are_locked():
     assert _default(parser, "transformer_light_learning_rate") == 1e-6
     assert _default(parser, "transformer_tail_learning_rate") == 2e-6
     assert _default(parser, "decoder_learning_rate") == 2e-5
+    assert _default(parser, "teacher_rgb_l1_weight") == 1.0
+    assert _default(parser, "teacher_lpips_weight") == 0.1
+    assert _default(parser, "teacher_rgb_temporal_weight") == 1.0
+    assert _default(parser, "decoder_teacher_l2_weight") == 10.0
+    assert _default(parser, "decoder_teacher_lpips_weight") == 0.1
+    assert _default(parser, "decoder_teacher_temporal_weight") == 1.0
     assert _default(parser, "max_steps") == 5000
     assert _default(parser, "validate_every") == 250
     assert _default(parser, "save_every") == 500
