@@ -17,8 +17,8 @@ from tools.profile_reae_slim_macs import estimate_reae_decoder_macs
 
 class M9D0Test(unittest.TestCase):
     def test_frame_limit_keeps_4k_plus_1(self):
-        self.assertEqual(_normalize_total_frames(100, 77), 77)
-        self.assertEqual(_normalize_total_frames(76, 77), 73)
+        self.assertEqual(_normalize_total_frames(100, 81), 81)
+        self.assertEqual(_normalize_total_frames(80, 81), 77)
 
     def test_whole_and_streaming_decoder_paths_align(self):
         torch.manual_seed(0)
