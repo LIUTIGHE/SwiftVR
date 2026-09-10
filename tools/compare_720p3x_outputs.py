@@ -7,9 +7,12 @@ artifacts cannot hide or invent high-frequency detail.
 
 Synchronization is deliberately FRAME-INDEX based. Input FPS, duration, PTS/DTS,
 and other container timing metadata are ignored when choosing corresponding
-frames: frame N from every source is compared with frame N from every other
-source. ``--fps`` controls only the playback rate of the generated comparison
-videos and never changes source-frame sampling.
+frames. By default, frame N from every source is compared with frame N from every
+other source. The historical BasicCNN input can optionally use an explicit ordinal
+mapping ``basiccnn_index = N * scale + offset`` for outputs that contain an
+integer multiple of frames (for example 60-FPS / 2x-frame-count results compared
+against a 30-FPS source). ``--fps`` controls only the playback rate of generated
+comparison videos and never changes source-frame sampling.
 
 Two interfaces are supported:
 
@@ -22,7 +25,8 @@ Two interfaces are supported:
 2. Historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` / ``--basiccnn``
    arguments, retained for backward compatibility. BasicCNN is always appended
    after the other historical methods so a six-panel comparison naturally ends
-   with BasicCNN.
+   with BasicCNN. ``--basiccnn-index-scale`` and ``--basiccnn-index-offset`` apply
+   only to this historical BasicCNN source.
 
 The first restoration method defines the target resolution. The tool writes a
 labeled comparison video, selected-frame PNGs, and optional native target-space
@@ -197,6 +201,23 @@ def _crop_strip(method_frames: list[tuple[str, np.ndarray]], crop, label_height:
     return np.concatenate(pieces, axis=1)
 
 
+def _logical_frame_count(source: FrameSource, scale: int, offset: int) -> int:
+    """Return how many logical frame indices are valid under an ordinal mapping.
+
+    Logical frame N addresses source frame ``N * scale + offset``. Scale must be
+    positive and offset non-negative, so logical frame 0 is always the first
+    sampled source frame and the valid logical range is contiguous.
+    """
+
+    if scale <= 0:
+        raise ValueError("frame-index scale must be positive")
+    if offset < 0:
+        raise ValueError("frame-index offset must be non-negative")
+    if offset >= len(source):
+        return 0
+    return 1 + (len(source) - 1 - offset) // scale
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--lq", type=Path, required=True, help="Original LQ video or image directory.")
@@ -223,6 +244,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--basiccnn", type=Path, default=None,
                    help="Optional BasicCNN video/image-sequence directory; appended last.")
     p.add_argument("--basiccnn-label", default="BasicCNN")
+    p.add_argument(
+        "--basiccnn-index-scale",
+        type=int,
+        default=1,
+        help=(
+            "Ordinal BasicCNN frame multiplier. Logical frame N reads BasicCNN "
+            "frame N*scale+offset. Use 2 for 2x-frame-count outputs. Default: 1."
+        ),
+    )
+    p.add_argument(
+        "--basiccnn-index-offset",
+        type=int,
+        default=0,
+        help=(
+            "Non-negative ordinal BasicCNN frame offset used with "
+            "--basiccnn-index-scale. Default: 0."
+        ),
+    )
 
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--panel-width", type=int, default=960)
@@ -238,7 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Playback FPS of generated comparison videos only. Source alignment "
-            "always uses frame number and ignores source FPS/timestamps."
+            "always uses ordinal frame mapping and ignores source FPS/timestamps."
         ),
     )
     p.add_argument("--frame-indices", type=_csv_ints, default=(0, 8, 16, 24, 32))
@@ -248,20 +287,31 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _collect_method_specs(args: argparse.Namespace) -> list[tuple[str, Path]]:
-    specs = list(args.method)
+def _collect_method_specs(args: argparse.Namespace) -> list[tuple[str, Path, int, int]]:
+    specs: list[tuple[str, Path, int, int]] = [
+        (label, path, 1, 0) for label, path in args.method
+    ]
     legacy = (
-        (args.original_label, args.original_swiftvr),
-        (args.b1_label, args.b1),
-        (args.avernet_label, args.avernet),
-        (args.basiccnn_label, args.basiccnn),
+        (args.original_label, args.original_swiftvr, 1, 0),
+        (args.b1_label, args.b1, 1, 0),
+        (args.avernet_label, args.avernet, 1, 0),
+        (
+            args.basiccnn_label,
+            args.basiccnn,
+            int(args.basiccnn_index_scale),
+            int(args.basiccnn_index_offset),
+        ),
     )
-    specs.extend((label, path) for label, path in legacy if path is not None)
+    specs.extend(
+        (label, path, scale, offset)
+        for label, path, scale, offset in legacy
+        if path is not None
+    )
     if not specs:
         raise ValueError(
             "provide at least one restoration source via --method LABEL=PATH or the legacy arguments"
         )
-    labels = [label for label, _ in specs]
+    labels = [label for label, _, _, _ in specs]
     if len(set(labels)) != len(labels):
         raise ValueError(f"method labels must be unique, got {labels}")
     return specs
@@ -277,6 +327,16 @@ def main() -> int:
         raise ValueError("--quality must be positive")
     if args.fps is not None and args.fps <= 0:
         raise ValueError("--fps must be positive when provided")
+    if args.basiccnn_index_scale <= 0:
+        raise ValueError("--basiccnn-index-scale must be positive")
+    if args.basiccnn_index_offset < 0:
+        raise ValueError("--basiccnn-index-offset must be non-negative")
+    if args.basiccnn is None and (
+        args.basiccnn_index_scale != 1 or args.basiccnn_index_offset != 0
+    ):
+        raise ValueError(
+            "--basiccnn-index-scale/--basiccnn-index-offset require --basiccnn"
+        )
 
     output = args.output_dir.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
@@ -285,12 +345,12 @@ def main() -> int:
 
     lq = FrameSource(args.lq)
     method_specs = _collect_method_specs(args)
-    methods: list[tuple[str, FrameSource]] = []
-    for label, path in method_specs:
-        methods.append((label, FrameSource(path, fallback_fps=lq.fps)))
+    methods: list[tuple[str, FrameSource, int, int]] = []
+    for label, path, scale, offset in method_specs:
+        methods.append((label, FrameSource(path, fallback_fps=lq.fps), scale, offset))
 
     target_w, target_h = methods[0][1].width, methods[0][1].height
-    for label, source in methods[1:]:
+    for label, source, _, _ in methods[1:]:
         if (source.width, source.height) != (target_w, target_h):
             raise ValueError(
                 f"{label} resolution {source.width}x{source.height} != "
@@ -303,19 +363,22 @@ def main() -> int:
         if (gt.width, gt.height) != (target_w, target_h):
             raise ValueError(f"GT resolution {gt.width}x{gt.height} != target {target_w}x{target_h}")
 
-    sources = [("LQ", lq)] + methods
+    # Each source exposes a logical frame sequence. LQ, GT, and ordinary methods
+    # use identity mapping. BasicCNN may use N*scale+offset explicitly.
+    mapped_sources: list[tuple[str, FrameSource, int, int]] = [("LQ", lq, 1, 0)] + methods
     if gt is not None:
-        sources.append((args.gt_label, gt))
+        mapped_sources.append((args.gt_label, gt, 1, 0))
 
-    # Strict frame-number synchronization: compare frame i with frame i from
-    # every source. Different FPS, duration, PTS/DTS, and container time bases
-    # are intentionally irrelevant. Stop only when the shortest source runs out.
-    frame_counts = {label: len(source) for label, source in sources}
-    common = min(frame_counts.values())
+    source_frame_counts = {label: len(source) for label, source, _, _ in mapped_sources}
+    logical_frame_counts = {
+        label: _logical_frame_count(source, scale, offset)
+        for label, source, scale, offset in mapped_sources
+    }
+    common = min(logical_frame_counts.values())
     if args.max_frames > 0:
         common = min(common, int(args.max_frames))
     if common <= 0:
-        raise RuntimeError("no common frame indices")
+        raise RuntimeError("no common logical frame indices under the requested mappings")
 
     # Output FPS controls display speed only. It is never used to map input
     # frame numbers. Explicit --fps is recommended for milestone comparisons.
@@ -324,15 +387,18 @@ def main() -> int:
     panel_count = 1 + len(methods) + (1 if gt is not None else 0)
     columns = int(args.columns) if args.columns is not None else (3 if panel_count == 6 else 2)
 
-    print("Frame-index synchronization (FPS/timestamps ignored):", flush=True)
-    for label, source in sources:
+    print("Ordinal frame-index synchronization (FPS/timestamps ignored):", flush=True)
+    for label, source, scale, offset in mapped_sources:
+        mapping = f"source_index=N*{scale}+{offset}"
         print(
-            f"  {label}: frames={len(source)} native_fps={source.fps:.6g} "
+            f"  {label}: frames={len(source)} logical_frames={logical_frame_counts[label]} "
+            f"native_fps={source.fps:.6g} mapping={mapping} "
             f"kind={source.kind} path={source.path}",
             flush=True,
         )
     print(
-        f"  comparing frame indices 0..{common - 1}; output playback fps={output_fps:.6g}",
+        f"  comparing logical frame indices 0..{common - 1}; "
+        f"output playback fps={output_fps:.6g}",
         flush=True,
     )
 
@@ -351,10 +417,12 @@ def main() -> int:
 
     try:
         for index in range(common):
-            # This one ordinal index is the synchronization key for every input.
+            # 'index' is the logical/source-reference frame number. Each method
+            # maps it deterministically to its own decoded ordinal frame.
             lq_up = _resize_rgb(lq.frame(index), target_w, target_h)
             method_frames = [("LQ Bicubic 3x", lq_up)] + [
-                (label, source.frame(index)) for label, source in methods
+                (label, source.frame(index * scale + offset))
+                for label, source, scale, offset in methods
             ]
             if gt is not None:
                 method_frames.append((args.gt_label, gt.frame(index)))
@@ -378,8 +446,11 @@ def main() -> int:
 
     metadata = {
         "alignment": {
-            "mode": "frame_index",
-            "description": "frame N is compared with frame N; source FPS/timestamps are ignored",
+            "mode": "ordinal_frame_index",
+            "description": (
+                "logical frame N maps to source frame N*index_scale+index_offset; "
+                "source FPS/timestamps are ignored"
+            ),
             "common_frame_count": common,
             "first_frame_index": 0,
             "last_frame_index": common - 1,
@@ -392,13 +463,26 @@ def main() -> int:
                 "path": str(source.path),
                 "kind": source.kind,
                 "frame_count": len(source),
+                "logical_frame_count": _logical_frame_count(source, scale, offset),
                 "native_fps": source.fps,
+                "index_scale": scale,
+                "index_offset": offset,
+                "mapping": f"N*{scale}+{offset}",
             }
-            for label, source in methods
+            for label, source, scale, offset in methods
         ],
-        "source_kinds": {label: source.kind for label, source in sources},
-        "source_frame_counts": frame_counts,
-        "source_native_fps": {label: source.fps for label, source in sources},
+        "source_kinds": {
+            label: source.kind for label, source, _, _ in mapped_sources
+        },
+        "source_frame_counts": source_frame_counts,
+        "source_logical_frame_counts": logical_frame_counts,
+        "source_native_fps": {
+            label: source.fps for label, source, _, _ in mapped_sources
+        },
+        "source_index_mappings": {
+            label: {"scale": scale, "offset": offset}
+            for label, _, scale, offset in mapped_sources
+        },
         "lq_resolution": [lq.width, lq.height],
         "target_resolution": [target_w, target_h],
         "scale_ratio": [target_w / lq.width, target_h / lq.height],
