@@ -5,16 +5,22 @@ Inputs may be video files or image-sequence directories. For publication-quality
 inspection, prefer PNG directories from SwiftVR ``--png`` inference so codec
 artifacts cannot hide or invent high-frequency detail.
 
+Synchronization is deliberately FRAME-INDEX based. Input FPS, duration, PTS/DTS,
+and other container timing metadata are ignored when choosing corresponding
+frames: frame N from every source is compared with frame N from every other
+source. ``--fps`` controls only the playback rate of the generated comparison
+videos and never changes source-frame sampling.
+
 Two interfaces are supported:
 
 1. Generic repeated methods (recommended):
 
    --method "M1 Stage-A=/path/to/m1" \
    --method "M3 D1536=/path/to/m3" \
-   --method "M7-A=/path/to/m7a"
+   --method "M8-A=/path/to/m8a"
 
 2. Historical ``--original-swiftvr`` / ``--b1`` / ``--avernet`` / ``--basiccnn``
-   arguments, retained for backward compatibility.  BasicCNN is always appended
+   arguments, retained for backward compatibility. BasicCNN is always appended
    after the other historical methods so a six-panel comparison naturally ends
    with BasicCNN.
 
@@ -79,6 +85,14 @@ def _sort_key(path: Path):
 
 
 class FrameSource:
+    """Frame-addressable source whose public indexing is always ordinal.
+
+    For videos, ``frame(i)`` means the i-th decoded frame in presentation order.
+    We intentionally do not convert frame numbers through FPS or timestamps.
+    For image directories, files are sorted numerically by stem when possible,
+    then lexicographically as a fallback.
+    """
+
     def __init__(self, path: Path, fallback_fps: float = 30.0):
         self.path = path.expanduser().resolve()
         self.kind = "images" if self.path.is_dir() else "video"
@@ -101,6 +115,8 @@ class FrameSource:
                 raise ValueError(f"empty video: {self.path}")
             first = self._video_frame(0)
             self.height, self.width = first.shape[:2]
+            # Retain native FPS only for an optional output-FPS default and
+            # metadata. It must never participate in source-frame alignment.
             try:
                 fps = float(self.reader.get_avg_fps())
                 if math.isfinite(fps) and fps > 0:
@@ -116,13 +132,22 @@ class FrameSource:
     def fps(self) -> float:
         return self._fps
 
+    def frame_number(self, index: int) -> int:
+        """Return the ordinal frame number used for synchronization."""
+        if index < 0 or index >= len(self):
+            raise IndexError(f"frame index {index} outside [0, {len(self)}) for {self.path}")
+        return int(index)
+
     def _video_frame(self, index: int) -> np.ndarray:
-        value = self.reader[index]
+        # Integer VideoReader indexing is the decoded-frame ordinal. Do not use
+        # seek(), timestamps, FPS-derived positions, or time-based resampling.
+        value = self.reader[int(index)]
         if hasattr(value, "asnumpy"):
             value = value.asnumpy()
         return np.asarray(value, dtype=np.uint8)
 
     def frame(self, index: int) -> np.ndarray:
+        self.frame_number(index)
         if self.kind == "video":
             return self._video_frame(index)
         with Image.open(self.files[index]) as image:
@@ -208,7 +233,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Full-frame montage columns. Default: 3 for exactly six panels, otherwise 2.",
     )
-    p.add_argument("--fps", type=float, default=None)
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help=(
+            "Playback FPS of generated comparison videos only. Source alignment "
+            "always uses frame number and ignores source FPS/timestamps."
+        ),
+    )
     p.add_argument("--frame-indices", type=_csv_ints, default=(0, 8, 16, 24, 32))
     p.add_argument("--crop", type=_parse_crop, action="append", default=[])
     p.add_argument("--max-frames", type=int, default=0)
@@ -243,6 +276,8 @@ def main() -> int:
         raise ValueError("--columns must be positive when provided")
     if args.quality <= 0:
         raise ValueError("--quality must be positive")
+    if args.fps is not None and args.fps <= 0:
+        raise ValueError("--fps must be positive when provided")
 
     output = args.output_dir.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
@@ -272,16 +307,35 @@ def main() -> int:
     sources = [("LQ", lq)] + methods
     if gt is not None:
         sources.append((args.gt_label, gt))
+
+    # Strict frame-number synchronization: compare frame i with frame i from
+    # every source. Different FPS, duration, PTS/DTS, and container time bases
+    # are intentionally irrelevant. Stop only when the shortest source runs out.
     frame_counts = {label: len(source) for label, source in sources}
     common = min(frame_counts.values())
     if args.max_frames > 0:
         common = min(common, int(args.max_frames))
     if common <= 0:
-        raise RuntimeError("no common frames")
-    output_fps = float(args.fps or methods[0][1].fps or lq.fps)
+        raise RuntimeError("no common frame indices")
+
+    # Output FPS controls display speed only. It is never used to map input
+    # frame numbers. Explicit --fps is recommended for milestone comparisons.
+    output_fps = float(args.fps if args.fps is not None else lq.fps)
 
     panel_count = 1 + len(methods) + (1 if gt is not None else 0)
     columns = int(args.columns) if args.columns is not None else (3 if panel_count == 6 else 2)
+
+    print("Frame-index synchronization (FPS/timestamps ignored):", flush=True)
+    for label, source in sources:
+        print(
+            f"  {label}: frames={len(source)} native_fps={source.fps:.6g} "
+            f"kind={source.kind} path={source.path}",
+            flush=True,
+        )
+    print(
+        f"  comparing frame indices 0..{common - 1}; output playback fps={output_fps:.6g}",
+        flush=True,
+    )
 
     montage_writer = imageio.get_writer(
         str(output / "comparison.mp4"), fps=output_fps, codec="libx264",
@@ -298,6 +352,8 @@ def main() -> int:
 
     try:
         for index in range(common):
+            # Do not derive per-source indices from FPS. This single integer is
+            # the synchronization key for every source in this iteration.
             lq_up = _resize_rgb(lq.frame(index), target_w, target_h)
             method_frames = [("LQ Bicubic 3x", lq_up)] + [
                 (label, source.frame(index)) for label, source in methods
@@ -323,26 +379,42 @@ def main() -> int:
             writer.close()
 
     metadata = {
+        "alignment": {
+            "mode": "frame_index",
+            "description": "frame N is compared with frame N; source FPS/timestamps are ignored",
+            "common_frame_count": common,
+            "first_frame_index": 0,
+            "last_frame_index": common - 1,
+        },
         "lq": str(lq.path),
         "gt": None if gt is None else str(gt.path),
         "methods": [
-            {"label": label, "path": str(source.path), "kind": source.kind}
+            {
+                "label": label,
+                "path": str(source.path),
+                "kind": source.kind,
+                "frame_count": len(source),
+                "native_fps": source.fps,
+            }
             for label, source in methods
         ],
         "source_kinds": {label: source.kind for label, source in sources},
+        "source_frame_counts": frame_counts,
+        "source_native_fps": {label: source.fps for label, source in sources},
         "lq_resolution": [lq.width, lq.height],
         "target_resolution": [target_w, target_h],
         "scale_ratio": [target_w / lq.width, target_h / lq.height],
-        "frame_counts": frame_counts,
         "compared_frames": common,
-        "fps": output_fps,
+        "output_fps": output_fps,
         "selected_frames": sorted(selected),
         "crops": [list(crop) for crop in args.crop],
         "panel_width": args.panel_width,
         "panel_count": panel_count,
         "columns": columns,
     }
-    (output / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    (output / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+    )
     print(json.dumps(metadata, indent=2, sort_keys=True))
     return 0
 
