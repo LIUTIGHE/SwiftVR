@@ -289,7 +289,7 @@ def build_parser():
     p.add_argument("--resolution", type=_parse_resolution, default=(960, 540))
     p.add_argument("--upscale", type=int, default=3)
     p.add_argument("--clip-len", type=int, default=24)
-    p.add_argument("--max-frames", type=int, default=77)
+    p.add_argument("--max-frames", type=int, default=81)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", choices=tuple(DTYPES), default="bfloat16")
     p.add_argument(
