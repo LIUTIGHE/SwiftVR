@@ -115,8 +115,7 @@ class FrameSource:
                 raise ValueError(f"empty video: {self.path}")
             first = self._video_frame(0)
             self.height, self.width = first.shape[:2]
-            # Retain native FPS only for an optional output-FPS default and
-            # metadata. It must never participate in source-frame alignment.
+            # Native FPS is metadata only. It never affects source-frame alignment.
             try:
                 fps = float(self.reader.get_avg_fps())
                 if math.isfinite(fps) and fps > 0:
@@ -132,22 +131,22 @@ class FrameSource:
     def fps(self) -> float:
         return self._fps
 
-    def frame_number(self, index: int) -> int:
-        """Return the ordinal frame number used for synchronization."""
+    def _check_index(self, index: int) -> int:
+        index = int(index)
         if index < 0 or index >= len(self):
             raise IndexError(f"frame index {index} outside [0, {len(self)}) for {self.path}")
-        return int(index)
+        return index
 
     def _video_frame(self, index: int) -> np.ndarray:
-        # Integer VideoReader indexing is the decoded-frame ordinal. Do not use
-        # seek(), timestamps, FPS-derived positions, or time-based resampling.
+        # Integer VideoReader indexing addresses decoded frames by ordinal index.
+        # Never seek through timestamps or derive an index from FPS.
         value = self.reader[int(index)]
         if hasattr(value, "asnumpy"):
             value = value.asnumpy()
         return np.asarray(value, dtype=np.uint8)
 
     def frame(self, index: int) -> np.ndarray:
-        self.frame_number(index)
+        index = self._check_index(index)
         if self.kind == "video":
             return self._video_frame(index)
         with Image.open(self.files[index]) as image:
@@ -352,8 +351,7 @@ def main() -> int:
 
     try:
         for index in range(common):
-            # Do not derive per-source indices from FPS. This single integer is
-            # the synchronization key for every source in this iteration.
+            # This one ordinal index is the synchronization key for every input.
             lq_up = _resize_rgb(lq.frame(index), target_w, target_h)
             method_frames = [("LQ Bicubic 3x", lq_up)] + [
                 (label, source.frame(index)) for label, source in methods
