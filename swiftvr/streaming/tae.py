@@ -14,6 +14,21 @@ from ..models.reae import MemBlock, TPool, TGrow
 from .chunk import ChunkSpec, ChunkType
 
 
+def _is_causal_clip_adapter(block) -> bool:
+    """Return whether ``block`` follows the M9 causal clip-adapter contract.
+
+    Keep this as a tiny duck-typed bridge rather than importing an experiment
+    model into the generic streaming module. Two stacked k=3 causal temporal
+    convolutions have a five-frame receptive field, so four input frames must be
+    carried across chunk boundaries.
+    """
+
+    return (
+        type(block).__name__ == "CausalTemporalAdapter"
+        and callable(getattr(block, "forward_clip", None))
+    )
+
+
 def apply_parallel_with_boundary(model, x, state=None):
     """Run ``model`` (a Sequential of streaming blocks) over ``x``.
 
@@ -54,6 +69,23 @@ def apply_parallel_with_boundary(model, x, state=None):
                 x = b(_x[:, :n_full].reshape(N * n_full, C, H, W))
             else:
                 return None, new_state
+
+        elif _is_causal_clip_adapter(b):
+            NT, C, H, W = x.shape
+            T_ = NT // N
+            current = x.reshape(N, T_, C, H, W)
+            key = f"causal_clip_{i}"
+            history = state.get(key)
+            extended = (
+                torch.cat([history, current], dim=1)
+                if history is not None
+                else current
+            )
+            decoded = b.forward_clip(extended)
+            decoded = decoded[:, -T_:]
+            context = min(4, int(extended.shape[1]))
+            new_state[key] = extended[:, -context:].detach().clone()
+            x = decoded.reshape(NT, C, H, W)
 
         elif isinstance(b, TGrow):
             x = b(x)
