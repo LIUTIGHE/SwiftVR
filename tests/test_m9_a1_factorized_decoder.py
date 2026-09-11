@@ -10,6 +10,7 @@ from swiftvr.models.m9_factorized_decoder import (
     M9A1FactorizedReAEDecoder,
     m9_a1_compute_breakdown_1920x1088,
 )
+from swiftvr.streaming import StreamingTAE
 
 
 class M9A1FactorizedDecoderTest(unittest.TestCase):
@@ -37,6 +38,28 @@ class M9A1FactorizedDecoderTest(unittest.TestCase):
         self.assertEqual(tuple(y.shape[-2:]), (32, 32))
         self.assertGreaterEqual(float(y.min()), 0.0)
         self.assertLessEqual(float(y.max()), 1.0)
+
+    def test_whole_and_streaming_match_with_active_temporal_adapter(self):
+        torch.manual_seed(1)
+        model = M9A1FactorizedReAEDecoder().eval()
+        adapter = model.decoder[19]
+        self.assertIsInstance(adapter, CausalTemporalAdapter)
+        with torch.no_grad():
+            torch.nn.init.normal_(adapter.conv1.weight, mean=0.0, std=0.01)
+            torch.nn.init.normal_(adapter.conv2.weight, mean=0.0, std=0.01)
+            adapter.conv1.bias.zero_()
+            adapter.conv2.bias.zero_()
+
+        z = torch.randn(1, 4, 48, 2, 2)
+        with torch.no_grad():
+            whole = model(z, clamp=True)
+            stream = StreamingTAE(model)
+            first = stream.decode_chunk(z[:, :2])
+            second = stream.decode_chunk(z[:, 2:])
+            streamed = torch.cat([first, second], dim=1)
+
+        self.assertEqual(tuple(streamed.shape), tuple(whole.shape))
+        self.assertTrue(torch.allclose(streamed, whole, atol=1e-5, rtol=1e-5))
 
 
 if __name__ == "__main__":
