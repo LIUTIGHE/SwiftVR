@@ -15,6 +15,7 @@ import torch
 
 from swiftvr import SwiftVRPromptFreeNoTimePipeline
 from swiftvr.models import ReAE
+from swiftvr.models.m9_factorized_decoder import M9A1FactorizedReAEDecoder
 from swiftvr.models.reae_slim_decoder import SlimReAEDecoder
 from swiftvr.models.transformer_prompt_free_no_time import (
     WanTransformer3DModelPromptFreeNoTime,
@@ -57,14 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--decoder-type",
-        choices=("original", "slim"),
+        choices=("original", "slim", "m9a1"),
         default="original",
     )
     p.add_argument(
         "--decoder-checkpoint",
         type=Path,
         default=None,
-        help="SlimReAE tiny_decoder directory when --decoder-type=slim.",
+        help="Decoder checkpoint directory for --decoder-type=slim or m9a1.",
     )
     p.add_argument("--reae-filename", default="reae.safetensors")
     p.add_argument("--transformer-subfolder", default="transformer")
@@ -134,16 +135,25 @@ def _load_transformer(
     return transformer, kind
 
 
+def _validate_decoder_contract(decoder, pipe, label: str) -> None:
+    if int(decoder.latent_channels) != 48:
+        raise ValueError(f"Unexpected {label} latent channels: {decoder.latent_channels}")
+    if int(decoder.patch_size) != int(pipe.reae.patch_size):
+        raise ValueError(f"{label} patch size does not match base ReAE")
+    if int(decoder.frames_to_trim) != int(pipe.reae.frames_to_trim):
+        raise ValueError(f"{label} temporal trim does not match base ReAE")
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.clip_len <= 0 or args.clip_len % 4:
         raise ValueError("--clip-len must be a positive multiple of 4")
     if args.upscale <= 0:
         raise ValueError("--upscale must be positive")
-    if args.decoder_type == "slim" and args.decoder_checkpoint is None:
-        raise ValueError("--decoder-type=slim requires --decoder-checkpoint")
+    if args.decoder_type in ("slim", "m9a1") and args.decoder_checkpoint is None:
+        raise ValueError(f"--decoder-type={args.decoder_type} requires --decoder-checkpoint")
     if args.decoder_type == "original" and args.decoder_checkpoint is not None:
-        raise ValueError("--decoder-checkpoint is only valid with --decoder-type=slim")
+        raise ValueError("--decoder-checkpoint is only valid with --decoder-type=slim or m9a1")
 
     dtype = {
         "bfloat16": torch.bfloat16,
@@ -168,18 +178,24 @@ def main() -> int:
     decoder_description = "original_reae"
     if args.decoder_type == "slim":
         decoder_root = args.decoder_checkpoint.expanduser().resolve()
-        slim = SlimReAEDecoder.from_pretrained(
+        decoder = SlimReAEDecoder.from_pretrained(
             decoder_root,
             device="cpu",
             dtype=torch.float32,
         )
-        if int(slim.latent_channels) != 48:
-            raise ValueError(f"Unexpected SlimReAE latent channels: {slim.latent_channels}")
-        if int(slim.patch_size) != int(pipe.reae.patch_size):
-            raise ValueError("SlimReAE patch size does not match base ReAE")
-        if int(slim.frames_to_trim) != int(pipe.reae.frames_to_trim):
-            raise ValueError("SlimReAE temporal trim does not match base ReAE")
-        pipe.reae.decoder = slim.decoder
+        _validate_decoder_contract(decoder, pipe, "SlimReAE")
+        pipe.reae.decoder = decoder.decoder
+        pipe.tae_stream = StreamingTAE(pipe.reae)
+        decoder_description = str(decoder_root)
+    elif args.decoder_type == "m9a1":
+        decoder_root = args.decoder_checkpoint.expanduser().resolve()
+        decoder = M9A1FactorizedReAEDecoder.from_pretrained(
+            decoder_root,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        _validate_decoder_contract(decoder, pipe, "M9-A1")
+        pipe.reae.decoder = decoder.decoder
         pipe.tae_stream = StreamingTAE(pipe.reae)
         decoder_description = str(decoder_root)
 
