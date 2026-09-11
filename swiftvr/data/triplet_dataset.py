@@ -18,6 +18,8 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from swiftvr.training.input_pipeline import dataloader_worker_kwargs
+
 
 MEDIA_FIELDS = ("hr", "hq", "lr")
 
@@ -335,7 +337,8 @@ class TripletVideoDataset(Dataset):
     ``clip_length`` defaults to 17 and, by default, must satisfy ``T = 4k + 1``
     so it is compatible with SwiftVR's causal temporal pooling protocol.
     Spatial crop coordinates are sampled in HQ/LR space and multiplied by
-    ``scale`` for HR.
+    ``scale`` for HR. ``load_hq=False`` omits HQ decoding and the returned
+    ``hq`` tensor while preserving identical LR/HR view sampling.
     """
 
     def __init__(
@@ -347,6 +350,7 @@ class TripletVideoDataset(Dataset):
         clip_length: int = 17,
         crop_size: int | Sequence[int] | None = None,
         scale: int = 3,
+        load_hq: bool = True,
         horizontal_flip_probability: float = 0.5,
         vertical_flip_probability: float = 0.0,
         require_4k_plus_1: bool = True,
@@ -359,6 +363,7 @@ class TripletVideoDataset(Dataset):
         self.clip_length = int(clip_length)
         self.crop_size = _normalize_crop_size(crop_size)
         self.scale = int(scale)
+        self.load_hq = bool(load_hq)
         self.horizontal_flip_probability = float(horizontal_flip_probability)
         self.vertical_flip_probability = float(vertical_flip_probability)
         self.require_4k_plus_1 = bool(require_4k_plus_1)
@@ -367,7 +372,7 @@ class TripletVideoDataset(Dataset):
             raise ValueError(f"clip_length must be positive, got {self.clip_length}")
         if self.require_4k_plus_1 and self.clip_length % 4 != 1:
             raise ValueError(
-                f"SwiftVR clip_length must satisfy T=4k+1, got {self.clip_length}"
+                f"SwiftVR clip_length must satisfy T=4k+1, got T={self.clip_length}"
             )
         if self.scale <= 0:
             raise ValueError(f"scale must be positive, got {self.scale}")
@@ -438,21 +443,23 @@ class TripletVideoDataset(Dataset):
             record.frame_indices[position] for position in positions
         )
 
-        hq_size = _image_size(record.hq_paths[positions[0]])
         lr_size = _image_size(record.lr_paths[positions[0]])
         hr_size = _image_size(record.hr_paths[positions[0]])
-        if hq_size != lr_size:
-            raise ValueError(
-                f"{record.sample_id}: HQ/LR size mismatch: {hq_size} vs {lr_size}"
-            )
-        expected_hr_size = (hq_size[0] * self.scale, hq_size[1] * self.scale)
+        hq_size = lr_size
+        if self.load_hq:
+            hq_size = _image_size(record.hq_paths[positions[0]])
+            if hq_size != lr_size:
+                raise ValueError(
+                    f"{record.sample_id}: HQ/LR size mismatch: {hq_size} vs {lr_size}"
+                )
+        expected_hr_size = (lr_size[0] * self.scale, lr_size[1] * self.scale)
         if hr_size != expected_hr_size:
             raise ValueError(
                 f"{record.sample_id}: expected HR size {expected_hr_size} for "
                 f"scale={self.scale}, got {hr_size}"
             )
 
-        hq_box = self._spatial_crop(hq_size)
+        hq_box = self._spatial_crop(lr_size)
         top, left, crop_height, crop_width = hq_box
         hr_box = (
             top * self.scale,
@@ -461,12 +468,6 @@ class TripletVideoDataset(Dataset):
             crop_width * self.scale,
         )
 
-        hq = _load_clip(
-            record.hq_paths,
-            positions=positions,
-            expected_size=hq_size,
-            crop_box=hq_box,
-        )
         lr = _load_clip(
             record.lr_paths,
             positions=positions,
@@ -479,6 +480,14 @@ class TripletVideoDataset(Dataset):
             expected_size=hr_size,
             crop_box=hr_box,
         )
+        hq = None
+        if self.load_hq:
+            hq = _load_clip(
+                record.hq_paths,
+                positions=positions,
+                expected_size=hq_size,
+                crop_box=hq_box,
+            )
 
         horizontal_flip = (
             self.training
@@ -492,16 +501,17 @@ class TripletVideoDataset(Dataset):
         )
         if horizontal_flip:
             lr = torch.flip(lr, dims=(-1,))
-            hq = torch.flip(hq, dims=(-1,))
             hr = torch.flip(hr, dims=(-1,))
+            if hq is not None:
+                hq = torch.flip(hq, dims=(-1,))
         if vertical_flip:
             lr = torch.flip(lr, dims=(-2,))
-            hq = torch.flip(hq, dims=(-2,))
             hr = torch.flip(hr, dims=(-2,))
+            if hq is not None:
+                hq = torch.flip(hq, dims=(-2,))
 
-        return {
+        result: dict[str, object] = {
             "lr": lr,
-            "hq": hq,
             "hr": hr,
             "sample_id": record.sample_id,
             "record_uid": f"{record.variant}:{record.sample_id}",
@@ -516,6 +526,9 @@ class TripletVideoDataset(Dataset):
             "horizontal_flip": horizontal_flip,
             "vertical_flip": vertical_flip,
         }
+        if hq is not None:
+            result["hq"] = hq
+        return result
 
 
 def build_triplet_dataloader(
@@ -527,6 +540,7 @@ def build_triplet_dataloader(
     drop_last: bool | None = None,
     pin_memory: bool = True,
     persistent_workers: bool = True,
+    prefetch_factor: int = 2,
     seed: int = 0,
     **dataset_kwargs: object,
 ) -> tuple[TripletVideoDataset, DataLoader]:
@@ -535,9 +549,6 @@ def build_triplet_dataloader(
     dataset = TripletVideoDataset(manifests, **dataset_kwargs)
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    workers = int(num_workers)
-    if workers < 0:
-        raise ValueError(f"num_workers must be non-negative, got {workers}")
     if shuffle is None:
         shuffle = dataset.training
     if drop_last is None:
@@ -545,14 +556,18 @@ def build_triplet_dataloader(
 
     generator = torch.Generator()
     generator.manual_seed(int(seed))
+    worker_kwargs = dataloader_worker_kwargs(
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and int(num_workers) > 0,
+    )
     loader = DataLoader(
         dataset,
         batch_size=int(batch_size),
         shuffle=bool(shuffle),
         drop_last=bool(drop_last),
-        num_workers=workers,
         pin_memory=bool(pin_memory),
-        persistent_workers=bool(persistent_workers and workers > 0),
         generator=generator,
+        **worker_kwargs,
     )
     return dataset, loader
