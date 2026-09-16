@@ -110,6 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--panel-size", type=int, default=256)
     p.add_argument("--fps", type=float, default=6.0)
     p.add_argument("--verify-paths", action="store_true")
+    p.add_argument("--include-stagea-a1", action="store_true",
+                   help="Decode the exact Stage-A latents through A1 as an additional control.")
+    p.add_argument("--phase-report", action="store_true",
+                   help="Export every-frame errors grouped by four decoder phases.")
     return p
 
 
@@ -212,6 +216,7 @@ def _make_contact_sheet(
     output: Path,
     *,
     panel_size: int,
+    phase_labels: bool = False,
 ) -> None:
     band = 24
     width = panel_size * len(methods)
@@ -219,7 +224,11 @@ def _make_contact_sheet(
     sheet = Image.new("RGB", (width, height), "white")
     for row, frame_index in enumerate(frame_indices):
         for col, (label, video) in enumerate(methods):
-            tile = _labeled_tile(video[0, frame_index], label, panel_size)
+            tile_label = (
+                f"{label} t={frame_index} p={(frame_index + 3) % 4}"
+                if phase_labels else label
+            )
+            tile = _labeled_tile(video[0, frame_index], tile_label, panel_size)
             y = row * (panel_size + band)
             sheet.paste(tile, (col * panel_size, y))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -289,6 +298,7 @@ def _stagea_reference_pass(
     device: torch.device,
     dtype: torch.dtype,
     attention_backend: str,
+    latent_sink: list[torch.Tensor] | None = None,
 ):
     reae = ReAE(str(base_root / reae_filename)).to(device=device, dtype=dtype).eval()
     transformer = WanTransformer3DModelPromptFreeNoTime.from_pretrained(
@@ -338,6 +348,8 @@ def _stagea_reference_pass(
                 clamp=True,
             )
 
+        if latent_sink is not None:
+            latent_sink.append(z_stagea.detach().cpu())
         stagea_gt.update(stagea_rgb, target, clamp=True)
         references.append(stagea_rgb.float().cpu())
         targets.append(target.float().clamp(0, 1).cpu())
@@ -365,6 +377,7 @@ def _compressed_pass(
     decoder76_checkpoint: Path | None,
     device: torch.device,
     dtype: torch.dtype,
+    stagea_latents: list[torch.Tensor] | None = None,
 ):
     reae = ReAE(str(base_root / reae_filename)).to(device=device, dtype=dtype).eval()
     a1 = M9A1FactorizedReAEDecoder.from_pretrained(
@@ -388,6 +401,8 @@ def _compressed_pass(
     d76_gt = VideoMetricAccumulator() if decoder76 is not None else None
     d76_m8orig = VideoMetricAccumulator() if decoder76 is not None else None
 
+    stagea_a1_gt = VideoMetricAccumulator() if stagea_latents is not None else None
+    stagea_a1_orig = VideoMetricAccumulator() if stagea_latents is not None else None
     outputs: list[dict[str, torch.Tensor]] = []
     autocast_enabled = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -412,6 +427,11 @@ def _compressed_pass(
                 output_frames=int(target.shape[1]),
                 clamp=True,
             )
+            stagea_a1_rgb = (
+                a1(stagea_latents[sample_index].to(device=device, dtype=dtype),
+                   output_frames=int(target.shape[1]), clamp=True)
+                if stagea_latents is not None else None
+            )
             d76_rgb = (
                 decoder76(z_m8a, output_frames=int(target.shape[1]), clamp=True)
                 if decoder76 is not None
@@ -432,6 +452,10 @@ def _compressed_pass(
             "m8a_original": m8orig.float().cpu(),
             "m8a_m9a1": a1_rgb.float().cpu(),
         }
+        if stagea_a1_rgb is not None:
+            stagea_a1_gt.update(stagea_a1_rgb, target, clamp=True)
+            stagea_a1_orig.update(stagea_a1_rgb, stagea, clamp=True)
+            item["stagea_m9a1"] = stagea_a1_rgb.float().cpu()
         if d76_rgb is not None:
             item["m8a_decoder76"] = d76_rgb.float().cpu()
         outputs.append(item)
@@ -447,6 +471,10 @@ def _compressed_pass(
     if d76_gt is not None and d76_m8orig is not None:
         metrics["m8a_decoder76_vs_gt"] = _metric_dict(d76_gt)
         metrics["decoder76_vs_m8a_original_same_latent"] = _metric_dict(d76_m8orig)
+
+    if stagea_a1_gt is not None:
+        metrics["stagea_m9a1_vs_gt"] = _metric_dict(stagea_a1_gt)
+        metrics["stagea_m9a1_vs_stagea_original_same_latent"] = _metric_dict(stagea_a1_orig)
 
     reae.to("cpu")
     a1.to("cpu")
@@ -512,6 +540,7 @@ def main() -> int:
         flush=True,
     )
 
+    stagea_latents = [] if args.include_stagea_a1 else None
     stagea_refs, targets, lq_inputs, identities, stagea_metrics = _stagea_reference_pass(
         dataset,
         base_root=base_root,
@@ -521,6 +550,7 @@ def main() -> int:
         device=device,
         dtype=dtype,
         attention_backend=args.attention_backend,
+        latent_sink=stagea_latents,
     )
     compressed_outputs, compressed_metrics = _compressed_pass(
         dataset,
@@ -533,12 +563,17 @@ def main() -> int:
         decoder76_checkpoint=decoder76_checkpoint,
         device=device,
         dtype=dtype,
+        stagea_latents=stagea_latents,
     )
 
     all_metrics: dict[str, object] = {
         "stagea_original_vs_gt": stagea_metrics,
         **compressed_metrics,
     }
+
+    phase_rows = []
+    if args.phase_report:
+        from tools.m10_phase_metrics import val_phase_rows, write_val_phase_report
 
     for sample_index in range(len(dataset)):
         sample_root = output_root / f"sample_{sample_index:02d}"
@@ -549,10 +584,18 @@ def main() -> int:
             ("M8A+Orig", compressed_outputs[sample_index]["m8a_original"]),
             ("M8A+M9A1", compressed_outputs[sample_index]["m8a_m9a1"]),
         ]
+        if "stagea_m9a1" in compressed_outputs[sample_index]:
+            methods.insert(3, ("StageA+M9A1", compressed_outputs[sample_index]["stagea_m9a1"]))
         if "m8a_decoder76" in compressed_outputs[sample_index]:
             methods.append(
                 ("M8A+D76", compressed_outputs[sample_index]["m8a_decoder76"])
             )
+
+        if args.phase_report:
+            sample_rows = val_phase_rows(methods, sample_index=sample_index,
+                                         identity=identities[sample_index])
+            phase_rows.extend(sample_rows)
+            write_val_phase_report(sample_root, sample_rows)
 
         for label, video in methods:
             safe = (
@@ -572,6 +615,7 @@ def main() -> int:
             selected,
             sample_root / "contact_sheet.png",
             panel_size=args.panel_size,
+            phase_labels=args.phase_report,
         )
         comparison_dir = sample_root / "comparison_frames"
         _make_comparison_frames(
@@ -591,6 +635,9 @@ def main() -> int:
             encoding="utf-8",
         )
 
+    if args.phase_report:
+        write_val_phase_report(output_root, phase_rows)
+
     report = {
         "kind": "m9_val13_component_visual_comparison",
         "val_views": len(dataset),
@@ -604,6 +651,10 @@ def main() -> int:
             None if decoder76_checkpoint is None else str(decoder76_checkpoint)
         ),
         "metrics": all_metrics,
+        "include_stagea_a1": args.include_stagea_a1,
+        "phase_report": "phase_report.json" if args.phase_report else None,
+        "visual_fps": args.fps,
+        "visual_fps_role": "playback_only_not_source_cadence",
     }
     (output_root / "report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True),
