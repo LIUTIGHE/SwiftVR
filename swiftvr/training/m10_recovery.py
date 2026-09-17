@@ -26,7 +26,6 @@ class RecoveryWeights:
     hf_l1: float = 1.0
     hf_temporal_l1: float = 0.0
     router_balance: float = 0.01
-    lpips: float = 0.0  # opt-in R2; legacy objectives are unchanged
 
     def __post_init__(self) -> None:
         values = vars(self)
@@ -111,7 +110,6 @@ def recovery_objective(
     *,
     weights: RecoveryWeights,
     high_pass: GaussianHighPass,
-    perceptual_loss: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Teacher-only objective. GT is intentionally not accepted by this API."""
     sv, tv = output["velocity"].float(), teacher_velocity.detach().float()
@@ -125,19 +123,10 @@ def recovery_objective(
         **high_frequency_terms(output["prediction"], output["teacher_prediction"], high_pass),
         "router_balance": output["router_balance_loss"],
     }
-    if weights.lpips > 0 and perceptual_loss is None:
-        raise ValueError("Positive LPIPS weight requires a pretrained perceptual loss")
-    if perceptual_loss is not None:
-        if perceptual_loss.ndim != 0:
-            raise ValueError("perceptual_loss must be a scalar mean over all frames")
-        terms["lpips"] = perceptual_loss
     weighted = {f"weighted_{key}": value * getattr(weights, key) for key, value in terms.items()}
     # Keep the selection score identical for spatial and spatiotemporal gates.
     # It is a reproducible ranking aid, NOT a visual-quality pass/fail test.
     score = terms["rgb_l1"] + terms["hf_l1"] + terms["hf_temporal_l1"]
-    if perceptual_loss is not None:
-        # R2 ranks appearance fidelity, not HF/temporal error which can prefer blur.
-        score = weights.rgb_l1 * terms["rgb_l1"] + weights.lpips * perceptual_loss
     return {**terms, **weighted, "loss": sum(weighted.values()), "teacher_selection_score": score}
 
 

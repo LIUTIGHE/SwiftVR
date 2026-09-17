@@ -11,7 +11,6 @@ import argparse
 from contextlib import nullcontext
 from dataclasses import asdict
 import json
-import math
 from pathlib import Path
 import sys
 
@@ -51,11 +50,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-weight", type=float, default=1.0)
     p.add_argument("--hf-temporal-weight", type=float, default=0.0)
     p.add_argument("--router-balance-weight", type=float, default=0.01)
-    p.add_argument("--lpips-weight", type=float, default=0.0, help="Opt-in R2 perceptual recovery.")
-    p.add_argument("--alexnet-weights", type=Path, default=None, help="Local torchvision AlexNet .pth; default uses existing torch cache.")
-    p.add_argument("--lpips-microbatch-frames", type=int, default=4)
-    p.add_argument("--probe-loss-gradients", action="store_true", help="One rank0 training-microbatch dLoss/dVelocity check.")
-    p.add_argument("--visual-frame-indices", default="0,6,12")
     p.add_argument("--validate-every", type=int, default=250)
     p.add_argument("--save-every", type=int, default=250)
     p.add_argument("--log-every", type=int, default=10)
@@ -76,14 +70,6 @@ def _check_args(a) -> None:
         raise ValueError("lr-warmup-steps must be in [0,max-steps)")
     if a.learning_rate <= 0 or a.max_grad_norm <= 0 or not 0 < a.min_lr_ratio <= 1:
         raise ValueError("Invalid learning rate, clipping norm or minimum LR ratio")
-    if not math.isfinite(a.lpips_weight) or a.lpips_weight < 0 or a.lpips_microbatch_frames <= 0:
-        raise ValueError("Invalid LPIPS settings")
-    if a.probe_loss_gradients and a.lpips_weight <= 0:
-        raise ValueError("--probe-loss-gradients requires a positive --lpips-weight")
-    if isinstance(a.visual_frame_indices, str):
-        a.visual_frame_indices = tuple(int(v) for v in a.visual_frame_indices.split(","))
-    if not a.visual_frame_indices or min(a.visual_frame_indices) < 0:
-        raise ValueError("visual-frame-indices must contain nonnegative indices")
     if a.visual_samples < 0 or a.visual_fps <= 0:
         raise ValueError("Invalid visualization settings")
     for key in ("base_checkpoint", "student_init", "decoder_checkpoint", "teacher_cache", "val_teacher_cache", "output_dir", "path_root"):
@@ -122,8 +108,7 @@ def _clear_attention_caches() -> None:
 
 
 @torch.no_grad()
-def validate(closure, loader, cache, *, device, dtype, weights, high_pass, visual_samples,
-             perceptual=None, lpips_microbatch_frames=4):
+def validate(closure, loader, cache, *, device, dtype, weights, high_pass, visual_samples):
     from tools.smoke_training_forward import move_video_batch
     from swiftvr.training.stage3 import VideoMetricAccumulator
     from swiftvr.training.m10_recovery import recovery_objective
@@ -133,7 +118,6 @@ def validate(closure, loader, cache, *, device, dtype, weights, high_pass, visua
         "student_teacher", "student_gt", "teacher_gt", "backbone_original_teacher"
     )}
     sums, visuals, count = {}, [], 0
-    phases = {}
     _clear_attention_caches()
     try:
         for batch_cpu in loader:
@@ -141,15 +125,7 @@ def validate(closure, loader, cache, *, device, dtype, weights, high_pass, visua
             batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
             with torch.autocast("cuda", dtype=dtype, enabled=dtype == torch.bfloat16):
                 out = closure(batch, tv, include_original=True)
-                perceptual_values = None
-                if perceptual is not None:
-                    from swiftvr.training.m10_perceptual import lpips_frame_values, phase_totals
-                    perceptual_values = lpips_frame_values(perceptual, out["prediction"], out["teacher_prediction"],
-                                                           microbatch_frames=lpips_microbatch_frames)
-                    for key, value in phase_totals(out["prediction"], out["teacher_prediction"], perceptual_values).items():
-                        phases[key] = phases.get(key, 0.0) + value
-                terms = recovery_objective(out, tv, weights=weights, high_pass=high_pass,
-                                           perceptual_loss=None if perceptual_values is None else perceptual_values.mean())
+                terms = recovery_objective(out, tv, weights=weights, high_pass=high_pass)
             n = int(out["target"].shape[0])
             count += n
             for key, value in terms.items():
@@ -176,12 +152,6 @@ def validate(closure, loader, cache, *, device, dtype, weights, high_pass, visua
         raise RuntimeError("Empty validation dataset")
     result = {key: value / count for key, value in sums.items()}
     result["samples"] = count
-    for phase in range(4):
-        frames = int(phases.get(f"phase{phase}_frames", 0))
-        if frames:
-            result[f"phase{phase}_frames"] = frames
-            for metric in ("rgb_l1", "lpips"):
-                result[f"phase{phase}_{metric}"] = phases[f"phase{phase}_{metric}"] / frames
     for name, accumulator in metrics.items():
         result.update({f"{name}_{key}": value for key, value in accumulator.compute().items()})
     return result, visuals
@@ -204,7 +174,7 @@ def main() -> int:
     from swiftvr.training.reference import sha256_file
 
     weights = RecoveryWeights(a.velocity_nmse_weight, a.velocity_cosine_weight, a.rgb_weight,
-                              a.hf_weight, a.hf_temporal_weight, a.router_balance_weight, a.lpips_weight)
+                              a.hf_weight, a.hf_temporal_weight, a.router_balance_weight)
     rank, local_rank, world, device = data_tools.init_distributed()
     try:
         dtype = getattr(torch, a.dtype)
@@ -219,17 +189,6 @@ def main() -> int:
         train_set, val_set = _dataset(train_cache, path_root=a.path_root), _dataset(val_cache, path_root=a.path_root)
         val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0) if rank == 0 else None
 
-        perceptual, perceptual_info = None, None
-        if weights.lpips > 0:
-            from swiftvr.training.m10_perceptual import load_local_lpips
-            # Do not let random construction of frozen LPIPS perturb the train RNG.
-            with torch.random.fork_rng(devices=[]):
-                perceptual, perceptual_info = load_local_lpips(a.alexnet_weights)
-            perceptual.to(device=device, dtype=torch.float32).requires_grad_(False).eval()
-            perceptual_info.update({
-                "alexnet_sha256": sha256_file(Path(perceptual_info["alexnet_weights"])),
-                "calibration_sha256": sha256_file(Path(perceptual_info["lpips_calibration"])),
-            })
         reae = ReAE(str(a.base_checkpoint / "reae.safetensors")).to(device=device, dtype=dtype)
         decoder = M9A1FactorizedReAEDecoder.from_pretrained(a.decoder_checkpoint, device=device, dtype=dtype)
         transformer = WanTransformer3DModelPromptFreeNoTimeMoE.from_pretrained(
@@ -275,11 +234,6 @@ def main() -> int:
             "visual_fps_role": "playback_only_not_source_cadence",
             "checkpoint_type": "weights_only; --student-init warm start resets optimizer/LR",
         }
-        if perceptual is not None:
-            config.update({"trainer": "m10_r2_perceptual_recovery_v1", "recipe": "perceptual_r2",
-                           "perceptual": perceptual_info,
-                           "selection": "weighted RGB L1 + weighted LPIPS; no GT; visual gate required",
-                           "phase_diagnostics": "teacher-relative RGB/LPIPS; exclude local t0; not absolute phase quality"})
         if rank == 0:
             a.output_dir.mkdir(parents=True, exist_ok=True)
             base._write_json(a.output_dir / "run_config.json", config)
@@ -301,12 +255,11 @@ def main() -> int:
             dist.barrier()
             if rank == 0:
                 result, visuals = validate(closure, val_loader, val_cache, device=device, dtype=dtype,
-                                           weights=weights, high_pass=high_pass, visual_samples=a.visual_samples,
-                                           perceptual=perceptual, lpips_microbatch_frames=a.lpips_microbatch_frames)
+                                           weights=weights, high_pass=high_pass, visual_samples=a.visual_samples)
                 append_jsonl(a.output_dir / "val_log.jsonl", {"global_step": step, **result})
                 if visuals:
                     report = export_validation_visuals(visuals, output_root=a.output_dir, step=step,
-                                                       frame_indices=a.visual_frame_indices, fps=a.visual_fps)
+                                                       frame_indices=(0, 6, 12), fps=a.visual_fps)
                     if report["video_errors"]:
                         print("Visual video warnings: " + json.dumps(report["video_errors"]), flush=True)
                 path = save_snapshot(step, result) if step else a.student_init
@@ -317,8 +270,7 @@ def main() -> int:
                     base._write_json(a.output_dir / "best.json", best)
                 print(f"[val step={step}] deploy/StageA PSNR={result['student_teacher_psnr']:.4f} "
                       f"backbone+Orig/StageA PSNR={result['backbone_original_teacher_psnr']:.4f} "
-                      f"HF={result['hf_l1']:.6g} HF-temporal={result['hf_temporal_l1']:.6g}"
-                      + (f" LPIPS={result['lpips']:.6g}" if "lpips" in result else ""), flush=True)
+                      f"HF={result['hf_l1']:.6g} HF-temporal={result['hf_temporal_l1']:.6g}", flush=True)
             dist.barrier()
 
         run_validation(0)
@@ -353,24 +305,11 @@ def main() -> int:
                             out = ddp(batch, tv)
                             if not out["prediction"].requires_grad:
                                 raise RuntimeError("Frozen decoder severed the RGB gradient path")
-                            perceptual_loss = None
-                            if perceptual is not None:
-                                from swiftvr.training.m10_perceptual import lpips_frame_values
-                                perceptual_loss = lpips_frame_values(
-                                    perceptual, out["prediction"], out["teacher_prediction"],
-                                    microbatch_frames=a.lpips_microbatch_frames).mean()
-                            terms = recovery_objective(out, tv, weights=weights, high_pass=high_pass,
-                                                       perceptual_loss=perceptual_loss)
+                            terms = recovery_objective(out, tv, weights=weights, high_pass=high_pass)
                         bad = (~torch.isfinite(terms["loss"].detach())).to(torch.int32)
                         dist.all_reduce(bad, op=dist.ReduceOp.MAX)
                         if bool(bad):
                             raise FloatingPointError("Non-finite M10 loss on at least one rank")
-                        if a.probe_loss_gradients and step == 0 and micro == 0 and rank == 0:
-                            from swiftvr.training.m10_perceptual import loss_gradient_probe
-                            probe = loss_gradient_probe(terms, out["velocity"])
-                            probe["loss_weights"] = asdict(weights)
-                            base._write_json(a.output_dir / "gradient_probe.json", probe)
-                            print("[R2 gradient probe] " + json.dumps(probe), flush=True)
                         (terms["loss"] / len(micro_batches)).backward()
                     for key, value in terms.items():
                         sums[key] = sums.get(key, 0.0) + float(value.detach()) / len(micro_batches)
@@ -379,16 +318,7 @@ def main() -> int:
                 if gradients["nonfinite_elements"] or gradients["forbidden_missing"] or not gradients["gradient_tensors"]:
                     raise RuntimeError("M10 gradient contract failed: " + json.dumps(gradients))
                 torch.nn.utils.clip_grad_norm_(transformer.parameters(), a.max_grad_norm, error_if_nonfinite=True)
-                head_before = transformer.proj_out.weight.detach().clone() if perceptual is not None and step == 0 and rank == 0 else None
                 optimizer.step()
-                if head_before is not None:
-                    delta = (transformer.proj_out.weight.detach() - head_before).float()
-                    update = {"scope": "proj_out.weight after first optimizer step, not all parameters",
-                              "update_l2": float(delta.norm()),
-                              "relative_update_l2": float(delta.norm() / head_before.float().norm().clamp_min(1e-12))}
-                    base._write_json(a.output_dir / "first_update.json", update)
-                    if not bool(torch.isfinite(delta).all()) or not bool(delta.abs().sum() > 0):
-                        raise RuntimeError("R2 first output-head update is nonfinite or zero")
                 step += 1
                 if step == 1 or step % a.log_every == 0:
                     keys = sorted(sums)
