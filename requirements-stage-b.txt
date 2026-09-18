@@ -1,0 +1,3 @@
+# Stage-B structural-compression training dependencies.
+# Kept separate from the core SwiftVR inference environment.
+lpips==0.1.4

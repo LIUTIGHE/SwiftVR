@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Run heuristic and selected L20 masks with the original M8-A DDP recipe.
+
+This is the long-budget confirmation after mask search. It intentionally reuses
+the historical M8-A training teacher/protocol (D1536 TA -> Stage-A validation),
+not the short Stage-A-direct search-recovery recipe.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def completed(run: Path, steps: int) -> bool:
+    summary = run / "summary.json"
+    if not summary.is_file():
+        return False
+    data = read_json(summary)
+    return int(data.get("global_step", -1)) >= int(steps)
+
+
+def add_repeat(command: list[str], flag: str, values) -> None:
+    for value in values:
+        command.extend([flag, str(value)])
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--selection-work", type=Path,
+                   default=Path("outputs/b2b/m10_layer_selection_v1"))
+    p.add_argument("--reference-run", type=Path,
+                   default=Path("outputs/b2b/m8a_d1024_l20_gate200k"))
+    p.add_argument("--output-root", type=Path,
+                   default=Path("outputs/b2b/m10_layer_fullbudget_v1"))
+    p.add_argument("--gpus", default="4,5,6,7")
+    p.add_argument("--steps", type=int, default=60000,
+                   help="Optimizer updates PER mask. 60k = 2x the mature M8-A30k checkpoint budget.")
+    p.add_argument("--lr-schedule-total-steps", type=int, default=200000,
+                   help="Preserve the original long-run cosine horizon while stopping at --steps.")
+    p.add_argument("--validate-every", type=int, default=5000)
+    p.add_argument("--save-every", type=int, default=15000)
+    p.add_argument("--visualize-every", type=int, default=15000)
+    args = p.parse_args()
+
+    if min(args.steps, args.lr_schedule_total_steps, args.validate_every,
+           args.save_every, args.visualize_every) <= 0:
+        raise ValueError("Step/schedule intervals must be positive")
+    if args.steps > args.lr_schedule_total_steps:
+        raise ValueError("--steps cannot exceed --lr-schedule-total-steps")
+
+    selection_path = args.selection_work.expanduser().resolve() / "selection.json"
+    reference_path = args.reference_run.expanduser().resolve() / "run_config.json"
+    selection = read_json(selection_path)
+    reference = read_json(reference_path)
+
+    selected = selection["selected"]
+    candidates = selection["candidates"]
+    heuristic = next(c for c in candidates if c["id"] == "heuristic")
+    selected_record = next(c for c in candidates if c["id"] == selected["id"])
+    pair = [("heuristic", heuristic), ("selected", selected_record)]
+    if heuristic["kept_source_blocks"] == selected_record["kept_source_blocks"]:
+        raise ValueError("Locked masks are identical")
+
+    # This run is meant to reproduce the actual M8-A architecture-training protocol.
+    expected = {
+        "world_size": 4,
+        "local_batch_size": 16,
+        "gradient_accumulation_steps": 1,
+        "global_effective_batch_size": 64,
+        "learning_rate": 2e-5,
+        "lr_warmup_steps": 100,
+        "training_teacher": "b2a_d1536_teaching_assistant",
+        "training_teacher_cache_kind": "swiftvr_b2b_d1536_ta_velocity",
+        "validation_teacher": "stage_a_d3072_reference",
+    }
+    mismatch = {k: (reference.get(k), v) for k, v in expected.items()
+                if reference.get(k) != v}
+    if mismatch:
+        raise ValueError(
+            "Reference M8-A run_config does not match the known long-run protocol: "
+            + json.dumps(mismatch, indent=2)
+        )
+    if int(reference["global_effective_batch_size"]) != (
+        int(reference["world_size"])
+        * int(reference["local_batch_size"])
+        * int(reference["gradient_accumulation_steps"])
+    ):
+        raise ValueError("Reference global batch accounting is inconsistent")
+    if not reference.get("manifests") or not reference.get("val_manifests"):
+        raise ValueError("Reference run_config is missing train/validation manifests")
+
+    gpu_ids = [x.strip() for x in args.gpus.split(",") if x.strip()]
+    if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
+        raise ValueError("--gpus must contain exactly four distinct IDs")
+    output_root = args.output_root.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    plan = {
+        "kind": "m10_layer_masks_fullbudget_m8a_protocol_v1",
+        "selection": str(selection_path),
+        "reference_run_config": str(reference_path),
+        "physical_gpus": gpu_ids,
+        "per_mask_steps": args.steps,
+        "mature_m8a_reference_step": 30000,
+        "lr_schedule_total_steps": args.lr_schedule_total_steps,
+        "reference_protocol": expected,
+        "teacher_cache": reference["teacher_cache"],
+        "val_teacher_cache": reference["val_teacher_cache"],
+        "masks": {
+            role: {
+                "id": record["id"],
+                "init_checkpoint": record["init_checkpoint"],
+                "kept_source_blocks": record["kept_source_blocks"],
+            }
+            for role, record in pair
+        },
+        "note": (
+            "Heuristic and selected are trained sequentially with identical M8-A "
+            "DDP protocol. 30k is the matched mature-M8A checkpoint budget; 60k "
+            "default is a 2x update budget. LR follows the original 200k horizon."
+        ),
+    }
+    plan_path = output_root / "longrun_plan.json"
+    if plan_path.exists():
+        if read_json(plan_path) != plan:
+            raise ValueError(f"Existing plan differs: {plan_path}")
+    else:
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+    env.setdefault("OMP_NUM_THREADS", "1")
+
+    for role, record in pair:
+        run = output_root / role
+        if completed(run, args.steps):
+            print(f"[skip] {role} already completed >= {args.steps} steps: {run}", flush=True)
+            continue
+        if run.exists() and any(run.iterdir()):
+            raise FileExistsError(
+                f"Incomplete/nonempty run exists: {run}. Do not mix or overwrite long-run results."
+            )
+
+        cmd = [
+            sys.executable, "-m", "torch.distributed.run",
+            "--standalone", "--nproc_per_node=4",
+            str(ROOT / "tools/train_b2b_moe_ta_distill_ddp_cache_safe.py"),
+            "--architecture", "m8-d1024-l20",
+            "--lr-schedule-total-steps", str(args.lr_schedule_total_steps),
+            "--base-checkpoint", reference["base_checkpoint"],
+            "--student-init", str(Path(record["init_checkpoint"]).expanduser().resolve()),
+            "--teacher-cache", reference["teacher_cache"],
+            "--val-teacher-cache", reference["val_teacher_cache"],
+            "--path-root", ".",
+            "--clip-length", str(reference["clip_length"]),
+            "--crop-size", str(reference["crop_size"]),
+            "--scale", str(reference["scale"]),
+            "--views-per-record", str(reference["views_per_record"]),
+            "--view-seed", str(reference["view_seed"]),
+            "--batch-size", str(reference["local_batch_size"]),
+            "--gradient-accumulation-steps", str(reference["gradient_accumulation_steps"]),
+            "--expected-global-batch-size", str(reference["global_effective_batch_size"]),
+            "--learning-rate", str(reference["learning_rate"]),
+            "--lr-warmup-steps", str(reference["lr_warmup_steps"]),
+            "--min-lr-ratio", str(reference["min_lr_ratio"]),
+            "--velocity-mse-weight", str(reference["velocity_mse_weight"]),
+            "--velocity-cosine-weight", str(reference["velocity_cosine_weight"]),
+            "--router-balance-weight", str(reference["router_balance_weight"]),
+            "--dtype", reference["runtime_dtype"],
+            "--attention-backend", "sdpa",
+            "--max-steps", str(args.steps),
+            "--validate-every", str(args.validate_every),
+            "--save-every", str(args.save_every),
+            "--visualize-every", str(args.visualize_every),
+            "--visual-validation-samples", "13",
+            "--visual-frame-indices", "0,1,2,3,4,5,6,7,8,9,10,11,12",
+            "--visual-video-fps", "30",
+            "--validate-at-start",
+            "--pin-memory",
+            "--num-workers", "0",
+            "--seed", "0",
+            "--no-tensorboard",
+            "--output-dir", str(run),
+        ]
+        add_repeat(cmd, "--manifest", reference["manifests"])
+        add_repeat(cmd, "--val-manifest", reference["val_manifests"])
+
+        print("\n[launch]", role, flush=True)
+        print(" ".join(cmd), flush=True)
+        subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
+
+    print(f"Both long runs completed. Results: {output_root}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
