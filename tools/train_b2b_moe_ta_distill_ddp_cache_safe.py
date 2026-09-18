@@ -26,6 +26,7 @@ indices in the normal autograd context on rank 0, matching ranks 1..N.
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -55,6 +56,7 @@ _original_write_json = trainer.base._write_json
 _original_save_snapshot = trainer.base._save_snapshot
 _STAGE_A_REFINE_FLAG = "--stage-a-refine"
 _ARCHITECTURE_FLAG = "--architecture"
+_LR_SCHEDULE_TOTAL_STEPS_FLAG = "--lr-schedule-total-steps"
 
 
 def _clear_window_caches() -> None:
@@ -80,6 +82,38 @@ def _consume_stage_a_refine_flag() -> bool:
         return False
     sys.argv.remove(_STAGE_A_REFINE_FLAG)
     return True
+
+
+def _consume_lr_schedule_total_steps() -> int | None:
+    """Consume an optional LR horizon independent of the training stop step."""
+
+    values: list[str] = []
+    retained = [sys.argv[0]]
+    index = 1
+    while index < len(sys.argv):
+        token = sys.argv[index]
+        if token == _LR_SCHEDULE_TOTAL_STEPS_FLAG:
+            if index + 1 >= len(sys.argv):
+                raise ValueError(f"{_LR_SCHEDULE_TOTAL_STEPS_FLAG} requires a value")
+            values.append(sys.argv[index + 1])
+            index += 2
+            continue
+        prefix = _LR_SCHEDULE_TOTAL_STEPS_FLAG + "="
+        if token.startswith(prefix):
+            values.append(token[len(prefix) :])
+            index += 1
+            continue
+        retained.append(token)
+        index += 1
+    if len(values) > 1:
+        raise ValueError(f"{_LR_SCHEDULE_TOTAL_STEPS_FLAG} may be specified at most once")
+    sys.argv[:] = retained
+    if not values:
+        return None
+    total = int(values[0])
+    if total <= 0:
+        raise ValueError(f"{_LR_SCHEDULE_TOTAL_STEPS_FLAG} must be positive")
+    return total
 
 
 def _consume_architecture() -> str:
@@ -171,6 +205,57 @@ def _configure_architecture(architecture: str) -> None:
     trainer.base._save_snapshot = save_snapshot
 
 
+def _configure_lr_schedule_total_steps(total_steps: int | None) -> None:
+    """Optionally keep the original long-run cosine horizon while stopping earlier."""
+
+    if total_steps is None:
+        return
+    current_write_json = trainer.base._write_json
+    current_save_snapshot = trainer.base._save_snapshot
+
+    def lr_for_step(args, step: int) -> float:
+        if total_steps <= int(args.lr_warmup_steps):
+            raise ValueError(
+                "lr-schedule-total-steps must exceed lr-warmup-steps"
+            )
+        base = float(args.learning_rate)
+        if args.lr_warmup_steps and step <= args.lr_warmup_steps:
+            return base * step / args.lr_warmup_steps
+        span = max(total_steps - int(args.lr_warmup_steps), 1)
+        progress = min(
+            max((step - int(args.lr_warmup_steps)) / span, 0.0),
+            1.0,
+        )
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base * (
+            float(args.min_lr_ratio)
+            + (1.0 - float(args.min_lr_ratio)) * cosine
+        )
+
+    def write_json(path: Path, value) -> None:
+        payload = dict(value) if isinstance(value, dict) else value
+        if isinstance(payload, dict):
+            name = Path(path).name
+            if name == "run_config.json":
+                payload["lr_schedule_total_steps"] = int(total_steps)
+                payload["lr_schedule_stop_decoupled"] = True
+            elif name in {"best.json", "summary.json"}:
+                payload["lr_schedule_total_steps"] = int(total_steps)
+        current_write_json(path, payload)
+
+    def save_snapshot(*args, **kwargs):
+        metadata = kwargs.get("metadata")
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata["lr_schedule_total_steps"] = int(total_steps)
+            kwargs["metadata"] = metadata
+        return current_save_snapshot(*args, **kwargs)
+
+    trainer.base._lr_for_step = lr_for_step
+    trainer.base._write_json = write_json
+    trainer.base._save_snapshot = save_snapshot
+
+
 def _configure_stage_a_refinement() -> None:
     """Retarget only the M5 training teacher from D1536 TA to Stage-A D3072."""
 
@@ -210,6 +295,7 @@ def _configure_stage_a_refinement() -> None:
 def main() -> int:
     architecture = _consume_architecture()
     stage_a_refine = _consume_stage_a_refine_flag()
+    lr_schedule_total_steps = _consume_lr_schedule_total_steps()
     if stage_a_refine and architecture != M5_MOE_ARCHITECTURE:
         raise ValueError(
             "--stage-a-refine is intentionally restricted to m5-d1024-l30; "
@@ -218,6 +304,7 @@ def main() -> int:
 
     trainer.base.validate_rank0 = _validate_rank0_cache_safe
     _configure_architecture(architecture)
+    _configure_lr_schedule_total_steps(lr_schedule_total_steps)
     if stage_a_refine:
         _configure_stage_a_refinement()
         print(
@@ -232,6 +319,12 @@ def main() -> int:
     elif architecture == M8_MOE_ARCHITECTURE:
         print(
             "[M8-A] D1024/H8/L20 1S12E2A enabled: training teacher = D1536 TA",
+            flush=True,
+        )
+    if lr_schedule_total_steps is not None:
+        print(
+            f"[schedule] cosine LR horizon={lr_schedule_total_steps} "
+            "(independent of --max-steps)",
             flush=True,
         )
     return trainer.main()
