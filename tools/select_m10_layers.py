@@ -58,6 +58,8 @@ def build_parser():
     for s in (screen, recover, validate):
         s.add_argument("--work-dir", type=Path, required=True)
         s.add_argument("--device", default="cuda")
+    from tools.m10_layer_confirmation import add_arguments
+    add_arguments(sub)
     return p
 
 
@@ -513,7 +515,11 @@ def main():
     dtype_name = a.dtype if a.stage == "screen" else read_json(a.work_dir / "run_config.json")["dtype"]
     if dtype_name == "bfloat16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 mode requires a BF16-capable GPU")
-    {"screen": screen, "recover": recover, "validate": validate}[a.stage](a, device)
+    if a.stage == "confirm":
+        from tools.m10_layer_confirmation import run
+        run(a, device)
+    else:
+        {"screen": screen, "recover": recover, "validate": validate}[a.stage](a, device)
     return 0
 
 

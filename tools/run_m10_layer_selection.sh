@@ -5,11 +5,11 @@ cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${1:-screen}"
 if [[ $# -gt 0 ]]; then shift; fi
 WORK="${WORK:-outputs/b2b/m10_layer_selection_v1}"
-if [[ "$STAGE" == recover || "$STAGE" == validate ]]; then
+if [[ "$STAGE" == recover || "$STAGE" == validate || "$STAGE" == confirm ]]; then
   exec python tools/select_m10_layers.py "$STAGE" --work-dir "$WORK" "$@"
 fi
 if [[ "$STAGE" != screen ]]; then
-  echo 'Usage: bash tools/run_m10_layer_selection.sh screen|recover|validate [arguments]' >&2
+  echo 'Usage: bash tools/run_m10_layer_selection.sh screen|recover|validate|confirm [arguments]' >&2
   exit 2
 fi
 BASE="${BASE:-checkpoints_prompt_free_no_time}"
