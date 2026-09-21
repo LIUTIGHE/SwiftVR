@@ -131,6 +131,28 @@ def _gradient_summary_allow_sparse_experts(module) -> dict[str, object]:
     }
 
 
+def _gradient_presence_allow_sparse_experts(module) -> dict[str, object]:
+    """Cheap missing-gradient audit for BF16/FP32; norm/finite check happens once."""
+    gradient_tensors = 0
+    forbidden_missing: list[str] = []
+    allowed_missing: list[str] = []
+    for name, parameter in trainable_named_parameters(module):
+        if parameter.grad is None:
+            if ".ffn.experts." in name:
+                allowed_missing.append(name)
+            else:
+                forbidden_missing.append(name)
+        else:
+            gradient_tensors += 1
+    return {
+        "gradient_tensors": gradient_tensors,
+        "allowed_missing_sparse_experts": len(allowed_missing),
+        "allowed_missing_examples": allowed_missing[:8],
+        "forbidden_missing": len(forbidden_missing),
+        "forbidden_missing_examples": forbidden_missing[:8],
+    }
+
+
 def _router_metrics_from_counts(counts: list[float], assignments: float, mean_entropy: float) -> dict[str, float]:
     fractions = [value / max(assignments, 1.0) for value in counts]
     mean = sum(fractions) / len(fractions)
@@ -489,28 +511,56 @@ def main() -> int:
                     scale_before = float(scaler.get_scale())
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
-                    gradients = _gradient_summary_allow_sparse_experts(closure)
-                    if int(gradients["gradient_tensors"]) == 0:
-                        raise RuntimeError("Backward produced no trainable gradients")
-                    if int(gradients["forbidden_missing"]) != 0:
-                        raise RuntimeError(f"Missing non-expert gradients: {gradients['forbidden_missing_examples']}")
+                    if scaler.is_enabled():
+                        gradients = _gradient_summary_allow_sparse_experts(closure)
+                        if int(gradients["gradient_tensors"]) == 0:
+                            raise RuntimeError("Backward produced no trainable gradients")
+                        if int(gradients["forbidden_missing"]) != 0:
+                            raise RuntimeError(
+                                f"Missing non-expert gradients: {gradients['forbidden_missing_examples']}"
+                            )
+                        local_nonfinite = int(gradients["nonfinite_elements"])
+                        grad_norm = float("nan")
+                        if local_nonfinite == 0:
+                            grad_norm = float(gradients["global_l2"])
+                            if args.max_grad_norm > 0:
+                                grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                                    [parameter for _, parameter in trainable_named_parameters(closure)],
+                                    max_norm=args.max_grad_norm,
+                                    error_if_nonfinite=True,
+                                ).float().item())
+                    else:
+                        gradients = _gradient_presence_allow_sparse_experts(closure)
+                        if int(gradients["gradient_tensors"]) == 0:
+                            raise RuntimeError("Backward produced no trainable gradients")
+                        if int(gradients["forbidden_missing"]) != 0:
+                            raise RuntimeError(
+                                f"Missing non-expert gradients: {gradients['forbidden_missing_examples']}"
+                            )
+                        parameters = [
+                            parameter for _, parameter in trainable_named_parameters(closure)
+                            if parameter.grad is not None
+                        ]
+                        clip_limit = args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
+                        norm_tensor = torch.nn.utils.clip_grad_norm_(
+                            parameters,
+                            max_norm=clip_limit,
+                            error_if_nonfinite=False,
+                        )
+                        local_nonfinite = int(not bool(torch.isfinite(norm_tensor).item()))
+                        grad_norm = (
+                            float(norm_tensor.float().item())
+                            if local_nonfinite == 0
+                            else float("nan")
+                        )
 
-                    local_nonfinite = int(gradients["nonfinite_elements"])
-                    nonfinite_flag = torch.tensor([1 if local_nonfinite else 0], device=device, dtype=torch.int32)
+                    nonfinite_flag = torch.tensor(
+                        [1 if local_nonfinite else 0], device=device, dtype=torch.int32
+                    )
                     dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
                     global_nonfinite = int(nonfinite_flag.item()) != 0
                     if global_nonfinite and not scaler.is_enabled():
                         raise FloatingPointError("Non-finite gradients without FP16 GradScaler")
-
-                    grad_norm = float("nan")
-                    if not global_nonfinite:
-                        grad_norm = float(gradients["global_l2"])
-                        if args.max_grad_norm > 0:
-                            grad_norm = float(torch.nn.utils.clip_grad_norm_(
-                                [parameter for _, parameter in trainable_named_parameters(closure)],
-                                max_norm=args.max_grad_norm,
-                                error_if_nonfinite=True,
-                            ).float().item())
 
                     if scaler.is_enabled():
                         scaler.step(optimizer)
