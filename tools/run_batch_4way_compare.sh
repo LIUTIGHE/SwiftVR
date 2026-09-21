@@ -27,6 +27,7 @@ ATTN="${ATTN:-sdpa}"
 QUALITY="${QUALITY:-95}"
 QUEUE_SIZE="${QUEUE_SIZE:-2}"
 FFMPEG_PRESET="${FFMPEG_PRESET:-}"
+BASIC_ALIGN="${BASIC_ALIGN:-auto}"
 BASIC_INDEX_SCALE="${BASIC_INDEX_SCALE:-2}"
 BASIC_INDEX_OFFSET="${BASIC_INDEX_OFFSET:-0}"
 COMPARE_PIX_FMT="${COMPARE_PIX_FMT:-yuv444p}"
@@ -155,6 +156,7 @@ run_one() {
     --original "$out/original_swiftvr.mp4" \
     --ours "$out/ours.mp4" \
     --output-dir "$out/compare" \
+    --basiccnn-align "$BASIC_ALIGN" \
     --basiccnn-index-scale "$BASIC_INDEX_SCALE" \
     --basiccnn-index-offset "$BASIC_INDEX_OFFSET" \
     --pix-fmt "$COMPARE_PIX_FMT"
