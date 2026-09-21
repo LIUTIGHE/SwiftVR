@@ -6,8 +6,12 @@ Outputs:
   * quadrant.mp4: 2x2 layout within the target W x H canvas.
   * vertical_quarters.mp4: full-height quarter-width slices, preserving W x H.
 
-BasicCNN can use N*scale+offset frame mapping (historically scale=2).
-Source FPS/timestamps are never used for alignment.
+BasicCNN alignment defaults to the Ours output timeline:
+  * same frame count -> identity mapping;
+  * more BasicCNN frames -> normalized-time downsampling with aligned endpoints;
+  * fewer BasicCNN frames -> error by default (do not silently duplicate frames).
+Manual N*scale+offset mapping remains available for exact known baselines.
+Source FPS/timestamps are reported but never used to choose corresponding frames.
 """
 from __future__ import annotations
 
@@ -27,6 +31,22 @@ from tools.compare_720p3x_outputs import FrameSource, _logical_frame_count, _res
 
 
 LABELS = ("LQ", "Basic CNN", "Original SwiftVR", "Ours")
+
+
+def _auto_basic_index(index: int, *, basic_count: int, reference_count: int) -> int:
+    """Map an Ours timeline index to BasicCNN by normalized ordinal time."""
+    if reference_count <= 0 or basic_count <= 0:
+        raise ValueError("frame counts must be positive")
+    if not 0 <= index < reference_count:
+        raise IndexError(index)
+    if basic_count < reference_count:
+        raise ValueError(
+            f"BasicCNN has fewer frames than Ours: {basic_count} < {reference_count}; "
+            "refusing to duplicate/interpolate missing BasicCNN frames"
+        )
+    if basic_count == reference_count or reference_count == 1:
+        return index if basic_count == reference_count else 0
+    return int(round(index * (basic_count - 1) / (reference_count - 1)))
 
 
 def _draw_label(frame: np.ndarray, text: str) -> np.ndarray:
@@ -95,6 +115,12 @@ def main() -> int:
     p.add_argument("--original", type=Path, required=True)
     p.add_argument("--ours", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--basiccnn-align",
+        choices=("auto", "manual"),
+        default="auto",
+        help="auto: align BasicCNN to Ours by normalized frame timeline; manual: use N*scale+offset",
+    )
     p.add_argument("--basiccnn-index-scale", type=int, default=2)
     p.add_argument("--basiccnn-index-offset", type=int, default=0)
     p.add_argument("--fps", type=float, default=None)
@@ -123,17 +149,58 @@ def main() -> int:
                 f"Original {width}x{height}"
             )
 
-    logical_counts = (
-        len(lq),
-        _logical_frame_count(basic, args.basiccnn_index_scale, args.basiccnn_index_offset),
-        len(original),
-        len(ours),
-    )
-    common = min(logical_counts)
+    reference_count = len(ours)
+    if reference_count <= 0:
+        raise RuntimeError("Ours output is empty")
+    if len(lq) != reference_count:
+        raise ValueError(
+            f"LQ/Ours frame-count mismatch: LQ={len(lq)} Ours={reference_count}; "
+            "refusing to resample the reference input timeline"
+        )
+    if len(original) != reference_count:
+        raise ValueError(
+            f"Original/Ours frame-count mismatch: Original={len(original)} "
+            f"Ours={reference_count}; refusing to hide SwiftVR frame-count drift"
+        )
+
+    if args.basiccnn_align == "auto":
+        if len(basic) < reference_count:
+            raise ValueError(
+                f"BasicCNN has fewer frames than Ours: {len(basic)} < {reference_count}. "
+                "Auto mode only downsamples extra BasicCNN frames."
+            )
+        common = reference_count
+        basic_mapping = (
+            "identity"
+            if len(basic) == reference_count
+            else "normalized_timeline_downsample"
+        )
+    else:
+        basic_logical = _logical_frame_count(
+            basic, args.basiccnn_index_scale, args.basiccnn_index_offset
+        )
+        if basic_logical < reference_count:
+            raise ValueError(
+                f"manual BasicCNN mapping exposes only {basic_logical} logical frames "
+                f"for Ours reference length {reference_count}"
+            )
+        common = reference_count
+        basic_mapping = (
+            f"N*{args.basiccnn_index_scale}+{args.basiccnn_index_offset}"
+        )
+
     if args.max_frames:
         common = min(common, args.max_frames)
     if common <= 0:
-        raise RuntimeError("no common logical frames")
+        raise RuntimeError("no aligned frames")
+
+    print(
+        "Alignment: "
+        f"Ours/LQ/Original={reference_count} frames, "
+        f"BasicCNN={len(basic)} frames, mode={args.basiccnn_align}, "
+        f"mapping={basic_mapping}, output_frames={common}",
+        flush=True,
+    )
 
     fps = float(args.fps if args.fps is not None else lq.fps)
     output = args.output_dir.expanduser().resolve()
@@ -147,9 +214,17 @@ def main() -> int:
     try:
         for n in range(common):
             lq_up = _resize_rgb(lq.frame(n), width, height)
-            basic_frame = basic.frame(
-                n * args.basiccnn_index_scale + args.basiccnn_index_offset
-            )
+            if args.basiccnn_align == "auto":
+                basic_index = _auto_basic_index(
+                    n,
+                    basic_count=len(basic),
+                    reference_count=reference_count,
+                )
+            else:
+                basic_index = (
+                    n * args.basiccnn_index_scale + args.basiccnn_index_offset
+                )
+            basic_frame = basic.frame(basic_index)
             frames = [lq_up, basic_frame, original.frame(n), ours.frame(n)]
             quadrant_writer.append_data(_quadrant(frames, width, height, labels))
             quarters_writer.append_data(_quarters(frames, width, height, labels))
@@ -160,7 +235,8 @@ def main() -> int:
         quarters_writer.close()
 
     print(
-        f"Done: {common} aligned frames, {width}x{height}, fps={fps:g}\n"
+        f"Done: {common} aligned frames, {width}x{height}, fps={fps:g}, "
+        f"BasicCNN mapping={basic_mapping}\n"
         f"  {output / 'quadrant.mp4'}\n"
         f"  {output / 'vertical_quarters.mp4'}"
     )
