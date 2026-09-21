@@ -50,7 +50,11 @@ from swiftvr.training import (
     write_latest_checkpoint,
 )
 from swiftvr.training.b2b_moe import B2BMoESpec, expected_moe_shape, transformer_moe_shape
-from swiftvr.training.b2b_moe_training import B2BMoEVelocityDistillationForward, router_summary
+from swiftvr.training.b2b_moe_training import (
+    B2BMoEVelocityDistillationForward,
+    router_summary,
+    set_router_stats_collection,
+)
 from swiftvr.training.reference import sha256_file
 
 TA_CACHE_KIND = "swiftvr_b2b_d1536_ta_velocity"
@@ -189,6 +193,7 @@ def main() -> int:
             hflip=args.horizontal_flip_probability,
             vflip=args.vertical_flip_probability,
             verify_paths=args.verify_paths,
+            load_hq=False,
         )
 
         val_cache = None
@@ -211,6 +216,7 @@ def main() -> int:
                 hflip=0.0,
                 vflip=0.0,
                 verify_paths=args.verify_paths,
+                load_hq=False,
             )
             if rank == 0:
                 val_loader = DataLoader(
@@ -300,6 +306,10 @@ def main() -> int:
             "world_size": world_size,
             "local_batch_size": args.batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "num_workers": args.num_workers,
+            "prefetch_factor": args.prefetch_factor,
+            "persistent_workers": args.persistent_workers,
+            "training_load_hq": False,
             "global_effective_batch_size": effective_batch,
             "runtime_dtype": _CANONICAL_DTYPE_NAME[dtype],
             "optimizer_master_dtype": "float32",
@@ -400,6 +410,11 @@ def main() -> int:
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
 
+                collect_router_stats = (
+                    next_step % args.log_every == 0 or next_step == args.max_steps
+                )
+                set_router_stats_collection(transformer, collect_router_stats)
+
                 micro_batches_cpu: list[Mapping[str, object]] = []
                 for _ in range(args.gradient_accumulation_steps):
                     try:
@@ -451,12 +466,13 @@ def main() -> int:
                             else:
                                 scaled_loss.backward()
 
-                        summary = router_summary(transformer)
-                        for index, value in enumerate(summary["expert_counts"]):
-                            route_counts[index] += float(value)
-                        route_assignments += float(summary["assignments"])
-                        route_entropy_sum += float(summary["mean_entropy"])
-                        route_observations += 1
+                        if collect_router_stats:
+                            summary = router_summary(transformer)
+                            for index, value in enumerate(summary["expert_counts"]):
+                                route_counts[index] += float(value)
+                            route_assignments += float(summary["assignments"])
+                            route_entropy_sum += float(summary["mean_entropy"])
+                            route_observations += 1
 
                         sums["loss"] = sums.get("loss", 0.0) + float(total_loss.detach().float().item())
                         sums["velocity_loss"] = sums.get("velocity_loss", 0.0) + float(objective["loss"].detach().float().item())
@@ -535,17 +551,21 @@ def main() -> int:
                 grad_norm_global = float(packed[-2].item()) / world_size
                 step_seconds = float(packed[-1].item()) / world_size
 
-                route_pack = torch.tensor(
-                    route_counts + [route_assignments, route_entropy_sum, float(route_observations)],
-                    device=device,
-                    dtype=torch.float64,
-                )
-                dist.all_reduce(route_pack, op=dist.ReduceOp.SUM)
-                global_counts = [float(value) for value in route_pack[: LOCKED_SPEC.num_experts].tolist()]
-                global_assignments = float(route_pack[-3].item())
-                entropy_observations = max(float(route_pack[-1].item()), 1.0)
-                mean_entropy = float(route_pack[-2].item()) / entropy_observations
-                route_metrics = _router_metrics_from_counts(global_counts, global_assignments, mean_entropy)
+                route_metrics: dict[str, float] = {}
+                if collect_router_stats:
+                    route_pack = torch.tensor(
+                        route_counts + [route_assignments, route_entropy_sum, float(route_observations)],
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    dist.all_reduce(route_pack, op=dist.ReduceOp.SUM)
+                    global_counts = [float(value) for value in route_pack[: LOCKED_SPEC.num_experts].tolist()]
+                    global_assignments = float(route_pack[-3].item())
+                    entropy_observations = max(float(route_pack[-1].item()), 1.0)
+                    mean_entropy = float(route_pack[-2].item()) / entropy_observations
+                    route_metrics = _router_metrics_from_counts(
+                        global_counts, global_assignments, mean_entropy
+                    )
 
                 relative_l2 = math.sqrt(
                     max(averages["velocity_mse"], 0.0)
@@ -575,9 +595,10 @@ def main() -> int:
                             f"step={global_step} loss={averages['loss']:.7f} "
                             f"vel={averages['velocity_loss']:.7f} rel_l2={relative_l2:.6f} "
                             f"cos={averages['velocity_cosine']:.6f} bal={averages['router_balance_loss']:.4f} "
-                            f"H={route_metrics['router_normalized_entropy']:.3f} "
-                            f"load=[{route_metrics['router_min_fraction']:.3f},{route_metrics['router_max_fraction']:.3f}] "
-                            f"cv={route_metrics['router_load_cv']:.3f} lr={current_lr:.3e} "
+                            f"H={route_metrics.get('router_normalized_entropy', float('nan')):.3f} "
+                            f"load=[{route_metrics.get('router_min_fraction', float('nan')):.3f},"
+                            f"{route_metrics.get('router_max_fraction', float('nan')):.3f}] "
+                            f"cv={route_metrics.get('router_load_cv', float('nan')):.3f} lr={current_lr:.3e} "
                             f"time={step_seconds:.3f}s peak={last_record['peak_allocated_gb_per_rank']:.2f}GB",
                             flush=True,
                         )
