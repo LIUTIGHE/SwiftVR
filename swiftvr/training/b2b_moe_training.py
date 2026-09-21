@@ -23,6 +23,18 @@ from .forward import (
 from ..models.transformer_prompt_free_no_time_moe import SparseMoEFFN
 
 
+def set_router_stats_collection(transformer: nn.Module, enabled: bool) -> None:
+    """Enable expensive host-visible router diagnostics only when requested."""
+    flag = bool(enabled)
+    for raw_block in transformer.blocks:
+        block = _base_block(raw_block)
+        if not isinstance(block.ffn, SparseMoEFFN):
+            raise TypeError(f"Expected SparseMoEFFN, got {type(block.ffn).__name__}")
+        block.ffn.collect_router_stats = flag
+        if not flag:
+            block.ffn._last_stats = None
+
+
 def _forward_moe_block_training(block: nn.Module, hidden_states: torch.Tensor, rotary_emb):
     hidden_dtype = hidden_states.dtype
     mods = block.scale_shift_table.to(dtype=hidden_dtype)
