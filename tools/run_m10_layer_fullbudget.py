@@ -44,6 +44,18 @@ def main() -> int:
     p.add_argument("--output-root", type=Path,
                    default=Path("outputs/b2b/m10_layer_fullbudget_v1"))
     p.add_argument("--gpus", default="4,5,6,7")
+    p.add_argument(
+        "--local-batch-size",
+        type=int,
+        default=None,
+        help="Runtime per-GPU microbatch. Defaults to the reference M8-A value when GPU count matches.",
+    )
+    p.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Runtime accumulation. Defaults to the reference M8-A value when GPU count matches.",
+    )
     p.add_argument("--steps", type=int, default=60000,
                    help="Optimizer updates PER mask. 60k = 2x the mature M8-A30k checkpoint budget.")
     p.add_argument("--lr-schedule-total-steps", type=int, default=200000,
@@ -110,8 +122,33 @@ def main() -> int:
         raise ValueError("Reference run_config is missing train/validation manifests")
 
     gpu_ids = [x.strip() for x in args.gpus.split(",") if x.strip()]
-    if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
-        raise ValueError("--gpus must contain exactly four distinct IDs")
+    if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("--gpus must contain one or more distinct GPU IDs")
+    world_size = len(gpu_ids)
+    if world_size == int(reference["world_size"]):
+        local_batch_size = (
+            int(reference["local_batch_size"])
+            if args.local_batch_size is None
+            else int(args.local_batch_size)
+        )
+        accumulation_steps = (
+            int(reference["gradient_accumulation_steps"])
+            if args.gradient_accumulation_steps is None
+            else int(args.gradient_accumulation_steps)
+        )
+    else:
+        if args.local_batch_size is None or args.gradient_accumulation_steps is None:
+            raise ValueError(
+                "Changing GPU count requires explicit --local-batch-size and "
+                "--gradient-accumulation-steps. For GPUs 4,5,6, use "
+                "--local-batch-size 7 --gradient-accumulation-steps 3 "
+                "for global batch 63 (closest practical match to reference 64)."
+            )
+        local_batch_size = int(args.local_batch_size)
+        accumulation_steps = int(args.gradient_accumulation_steps)
+    if local_batch_size <= 0 or accumulation_steps <= 0:
+        raise ValueError("Runtime batch/accumulation must be positive")
+    runtime_global_batch = world_size * local_batch_size * accumulation_steps
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -120,6 +157,12 @@ def main() -> int:
         "selection": str(selection_path),
         "reference_run_config": str(reference_path),
         "physical_gpus": gpu_ids,
+        "runtime_world_size": world_size,
+        "runtime_local_batch_size": local_batch_size,
+        "runtime_gradient_accumulation_steps": accumulation_steps,
+        "runtime_global_effective_batch_size": runtime_global_batch,
+        "reference_global_effective_batch_size": int(reference["global_effective_batch_size"]),
+        "global_batch_ratio_to_reference": runtime_global_batch / int(reference["global_effective_batch_size"]),
         "per_mask_steps": args.steps,
         "mature_m8a_reference_step": 30000,
         "lr_schedule_total_steps": args.lr_schedule_total_steps,
@@ -135,9 +178,11 @@ def main() -> int:
             for role, record in all_pair
         },
         "note": (
-            "Heuristic and selected are trained sequentially with identical M8-A "
-            "DDP protocol. 30k is the matched mature-M8A checkpoint budget; 60k "
-            "default is a 2x update budget. LR follows the original 200k horizon."
+            "Heuristic and selected use the same locked M8-A teacher/loss/LR protocol. "
+            "When runtime_global_effective_batch_size differs from the reference 64, "
+            "comparison to historical M8-A is approximate; strict mask comparison "
+            "requires both masks to use the same runtime batch. LR follows the "
+            "original 200k horizon."
         ),
     }
     plan_path = output_root / "longrun_plan.json"
@@ -151,6 +196,14 @@ def main() -> int:
     env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
     env.setdefault("OMP_NUM_THREADS", "1")
 
+    print(
+        f"[runtime] GPUs={gpu_ids} world={world_size} "
+        f"local_batch={local_batch_size} accum={accumulation_steps} "
+        f"global_batch={runtime_global_batch} "
+        f"(reference={reference['global_effective_batch_size']})",
+        flush=True,
+    )
+
     for role, record in pair:
         run = output_root / role
         if completed(run, args.steps):
@@ -163,7 +216,7 @@ def main() -> int:
 
         cmd = [
             sys.executable, "-m", "torch.distributed.run",
-            "--standalone", "--nproc_per_node=4",
+            "--standalone", f"--nproc_per_node={world_size}",
             str(ROOT / "tools/train_b2b_moe_ta_distill_ddp_cache_safe.py"),
             "--architecture", "m8-d1024-l20",
             "--lr-schedule-total-steps", str(args.lr_schedule_total_steps),
@@ -177,9 +230,9 @@ def main() -> int:
             "--scale", str(reference["scale"]),
             "--views-per-record", str(reference["views_per_record"]),
             "--view-seed", str(reference["view_seed"]),
-            "--batch-size", str(reference["local_batch_size"]),
-            "--gradient-accumulation-steps", str(reference["gradient_accumulation_steps"]),
-            "--expected-global-batch-size", str(reference["global_effective_batch_size"]),
+            "--batch-size", str(local_batch_size),
+            "--gradient-accumulation-steps", str(accumulation_steps),
+            "--expected-global-batch-size", str(runtime_global_batch),
             "--learning-rate", str(reference["learning_rate"]),
             "--lr-warmup-steps", str(reference["lr_warmup_steps"]),
             "--min-lr-ratio", str(reference["min_lr_ratio"]),
