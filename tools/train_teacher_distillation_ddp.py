@@ -61,6 +61,7 @@ from swiftvr.training.distillation import (
 from swiftvr.training.distillation_visuals import export_validation_visuals
 from swiftvr.training.perceptual_review import parse_csv_ints
 from swiftvr.training.reference import sha256_file
+from swiftvr.training.input_pipeline import dataloader_worker_kwargs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,6 +185,7 @@ def build_cached_dataset(
     hflip: float,
     vflip: float,
     verify_paths: bool,
+    load_hq: bool = True,
 ) -> Subset:
     base = TripletVideoDataset(
         manifests,
@@ -192,6 +194,7 @@ def build_cached_dataset(
         clip_length=clip_length,
         crop_size=crop_size,
         scale=scale,
+        load_hq=load_hq,
         horizontal_flip_probability=hflip,
         vertical_flip_probability=vflip,
         drop_short_sequences=True,
@@ -240,14 +243,21 @@ def make_train_loader(
         drop_last=True,
     )
     sampler.set_epoch(epoch)
+    worker_kwargs = dataloader_worker_kwargs(
+        num_workers=args.num_workers,
+        prefetch_factor=getattr(args, "prefetch_factor", 2),
+        persistent_workers=bool(
+            getattr(args, "persistent_workers", False)
+            and int(args.num_workers) > 0
+        ),
+    )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         drop_last=True,
-        num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        persistent_workers=False,
+        **worker_kwargs,
     )
 
 
