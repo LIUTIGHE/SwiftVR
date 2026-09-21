@@ -26,6 +26,7 @@ DTYPE="${DTYPE:-bfloat16}"
 ATTN="${ATTN:-sdpa}"
 QUALITY="${QUALITY:-95}"
 QUEUE_SIZE="${QUEUE_SIZE:-2}"
+FFMPEG_PRESET="${FFMPEG_PRESET:-}"
 BASIC_INDEX_SCALE="${BASIC_INDEX_SCALE:-2}"
 BASIC_INDEX_OFFSET="${BASIC_INDEX_OFFSET:-0}"
 COMPARE_PIX_FMT="${COMPARE_PIX_FMT:-yuv444p}"
@@ -111,6 +112,7 @@ run_one() {
       --attention_backend "$ATTN" \
       --quality "$QUALITY" \
       --save-format yuv444p \
+      --ffmpeg-preset "$FFMPEG_PRESET" \
       --queue-size "$QUEUE_SIZE" \
       --quiet
   fi
@@ -135,6 +137,7 @@ run_one() {
       --attention-backend "$ATTN"
       --quality "$QUALITY"
       --save-format yuv444p
+      --ffmpeg-preset "$FFMPEG_PRESET"
       --queue-size "$QUEUE_SIZE"
       --quiet
     )
