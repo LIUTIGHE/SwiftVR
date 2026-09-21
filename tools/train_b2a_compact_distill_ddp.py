@@ -84,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vertical-flip-probability", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--prefetch-factor", type=int, default=2)
+    p.add_argument("--persistent-workers", action="store_true")
     p.add_argument("--pin-memory", action="store_true")
     p.add_argument("--verify-paths", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -169,8 +171,12 @@ def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
     bad = [name for name, value in positive.items() if int(value) <= 0]
     if bad:
         raise ValueError(f"Arguments must be positive: {bad}")
-    if args.num_workers != 0:
-        raise ValueError("B2-A v1 keeps --num-workers 0 for deterministic diagnosis")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if args.prefetch_factor <= 0:
+        raise ValueError("--prefetch-factor must be positive")
+    if args.persistent_workers and args.num_workers == 0:
+        raise ValueError("--persistent-workers requires --num-workers > 0")
     if args.validate_every > 0 and (not args.val_manifest or not args.val_teacher_cache):
         raise ValueError("Validation requires --val-manifest and --val-teacher-cache")
     if args.lr_warmup_steps < 0 or args.lr_warmup_steps >= args.max_steps:
