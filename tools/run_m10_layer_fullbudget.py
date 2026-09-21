@@ -147,7 +147,8 @@ def main() -> int:
                 "--gradient-accumulation-steps. For GPUs 4,5,6, first try "
                 "--local-batch-size 21 --gradient-accumulation-steps 1 "
                 "(global batch 63; best throughput if memory fits). If that OOMs, "
-                "fall back to --local-batch-size 7 --gradient-accumulation-steps 3."
+                "fall back to --local-batch-size 11 --gradient-accumulation-steps 2 "
+                "(global batch 66)."
             )
         local_batch_size = int(args.local_batch_size)
         accumulation_steps = int(args.gradient_accumulation_steps)
