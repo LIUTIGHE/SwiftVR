@@ -74,9 +74,10 @@ def main() -> int:
     candidates = selection["candidates"]
     heuristic = next(c for c in candidates if c["id"] == "heuristic")
     selected_record = next(c for c in candidates if c["id"] == selected["id"])
-    pair = [("heuristic", heuristic), ("selected", selected_record)]
-    if args.only is not None:
-        pair = [item for item in pair if item[0] == args.only]
+    all_pair = [("heuristic", heuristic), ("selected", selected_record)]
+    pair = all_pair if args.only is None else [
+        item for item in all_pair if item[0] == args.only
+    ]
     if heuristic["kept_source_blocks"] == selected_record["kept_source_blocks"]:
         raise ValueError("Locked masks are identical")
 
@@ -119,7 +120,6 @@ def main() -> int:
         "selection": str(selection_path),
         "reference_run_config": str(reference_path),
         "physical_gpus": gpu_ids,
-        "only": args.only,
         "per_mask_steps": args.steps,
         "mature_m8a_reference_step": 30000,
         "lr_schedule_total_steps": args.lr_schedule_total_steps,
@@ -132,7 +132,7 @@ def main() -> int:
                 "init_checkpoint": record["init_checkpoint"],
                 "kept_source_blocks": record["kept_source_blocks"],
             }
-            for role, record in pair
+            for role, record in all_pair
         },
         "note": (
             "Heuristic and selected are trained sequentially with identical M8-A "
