@@ -125,6 +125,16 @@ def main() -> int:
     p.add_argument("--basiccnn-index-offset", type=int, default=0)
     p.add_argument("--fps", type=float, default=None)
     p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument(
+        "--minor-mismatch-tolerance",
+        type=int,
+        default=3,
+        help=(
+            "Allow LQ/Original to have up to this many EXTRA tail frames versus Ours. "
+            "Extra frames are ignored; missing frames still error. Default 3 matches "
+            "SwiftVR's 4k+1 input truncation."
+        ),
+    )
     p.add_argument("--pix-fmt", default="yuv444p", choices=("yuv420p", "yuv444p"))
     p.add_argument("--no-labels", action="store_true")
     args = p.parse_args()
@@ -135,6 +145,8 @@ def main() -> int:
         raise ValueError("--fps must be positive")
     if args.max_frames < 0:
         raise ValueError("--max-frames must be non-negative")
+    if args.minor_mismatch_tolerance < 0:
+        raise ValueError("--minor-mismatch-tolerance must be non-negative")
 
     lq = FrameSource(args.lq)
     basic = FrameSource(args.basiccnn, fallback_fps=lq.fps)
@@ -152,16 +164,33 @@ def main() -> int:
     reference_count = len(ours)
     if reference_count <= 0:
         raise RuntimeError("Ours output is empty")
-    if len(lq) != reference_count:
+    def _accept_reference_source(label: str, count: int) -> str:
+        if count == reference_count:
+            return "identity"
+        delta = count - reference_count
+        if 0 < delta <= args.minor_mismatch_tolerance:
+            # SwiftVR restore_video intentionally truncates raw input to the
+            # largest 4k+1 prefix. Preserve exact ordinal alignment for the
+            # processed prefix and ignore only the unused source tail.
+            print(
+                f"warning: {label} has {count} frames vs Ours {reference_count}; "
+                f"ignoring {delta} extra tail frame(s)",
+                flush=True,
+            )
+            return f"prefix_truncate_{delta}"
+        if delta < 0:
+            raise ValueError(
+                f"{label} has fewer frames than Ours: {count} < {reference_count}; "
+                "refusing to duplicate missing reference frames"
+            )
         raise ValueError(
-            f"LQ/Ours frame-count mismatch: LQ={len(lq)} Ours={reference_count}; "
-            "refusing to resample the reference input timeline"
+            f"{label}/Ours frame-count mismatch exceeds tolerance: "
+            f"{count} vs {reference_count} "
+            f"(tolerance={args.minor_mismatch_tolerance})"
         )
-    if len(original) != reference_count:
-        raise ValueError(
-            f"Original/Ours frame-count mismatch: Original={len(original)} "
-            f"Ours={reference_count}; refusing to hide SwiftVR frame-count drift"
-        )
+
+    lq_mapping = _accept_reference_source("LQ", len(lq))
+    original_mapping = _accept_reference_source("Original", len(original))
 
     if args.basiccnn_align == "auto":
         if len(basic) < reference_count:
@@ -196,7 +225,8 @@ def main() -> int:
 
     print(
         "Alignment: "
-        f"Ours/LQ/Original={reference_count} frames, "
+        f"Ours={reference_count}, LQ={len(lq)}({lq_mapping}), "
+        f"Original={len(original)}({original_mapping}), "
         f"BasicCNN={len(basic)} frames, mode={args.basiccnn_align}, "
         f"mapping={basic_mapping}, output_frames={common}",
         flush=True,
