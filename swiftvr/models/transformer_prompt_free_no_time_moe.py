@@ -92,6 +92,7 @@ class SparseMoEFFN(nn.Module):
         )
         self.router = nn.Linear(self.dim, self.num_experts, bias=False)
         self._last_stats: SparseMoERouterStats | None = None
+        self.collect_router_stats = True
 
     @property
     def total_expansion(self) -> float:
@@ -165,16 +166,19 @@ class SparseMoEFFN(nn.Module):
             contribution = expert_output * weight.unsqueeze(-1)
             routed = routed.index_add(0, positions, contribution)
 
-        with torch.no_grad():
-            probs = probabilities.reshape(-1, self.num_experts)
-            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1).mean()
-            self._last_stats = SparseMoERouterStats(
-                token_count=int(flat.shape[0]),
-                assignment_count=int(flat.shape[0]) * self.top_k,
-                expert_counts=tuple(counts),
-                probability_entropy=float(entropy.item()),
-                balance_loss=float(balance_loss.detach().item()),
-            )
+        if self.collect_router_stats:
+            with torch.no_grad():
+                probs = probabilities.reshape(-1, self.num_experts)
+                entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1).mean()
+                self._last_stats = SparseMoERouterStats(
+                    token_count=int(flat.shape[0]),
+                    assignment_count=int(flat.shape[0]) * self.top_k,
+                    expert_counts=tuple(counts),
+                    probability_entropy=float(entropy.item()),
+                    balance_loss=float(balance_loss.detach().item()),
+                )
+        else:
+            self._last_stats = None
 
         return (shared + routed).reshape(original_shape), balance_loss
 
