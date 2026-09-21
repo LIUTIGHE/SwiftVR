@@ -31,6 +31,7 @@ BASIC_ALIGN="${BASIC_ALIGN:-auto}"
 BASIC_INDEX_SCALE="${BASIC_INDEX_SCALE:-2}"
 BASIC_INDEX_OFFSET="${BASIC_INDEX_OFFSET:-0}"
 COMPARE_PIX_FMT="${COMPARE_PIX_FMT:-yuv444p}"
+MINOR_MISMATCH_TOLERANCE="${MINOR_MISMATCH_TOLERANCE:-3}"
 
 IFS=',' read -r -a GPUS <<< "$GPU_IDS"
 if [[ "${#GPUS[@]}" -eq 0 ]]; then
@@ -159,6 +160,7 @@ run_one() {
     --basiccnn-align "$BASIC_ALIGN" \
     --basiccnn-index-scale "$BASIC_INDEX_SCALE" \
     --basiccnn-index-offset "$BASIC_INDEX_OFFSET" \
+    --minor-mismatch-tolerance "$MINOR_MISMATCH_TOLERANCE" \
     --pix-fmt "$COMPARE_PIX_FMT"
 
   printf '%s\n' "$basic" > "$out/basiccnn_source.txt"
