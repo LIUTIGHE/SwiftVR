@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Batch 720p->3x comparison inference.
-#
-# Required/typical paths may be overridden through environment variables.
-# BasicCNN is an already-generated external baseline under AISR_pred.
-#
-# Example:
-#   GPU_IDS=4,5,6,7 bash tools/run_batch_4way_compare.sh
+# Batch 720p->3x comparison inference with resume-safe outputs.
+# Each GPU processes a disjoint subset of videos sequentially.
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -43,7 +38,14 @@ fi
 
 mkdir -p "$OUTPUT_ROOT"
 
-# Expand input glob without treating a non-match literally.
+valid_video() {
+  local path="$1"
+  [[ -s "$path" ]] || return 1
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height \
+    -of csv=p=0 "$path" >/dev/null 2>&1
+}
+
 shopt -s nullglob
 inputs=( $INPUT_GLOB )
 shopt -u nullglob
@@ -69,6 +71,7 @@ resolve_basic() {
     printf '%s\n' "${matches[0]}"
     return 0
   fi
+
   echo "Cannot uniquely resolve BasicCNN for $input under $BASIC_DIR" >&2
   printf 'matches:' >&2
   printf ' %q' "${matches[@]}" >&2
@@ -80,46 +83,83 @@ run_one() {
   local gpu="$1"
   local input="$2"
   local stem out basic
+
   stem="$(basename "${input%.*}")"
   out="$OUTPUT_ROOT/$stem"
   basic="$(resolve_basic "$input")"
   mkdir -p "$out"
 
-  echo "[$(date '+%F %T')] GPU $gpu :: $stem :: Original SwiftVR" >&2
-  CUDA_VISIBLE_DEVICES="$gpu" python scripts/inference.py     --input "$input"     --output "$out/original_swiftvr.mp4"     --checkpoint "$ORIGINAL_CKPT"     --upscale "$UPSCALE"     --clip-len "$CLIP_LEN"     --dit-overlap "$DIT_OVERLAP"     --dtype "$DTYPE"     --attention_backend "$ATTN"     --quality "$QUALITY"     --save-format yuv444p     --queue-size "$QUEUE_SIZE"     --quiet
-
-  echo "[$(date '+%F %T')] GPU $gpu :: $stem :: Ours" >&2
-  ours_cmd=(
-    python scripts/inference_custom_components.py
-    --input "$input"
-    --output "$out/ours.mp4"
-    --base-checkpoint "$BASE_CKPT"
-    --transformer-checkpoint "$OURS_TRANSFORMER"
-    --transformer-type "$OURS_TRANSFORMER_TYPE"
-    --decoder-type "$OURS_DECODER_TYPE"
-    --upscale "$UPSCALE"
-    --clip-len "$CLIP_LEN"
-    --dit-overlap "$DIT_OVERLAP"
-    --dtype "$DTYPE"
-    --attention-backend "$ATTN"
-    --quality "$QUALITY"
-    --save-format yuv444p
-    --queue-size "$QUEUE_SIZE"
-    --quiet
-  )
-  if [[ "$OURS_DECODER_TYPE" != "original" ]]; then
-    ours_cmd+=(--decoder-checkpoint "$OURS_DECODER")
+  if valid_video "$out/compare/quadrant.mp4" && \
+     valid_video "$out/compare/vertical_quarters.mp4"; then
+    echo "[$(date '+%F %T')] skip complete :: $stem" >&2
+    return 0
   fi
-  CUDA_VISIBLE_DEVICES="$gpu" "${ours_cmd[@]}"
 
+  if valid_video "$out/original_swiftvr.mp4"; then
+    echo "[$(date '+%F %T')] reuse :: $stem :: Original SwiftVR" >&2
+  else
+    rm -f "$out/original_swiftvr.mp4"
+    echo "[$(date '+%F %T')] GPU $gpu :: $stem :: Original SwiftVR" >&2
+    CUDA_VISIBLE_DEVICES="$gpu" python scripts/inference.py \
+      --input "$input" \
+      --output "$out/original_swiftvr.mp4" \
+      --checkpoint "$ORIGINAL_CKPT" \
+      --upscale "$UPSCALE" \
+      --clip-len "$CLIP_LEN" \
+      --dit-overlap "$DIT_OVERLAP" \
+      --dtype "$DTYPE" \
+      --attention_backend "$ATTN" \
+      --quality "$QUALITY" \
+      --save-format yuv444p \
+      --queue-size "$QUEUE_SIZE" \
+      --quiet
+  fi
+
+  if valid_video "$out/ours.mp4"; then
+    echo "[$(date '+%F %T')] reuse :: $stem :: Ours" >&2
+  else
+    rm -f "$out/ours.mp4"
+    echo "[$(date '+%F %T')] GPU $gpu :: $stem :: Ours" >&2
+    ours_cmd=(
+      python scripts/inference_custom_components.py
+      --input "$input"
+      --output "$out/ours.mp4"
+      --base-checkpoint "$BASE_CKPT"
+      --transformer-checkpoint "$OURS_TRANSFORMER"
+      --transformer-type "$OURS_TRANSFORMER_TYPE"
+      --decoder-type "$OURS_DECODER_TYPE"
+      --upscale "$UPSCALE"
+      --clip-len "$CLIP_LEN"
+      --dit-overlap "$DIT_OVERLAP"
+      --dtype "$DTYPE"
+      --attention-backend "$ATTN"
+      --quality "$QUALITY"
+      --save-format yuv444p
+      --queue-size "$QUEUE_SIZE"
+      --quiet
+    )
+    if [[ "$OURS_DECODER_TYPE" != "original" ]]; then
+      ours_cmd+=(--decoder-checkpoint "$OURS_DECODER")
+    fi
+    CUDA_VISIBLE_DEVICES="$gpu" "${ours_cmd[@]}"
+  fi
+
+  rm -rf "$out/compare"
   echo "[$(date '+%F %T')] CPU :: $stem :: compose" >&2
-  python tools/compose_4way_video.py     --lq "$input"     --basiccnn "$basic"     --original "$out/original_swiftvr.mp4"     --ours "$out/ours.mp4"     --output-dir "$out/compare"     --basiccnn-index-scale "$BASIC_INDEX_SCALE"     --basiccnn-index-offset "$BASIC_INDEX_OFFSET"     --pix-fmt "$COMPARE_PIX_FMT"
+  python tools/compose_4way_video.py \
+    --lq "$input" \
+    --basiccnn "$basic" \
+    --original "$out/original_swiftvr.mp4" \
+    --ours "$out/ours.mp4" \
+    --output-dir "$out/compare" \
+    --basiccnn-index-scale "$BASIC_INDEX_SCALE" \
+    --basiccnn-index-offset "$BASIC_INDEX_OFFSET" \
+    --pix-fmt "$COMPARE_PIX_FMT"
 
   printf '%s\n' "$basic" > "$out/basiccnn_source.txt"
   echo "[$(date '+%F %T')] done :: $stem" >&2
 }
 
-# Simple fixed worker pool: each physical GPU gets one sequential list.
 pids=()
 for gi in "${!GPUS[@]}"; do
   gpu="${GPUS[$gi]}"
