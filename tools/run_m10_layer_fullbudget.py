@@ -51,6 +51,12 @@ def main() -> int:
     p.add_argument("--validate-every", type=int, default=5000)
     p.add_argument("--save-every", type=int, default=15000)
     p.add_argument("--visualize-every", type=int, default=15000)
+    p.add_argument(
+        "--only",
+        choices=("heuristic", "selected"),
+        default=None,
+        help="Run only one locked mask. Default runs heuristic then selected.",
+    )
     args = p.parse_args()
 
     if min(args.steps, args.lr_schedule_total_steps, args.validate_every,
@@ -69,6 +75,8 @@ def main() -> int:
     heuristic = next(c for c in candidates if c["id"] == "heuristic")
     selected_record = next(c for c in candidates if c["id"] == selected["id"])
     pair = [("heuristic", heuristic), ("selected", selected_record)]
+    if args.only is not None:
+        pair = [item for item in pair if item[0] == args.only]
     if heuristic["kept_source_blocks"] == selected_record["kept_source_blocks"]:
         raise ValueError("Locked masks are identical")
 
@@ -111,6 +119,7 @@ def main() -> int:
         "selection": str(selection_path),
         "reference_run_config": str(reference_path),
         "physical_gpus": gpu_ids,
+        "only": args.only,
         "per_mask_steps": args.steps,
         "mature_m8a_reference_step": 30000,
         "lr_schedule_total_steps": args.lr_schedule_total_steps,
