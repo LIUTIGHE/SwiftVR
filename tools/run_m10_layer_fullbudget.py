@@ -63,6 +63,10 @@ def main() -> int:
     p.add_argument("--validate-every", type=int, default=5000)
     p.add_argument("--save-every", type=int, default=15000)
     p.add_argument("--visualize-every", type=int, default=15000)
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="Training DataLoader workers PER rank.")
+    p.add_argument("--prefetch-factor", type=int, default=2)
+    p.add_argument("--no-persistent-workers", action="store_true")
     p.add_argument(
         "--only",
         choices=("heuristic", "selected"),
@@ -140,14 +144,17 @@ def main() -> int:
         if args.local_batch_size is None or args.gradient_accumulation_steps is None:
             raise ValueError(
                 "Changing GPU count requires explicit --local-batch-size and "
-                "--gradient-accumulation-steps. For GPUs 4,5,6, use "
-                "--local-batch-size 7 --gradient-accumulation-steps 3 "
-                "for global batch 63 (closest practical match to reference 64)."
+                "--gradient-accumulation-steps. For GPUs 4,5,6, first try "
+                "--local-batch-size 21 --gradient-accumulation-steps 1 "
+                "(global batch 63; best throughput if memory fits). If that OOMs, "
+                "fall back to --local-batch-size 7 --gradient-accumulation-steps 3."
             )
         local_batch_size = int(args.local_batch_size)
         accumulation_steps = int(args.gradient_accumulation_steps)
     if local_batch_size <= 0 or accumulation_steps <= 0:
         raise ValueError("Runtime batch/accumulation must be positive")
+    if args.num_workers < 0 or args.prefetch_factor <= 0:
+        raise ValueError("DataLoader worker count must be non-negative and prefetch positive")
     runtime_global_batch = world_size * local_batch_size * accumulation_steps
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -161,6 +168,9 @@ def main() -> int:
         "runtime_local_batch_size": local_batch_size,
         "runtime_gradient_accumulation_steps": accumulation_steps,
         "runtime_global_effective_batch_size": runtime_global_batch,
+        "num_workers_per_rank": args.num_workers,
+        "prefetch_factor": args.prefetch_factor,
+        "persistent_workers": bool(args.num_workers > 0 and not args.no_persistent_workers),
         "reference_global_effective_batch_size": int(reference["global_effective_batch_size"]),
         "global_batch_ratio_to_reference": runtime_global_batch / int(reference["global_effective_batch_size"]),
         "per_mask_steps": args.steps,
@@ -250,11 +260,14 @@ def main() -> int:
             "--visual-video-fps", "30",
             "--validate-at-start",
             "--pin-memory",
-            "--num-workers", "0",
+            "--num-workers", str(args.num_workers),
+            "--prefetch-factor", str(args.prefetch_factor),
             "--seed", "0",
             "--no-tensorboard",
             "--output-dir", str(run),
         ]
+        if args.num_workers > 0 and not args.no_persistent_workers:
+            cmd.append("--persistent-workers")
         add_repeat(cmd, "--manifest", reference["manifests"])
         add_repeat(cmd, "--val-manifest", reference["val_manifests"])
 
