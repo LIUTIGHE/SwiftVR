@@ -92,6 +92,45 @@ class TrainingDataAuditTest(unittest.TestCase):
                 self.assertEqual(spec["horizontal_flip"], sample["horizontal_flip"])
                 self.assertEqual(spec["vertical_flip"], sample["vertical_flip"])
 
+    def test_temporal_strip_sheet_writes_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "vsr_triplets_plain_train.jsonl"
+            manifest.write_text(json.dumps(_write_sequence(root)) + "\n", encoding="utf-8")
+            base = TripletVideoDataset(
+                manifest,
+                split="train",
+                training=True,
+                clip_length=5,
+                crop_size=(4, 6),
+                scale=3,
+                load_hq=False,
+                horizontal_flip_probability=0.0,
+                vertical_flip_probability=0.0,
+            )
+            full = DeterministicTripletViewDataset(base, views_per_record=1, view_seed=123)
+            metrics = {
+                0: {
+                    "record_uid": "plain:clip",
+                    "view_index": 0,
+                    "lr_temporal_l1": 0.1,
+                }
+            }
+            output = root / "motion.jpg"
+            _TOOL._temporal_strip_sheet(
+                output,
+                "motion",
+                [0],
+                full,
+                metrics,
+                frame_positions=(0, 2, 4),
+                cell_size=32,
+            )
+            self.assertTrue(output.is_file())
+            with Image.open(output) as image:
+                self.assertGreater(image.width, 0)
+                self.assertGreater(image.height, 0)
+
     def test_profile_metrics_are_finite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
