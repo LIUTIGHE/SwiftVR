@@ -324,6 +324,59 @@ def _contact_sheet(
     canvas.save(path, quality=92)
 
 
+def _temporal_strip_sheet(
+    path: Path,
+    title: str,
+    indices: Sequence[int],
+    full: DeterministicTripletViewDataset,
+    metrics_by_index: Mapping[int, Mapping[str, object]],
+    *,
+    frame_positions: Sequence[int] = (0, 3, 6, 9, 12),
+    cell_size: int = 112,
+) -> None:
+    """Show several bicubic-LR frames per candidate to review motion semantics."""
+    if not indices:
+        return
+    label_width = 220
+    row_height = cell_size + 6
+    positions = [int(value) for value in frame_positions]
+    canvas = Image.new(
+        "RGB",
+        (label_width + cell_size * len(positions), 28 + row_height * len(indices)),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    draw.text((6, 6), title + "  (bicubic LR temporal strip)", fill="black")
+    for row_index, index in enumerate(indices):
+        sample = full[int(index)]
+        lr = sample["lr"]
+        hr = sample["hr"]
+        if not isinstance(lr, torch.Tensor) or not isinstance(hr, torch.Tensor):
+            raise TypeError("Dataset sample must contain tensor lr/hr clips")
+        y = 28 + row_index * row_height
+        metrics = metrics_by_index[int(index)]
+        label = (
+            f"{metrics['record_uid']} v{metrics['view_index']}\n"
+            f"motion={metrics['lr_temporal_l1']:.4f}"
+        )
+        draw.text((4, y + 4), label, fill="black")
+        for column, position in enumerate(positions):
+            if position < 0 or position >= int(lr.shape[0]):
+                continue
+            up = F.interpolate(
+                lr[position].unsqueeze(0),
+                size=tuple(int(value) for value in hr[position].shape[-2:]),
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(0).clamp(0, 1)
+            canvas.paste(
+                _tensor_to_pil(up, cell_size),
+                (label_width + column * cell_size, y),
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, quality=92)
+
+
 def _representatives(rows: Sequence[Mapping[str, object]], count: int) -> dict[str, list[int]]:
     if not rows or count <= 0:
         return {}
@@ -466,6 +519,18 @@ def main() -> int:
         if position == 1 or position % 50 == 0 or position == len(profile_indices):
             print(f"profiled {position}/{len(profile_indices)} deterministic views", flush=True)
 
+    sample_id_records: dict[str, list[int]] = defaultdict(list)
+    for record_index, record in enumerate(base.records):
+        sample_id_records[record.sample_id].append(record_index)
+    cross_variant_sample_ids = []
+    repeated_sample_ids = []
+    for sample_id, record_indices in sorted(sample_id_records.items()):
+        if len(record_indices) > 1:
+            repeated_sample_ids.append(sample_id)
+        variants = sorted({base.records[index].variant for index in record_indices})
+        if len(variants) > 1:
+            cross_variant_sample_ids.append(sample_id)
+
     source_histogram = Counter(len(indices) for indices in source_records.values())
     variant_counts = Counter(record.variant for record in base.records)
     manifest_counts = Counter(record.source_manifest for record in base.records)
@@ -516,6 +581,15 @@ def main() -> int:
             metrics_by_index,
         )
 
+    motion_indices = representatives.get("detail_motion_candidates", [])
+    _temporal_strip_sheet(
+        output / "detail_motion_temporal_strips.jpg",
+        "detail motion candidates",
+        motion_indices,
+        full,
+        metrics_by_index,
+    )
+
     summary = {
         "kind": "swiftvr_training_data_view_audit_v1",
         "run_config": str(run_config_path),
@@ -536,6 +610,17 @@ def main() -> int:
             "frame_count": _quantiles(frame_counts),
             "first_frame_size_pairs": dict(sorted(size_pairs.items())),
             "duplicate_source_examples": duplicate_examples,
+        },
+        "sample_id_alias_check": {
+            "unique_sample_id_count": len(sample_id_records),
+            "repeated_sample_id_count": len(repeated_sample_ids),
+            "cross_variant_sample_id_count": len(cross_variant_sample_ids),
+            "cross_variant_sample_id_examples": cross_variant_sample_ids[:40],
+            "note": (
+                "Matching sample_id across variants is only a naming-level alias signal. "
+                "It does not prove identical source pixels, but it can reveal plain/text "
+                "records that the path-based source_uid treats as distinct."
+            ),
         },
         "manifest_field_counts_for_split": _manifest_fields(manifests, str(config["split"])),
         "view_redundancy": {
