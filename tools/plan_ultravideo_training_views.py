@@ -182,18 +182,15 @@ def _candidate_specs(
     return specs
 
 
-def _score_candidate(
-    frames: Mapping[int, np.ndarray],
+def _detail_score(
+    raw_middle: np.ndarray,
     spec: Mapping[str, object],
     *,
     canonical_hr_size: tuple[int, int],
     crop_size: int,
     scale: int,
 ) -> dict[str, float]:
-    positions = [int(value) for value in spec["raw_frame_positions"]]
     top, left, _, _ = (int(value) for value in spec["crop_box_hq"])
-    middle_position = positions[len(positions) // 2]
-    raw_middle = frames[middle_position]
     hr_full = _resize_rgb(raw_middle, canonical_hr_size, Image.Resampling.LANCZOS)
     hq_size = (canonical_hr_size[0] // scale, canonical_hr_size[1] // scale)
     hq_full = _resize_rgb(hr_full, hq_size, Image.Resampling.BOX)
@@ -209,12 +206,25 @@ def _score_candidate(
     )
     hr_detail = _highpass_l1(_gray01(hr_crop))
     hq_up_detail = _highpass_l1(_gray01(hq_up))
-    clean_sr_gap = hr_detail - hq_up_detail
+    return {
+        "hr_highpass_l1": hr_detail,
+        "clean_sr_highpass_gap": hr_detail - hq_up_detail,
+    }
 
+
+def _motion_score(
+    hq_frames: Mapping[int, np.ndarray],
+    spec: Mapping[str, object],
+    *,
+    score_offsets: Sequence[int],
+    crop_size: int,
+) -> dict[str, float]:
+    all_positions = [int(value) for value in spec["raw_frame_positions"]]
+    positions = [all_positions[int(offset)] for offset in score_offsets]
+    top, left, _, _ = (int(value) for value in spec["crop_box_hq"])
     gray_clips: list[np.ndarray] = []
     for position in positions:
-        hr = _resize_rgb(frames[position], canonical_hr_size, Image.Resampling.LANCZOS)
-        hq = _resize_rgb(hr, hq_size, Image.Resampling.BOX)
+        hq = hq_frames[position]
         crop = hq[top : top + crop_size, left : left + crop_size]
         gray_clips.append(_gray01(crop))
     gray = np.stack(gray_clips, axis=0)
@@ -225,15 +235,35 @@ def _score_candidate(
     luma = np.abs(frame_means[1:] - frame_means[:-1]).reshape(-1)
     median_structural = float(np.median(structural))
     spike_ratio = float(np.max(structural) / max(median_structural, 1e-8))
-
     return {
-        "hr_highpass_l1": hr_detail,
-        "clean_sr_highpass_gap": clean_sr_gap,
         "structural_motion_l1": float(np.mean(structural)),
         "raw_motion_l1": float(np.mean(raw_motion)),
         "luma_motion_l1": float(np.mean(luma)),
         "temporal_spike_ratio": spike_ratio,
     }
+
+
+def _decode_hq_proxy_frames(
+    reader,
+    positions: Sequence[int],
+    *,
+    hq_size: tuple[int, int],
+    batch_size: int,
+) -> dict[int, np.ndarray]:
+    """Decode native frames in small batches and retain only HQ-size RGB proxies."""
+    result: dict[int, np.ndarray] = {}
+    ordered = sorted({int(value) for value in positions})
+    for start in range(0, len(ordered), int(batch_size)):
+        batch_positions = ordered[start : start + int(batch_size)]
+        decoded = _batch_to_numpy(reader.get_batch(batch_positions))
+        for index, position in enumerate(batch_positions):
+            result[position] = _resize_rgb(
+                decoded[index],
+                hq_size,
+                Image.Resampling.BOX,
+            )
+        del decoded
+    return result
 
 
 def _rank_normalized(values: Sequence[float]) -> list[float]:
@@ -400,6 +430,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=128)
     parser.add_argument("--scale", type=int, default=3)
     parser.add_argument("--candidate-count", type=int, default=24)
+    parser.add_argument(
+        "--motion-score-frames",
+        type=int,
+        default=7,
+        help="Evenly spaced frames from each 13-frame view used only for motion scoring.",
+    )
+    parser.add_argument(
+        "--decode-batch-size",
+        type=int,
+        default=4,
+        help="Native-resolution frames decoded at once while building HQ motion proxies.",
+    )
     parser.add_argument("--detail-count", type=int, default=4)
     parser.add_argument("--detail-motion-count", type=int, default=2)
     parser.add_argument("--random-count", type=int, default=2)
@@ -416,6 +458,10 @@ def main() -> int:
         raise ValueError("clip-length must be positive and satisfy T=4k+1")
     if args.crop_size <= 0 or args.scale <= 0 or args.candidate_count <= 0:
         raise ValueError("crop-size, scale and candidate-count must be positive")
+    if args.motion_score_frames < 2 or args.motion_score_frames > args.clip_length:
+        raise ValueError("motion-score-frames must be in [2, clip-length]")
+    if args.decode_batch_size <= 0:
+        raise ValueError("decode-batch-size must be positive")
     requested = args.detail_count + args.detail_motion_count + args.random_count
     if requested <= 0 or args.candidate_count < requested:
         raise ValueError("candidate-count must cover all requested selected views")
@@ -481,28 +527,51 @@ def main() -> int:
             )
             continue
 
-        needed_positions = sorted(
+        score_offsets = sorted(
             {
-                int(position)
-                for spec in specs
-                for position in spec["raw_frame_positions"]
+                int(round(value))
+                for value in np.linspace(
+                    0,
+                    int(args.clip_length) - 1,
+                    int(args.motion_score_frames),
+                )
             }
         )
-        decoded = _batch_to_numpy(reader.get_batch(needed_positions))
-        frame_map = {
-            int(position): decoded[index]
-            for index, position in enumerate(needed_positions)
-        }
+        motion_positions = sorted(
+            {
+                int(spec["raw_frame_positions"][offset])
+                for spec in specs
+                for offset in score_offsets
+            }
+        )
+        hq_proxy_frames = _decode_hq_proxy_frames(
+            reader,
+            motion_positions,
+            hq_size=hq_size,
+            batch_size=int(args.decode_batch_size),
+        )
         candidates: list[dict[str, object]] = []
         for spec in specs:
-            score = _score_candidate(
-                frame_map,
+            middle_position = int(
+                spec["raw_frame_positions"][int(args.clip_length) // 2]
+            )
+            raw_middle = _batch_to_numpy(reader.get_batch([middle_position]))[0]
+            detail = _detail_score(
+                raw_middle,
                 spec,
                 canonical_hr_size=(hr_width, hr_height),
                 crop_size=int(args.crop_size),
                 scale=int(args.scale),
             )
-            candidates.append({**spec, **score})
+            motion = _motion_score(
+                hq_proxy_frames,
+                spec,
+                score_offsets=score_offsets,
+                crop_size=int(args.crop_size),
+            )
+            candidates.append({**spec, **detail, **motion})
+            del raw_middle
+        del hq_proxy_frames
 
         stride = _cadence_stride(fps)
         selected = _select_views(
@@ -596,6 +665,8 @@ def main() -> int:
         },
         "selected_category_counts": dict(sorted(category_counts.items())),
         "candidate_count": int(args.candidate_count),
+        "motion_score_frames": int(args.motion_score_frames),
+        "decode_batch_size": int(args.decode_batch_size),
         "clip_length": int(args.clip_length),
         "crop_size_hq_lr": int(args.crop_size),
         "scale": int(args.scale),
@@ -615,6 +686,8 @@ def main() -> int:
             "detail ranks clean 3x SR high-frequency loss within each clip.",
             "detail_motion combines within-clip detail and structural-motion ranks and excludes candidates above the temporal spike limit.",
             "random views remain unbiased apart from the same diversity penalty.",
+            "Motion scoring uses evenly spaced HQ-resolution proxy frames to bound native 4K/8K decode memory.",
+            "Detail scoring decodes only the center native-resolution frame for each candidate.",
             "No training pixels are materialized by this planner.",
         ],
     }
