@@ -380,7 +380,7 @@ def _select_views(
         raise ValueError("global_spike_limit must be positive")
 
     safe = [
-        item
+        {**item, "global_spike_guard_fallback": False}
         for item in candidates
         if float(item["temporal_spike_ratio"]) <= float(global_spike_limit)
     ]
@@ -396,7 +396,13 @@ def _select_views(
                 int(item["candidate_index"]),
             ),
         )
-        safe.extend(rejected[: requested - len(safe)])
+        safe.extend(
+            {
+                **item,
+                "global_spike_guard_fallback": True,
+            }
+            for item in rejected[: requested - len(safe)]
+        )
     candidates = safe
 
     gaps = [float(item["clean_sr_highpass_gap"]) for item in candidates]
@@ -582,6 +588,7 @@ def main() -> int:
     }
     overlap_spatial: list[float] = []
     overlap_temporal: list[float] = []
+    global_spike_guard_fallback_count = 0
 
     for record_index, (source_row_index, row) in enumerate(
         zip(source_row_indices, rows),
@@ -749,6 +756,8 @@ def main() -> int:
                     )
                 )
         for view_index, item in enumerate(selected):
+            if bool(item.get("global_spike_guard_fallback", False)):
+                global_spike_guard_fallback_count += 1
             for name in selected_metric_values:
                 selected_metric_values[name].append(float(item[name]))
             planned.append(
@@ -823,6 +832,7 @@ def main() -> int:
         "diversity_weight": float(args.diversity_weight),
         "spike_limit": float(args.spike_limit),
         "global_spike_limit": float(args.global_spike_limit),
+        "global_spike_guard_fallback_count": int(global_spike_guard_fallback_count),
         "seed": int(args.seed),
         "selected_metric_distributions": {
             name: _quantiles(values)
