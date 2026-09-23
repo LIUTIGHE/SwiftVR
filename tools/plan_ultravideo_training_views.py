@@ -516,6 +516,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=20260923)
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="Split pilot rows into deterministic index-modulo shards for resumable/parallel planning.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based shard index in [0, shard-count).",
+    )
     parser.add_argument("--max-records", type=int, default=0)
     return parser.parse_args()
 
@@ -541,10 +553,21 @@ def main() -> int:
         raise ValueError("candidate-count must cover all requested selected views")
     if args.max_records < 0:
         raise ValueError("max-records must be non-negative")
+    if args.shard_count <= 0:
+        raise ValueError("shard-count must be positive")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise ValueError("shard-index must be in [0, shard-count)")
 
-    rows = _read_jsonl(args.pilot.expanduser().resolve())
+    all_rows = _read_jsonl(args.pilot.expanduser().resolve())
+    indexed_rows = [
+        (index, row)
+        for index, row in enumerate(all_rows)
+        if index % int(args.shard_count) == int(args.shard_index)
+    ]
     if args.max_records:
-        rows = rows[: int(args.max_records)]
+        indexed_rows = indexed_rows[: int(args.max_records)]
+    rows = [row for _, row in indexed_rows]
+    source_row_indices = [index for index, _ in indexed_rows]
     output = args.output_dir.expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output}")
@@ -560,7 +583,10 @@ def main() -> int:
     overlap_spatial: list[float] = []
     overlap_temporal: list[float] = []
 
-    for record_index, row in enumerate(rows, start=1):
+    for record_index, (source_row_index, row) in enumerate(
+        zip(source_row_indices, rows),
+        start=1,
+    ):
         path = str(row.get("raw_video", ""))
         fps = float(row.get("fps"))
         clip_id = str(row.get("clip_id", ""))
@@ -729,6 +755,7 @@ def main() -> int:
                 {
                     "dataset": "UltraVideo",
                     "subset": "short",
+                    "pilot_row_index": int(source_row_index),
                     "split": row.get("split"),
                     "clip_id": clip_id,
                     "source_group_uid": row.get("source_group_uid"),
@@ -770,6 +797,9 @@ def main() -> int:
     summary = {
         "kind": "ultravideo_deterministic_view_plan_v1",
         "pilot": str(args.pilot.expanduser().resolve()),
+        "pilot_total_clip_count": len(all_rows),
+        "shard_count": int(args.shard_count),
+        "shard_index": int(args.shard_index),
         "input_clip_count": len(rows),
         "planned_clip_count": len(rows) - len(skipped),
         "skipped_clip_count": len(skipped),
