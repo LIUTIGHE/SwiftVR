@@ -256,7 +256,20 @@ def _profile_view(sample: Mapping[str, object]) -> dict[str, float]:
         align_corners=False,
     ).squeeze(0).clamp_(0.0, 1.0)
     lr_gray = _gray(lr.float())
-    motion = float((lr_gray[1:] - lr_gray[:-1]).abs().mean().item()) if lr.shape[0] > 1 else 0.0
+    if lr.shape[0] > 1:
+        adjacent_raw = (lr_gray[1:] - lr_gray[:-1]).abs().mean(dim=(1, 2, 3))
+        frame_means = lr_gray.mean(dim=(1, 2, 3), keepdim=True)
+        centered = lr_gray - frame_means
+        adjacent_structure = (centered[1:] - centered[:-1]).abs().mean(dim=(1, 2, 3))
+        mean_luma_delta = (frame_means[1:] - frame_means[:-1]).abs().flatten()
+        motion = float(adjacent_raw.mean().item())
+        structural_motion = float(adjacent_structure.mean().item())
+        luma_motion = float(mean_luma_delta.mean().item())
+        median_structure = float(adjacent_structure.median().item())
+        spike_ratio = float(adjacent_structure.max().item() / max(median_structure, 1e-8))
+    else:
+        motion = structural_motion = luma_motion = 0.0
+        spike_ratio = 1.0
     hr_detail = _highpass_energy(hr_mid)
     lr_detail = _highpass_energy(lr_up)
     return {
@@ -265,6 +278,9 @@ def _profile_view(sample: Mapping[str, object]) -> dict[str, float]:
         "recoverable_highpass_gap": hr_detail - lr_detail,
         "hr_vs_bicubic_lr_mae": float((hr_mid - lr_up).abs().mean().item()),
         "lr_temporal_l1": motion,
+        "lr_temporal_structure_l1": structural_motion,
+        "lr_luma_temporal_l1": luma_motion,
+        "lr_temporal_spike_ratio": spike_ratio,
     }
 
 
@@ -331,8 +347,8 @@ def _temporal_strip_sheet(
     full: DeterministicTripletViewDataset,
     metrics_by_index: Mapping[int, Mapping[str, object]],
     *,
-    frame_positions: Sequence[int] = (0, 3, 6, 9, 12),
-    cell_size: int = 112,
+    frame_positions: Sequence[int] = tuple(range(13)),
+    cell_size: int = 80,
 ) -> None:
     """Show several bicubic-LR frames per candidate to review motion semantics."""
     if not indices:
@@ -357,7 +373,8 @@ def _temporal_strip_sheet(
         metrics = metrics_by_index[int(index)]
         label = (
             f"{metrics['record_uid']} v{metrics['view_index']}\n"
-            f"motion={metrics['lr_temporal_l1']:.4f}"
+            f"raw={metrics['lr_temporal_l1']:.4f} struct={metrics['lr_temporal_structure_l1']:.4f} "
+            f"luma={metrics['lr_luma_temporal_l1']:.4f} spike={metrics['lr_temporal_spike_ratio']:.2f}"
         )
         draw.text((4, y + 4), label, fill="black")
         for column, position in enumerate(positions):
@@ -373,6 +390,69 @@ def _temporal_strip_sheet(
                 _tensor_to_pil(up, cell_size),
                 (label_width + column * cell_size, y),
             )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, quality=92)
+
+
+def _motion_context_sheet(
+    path: Path,
+    title: str,
+    indices: Sequence[int],
+    base: TripletVideoDataset,
+    metrics_by_index: Mapping[int, Mapping[str, object]],
+    *,
+    cell_width: int = 120,
+) -> None:
+    """Show all 13 consecutive full LR frames with the training crop marked."""
+    if not indices:
+        return
+    rows: list[tuple[Mapping[str, object], list[Image.Image]]] = []
+    cell_height = round(cell_width * 720 / 1280)
+    for index in indices:
+        metrics = metrics_by_index[int(index)]
+        record = base.records[int(metrics["record_index"])]
+        start = int(metrics["temporal_start"])
+        top, left, crop_h, crop_w = (int(value) for value in metrics["crop_box_lr"])
+        frames: list[Image.Image] = []
+        for position in range(start, min(start + base.clip_length, record.frame_count)):
+            with Image.open(record.lr_paths[position]) as image:
+                image = image.convert("RGB")
+                source_w, source_h = image.size
+                thumb = image.resize((cell_width, cell_height), resample=Image.Resampling.BILINEAR)
+            draw = ImageDraw.Draw(thumb)
+            x0 = round(left * cell_width / source_w)
+            y0 = round(top * cell_height / source_h)
+            x1 = round((left + crop_w) * cell_width / source_w)
+            y1 = round((top + crop_h) * cell_height / source_h)
+            draw.rectangle((x0, y0, x1, y1), outline="white", width=2)
+            draw.rectangle((x0 + 2, y0 + 2, x1 - 2, y1 - 2), outline="black", width=1)
+            frames.append(thumb)
+        rows.append((metrics, frames))
+
+    label_width = 250
+    row_height = cell_height + 8
+    columns = max((len(frames) for _, frames in rows), default=0)
+    canvas = Image.new(
+        "RGB",
+        (label_width + cell_width * columns, 28 + row_height * len(rows)),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    draw.text((6, 6), title + "  (full LR context; box = actual 128x128 training crop)", fill="black")
+    for row_index, (metrics, frames) in enumerate(rows):
+        y = 28 + row_index * row_height
+        draw.text(
+            (4, y + 3),
+            (
+                f"{metrics['record_uid']} v{metrics['view_index']}\n"
+                f"struct={metrics['lr_temporal_structure_l1']:.4f} "
+                f"luma={metrics['lr_luma_temporal_l1']:.4f} "
+                f"spike={metrics['lr_temporal_spike_ratio']:.2f}"
+            ),
+            fill="black",
+        )
+        for column, frame in enumerate(frames):
+            canvas.paste(frame, (label_width + column * cell_width, y))
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path, quality=92)
 
@@ -396,10 +476,25 @@ def _representatives(rows: Sequence[Mapping[str, object]], count: int) -> dict[s
         ),
         reverse=True,
     )[:count]
+    structural_pool = [
+        row for row in high_detail
+        if float(row["lr_temporal_spike_ratio"]) <= 4.0
+    ]
+    detail_structural_motion = sorted(
+        structural_pool,
+        key=lambda row: (
+            float(row["lr_temporal_structure_l1"]),
+            float(row["recoverable_highpass_gap"]),
+        ),
+        reverse=True,
+    )[:count]
     return {
         "low_hr_detail_candidates": [int(row["distillation_index"]) for row in low_detail],
         "recoverable_detail_candidates": [int(row["distillation_index"]) for row in recoverable],
         "detail_motion_candidates": [int(row["distillation_index"]) for row in detail_motion],
+        "detail_structural_motion_candidates": [
+            int(row["distillation_index"]) for row in detail_structural_motion
+        ],
     }
 
 
@@ -568,6 +663,9 @@ def main() -> int:
             "recoverable_highpass_gap",
             "hr_vs_bicubic_lr_mae",
             "lr_temporal_l1",
+            "lr_temporal_structure_l1",
+            "lr_luma_temporal_l1",
+            "lr_temporal_spike_ratio",
         )
     }
     representatives = _representatives(profile_rows, int(args.representatives_per_group))
@@ -587,6 +685,21 @@ def main() -> int:
         "detail motion candidates",
         motion_indices,
         full,
+        metrics_by_index,
+    )
+    structural_motion_indices = representatives.get("detail_structural_motion_candidates", [])
+    _temporal_strip_sheet(
+        output / "detail_structural_motion_temporal_strips.jpg",
+        "detail structural motion candidates",
+        structural_motion_indices,
+        full,
+        metrics_by_index,
+    )
+    _motion_context_sheet(
+        output / "detail_structural_motion_context.jpg",
+        "detail structural motion candidates",
+        structural_motion_indices,
+        base,
         metrics_by_index,
     )
 
