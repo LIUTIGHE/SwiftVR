@@ -112,8 +112,14 @@ class TrainingDataAuditTest(unittest.TestCase):
             metrics = {
                 0: {
                     "record_uid": "plain:clip",
+                    "record_index": 0,
                     "view_index": 0,
+                    "temporal_start": 0,
+                    "crop_box_lr": [0, 0, 4, 6],
                     "lr_temporal_l1": 0.1,
+                    "lr_temporal_structure_l1": 0.08,
+                    "lr_luma_temporal_l1": 0.02,
+                    "lr_temporal_spike_ratio": 1.5,
                 }
             }
             output = root / "motion.jpg"
@@ -126,6 +132,41 @@ class TrainingDataAuditTest(unittest.TestCase):
                 frame_positions=(0, 2, 4),
                 cell_size=32,
             )
+            self.assertTrue(output.is_file())
+            with Image.open(output) as image:
+                self.assertGreater(image.width, 0)
+                self.assertGreater(image.height, 0)
+
+    def test_motion_context_sheet_writes_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "vsr_triplets_plain_train.jsonl"
+            manifest.write_text(json.dumps(_write_sequence(root)) + "\n", encoding="utf-8")
+            base = TripletVideoDataset(
+                manifest,
+                split="train",
+                training=True,
+                clip_length=5,
+                crop_size=(4, 6),
+                scale=3,
+                load_hq=False,
+                horizontal_flip_probability=0.0,
+                vertical_flip_probability=0.0,
+            )
+            metrics = {
+                0: {
+                    "record_uid": "plain:clip",
+                    "record_index": 0,
+                    "view_index": 0,
+                    "temporal_start": 0,
+                    "crop_box_lr": [0, 0, 4, 6],
+                    "lr_temporal_structure_l1": 0.08,
+                    "lr_luma_temporal_l1": 0.02,
+                    "lr_temporal_spike_ratio": 1.5,
+                }
+            }
+            output = root / "context.jpg"
+            _TOOL._motion_context_sheet(output, "motion", [0], base, metrics, cell_width=32)
             self.assertTrue(output.is_file())
             with Image.open(output) as image:
                 self.assertGreater(image.width, 0)
@@ -154,6 +195,9 @@ class TrainingDataAuditTest(unittest.TestCase):
                     "recoverable_highpass_gap",
                     "hr_vs_bicubic_lr_mae",
                     "lr_temporal_l1",
+                    "lr_temporal_structure_l1",
+                    "lr_luma_temporal_l1",
+                    "lr_temporal_spike_ratio",
                 },
             )
             self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
