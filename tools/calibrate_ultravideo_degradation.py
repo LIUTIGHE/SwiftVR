@@ -122,6 +122,17 @@ def _decord_reader(path: str):
     return decord.VideoReader(path, ctx=decord.cpu(0))
 
 
+def _batch_to_numpy(value) -> np.ndarray:
+    """Convert Decord/torch/numpy batch outputs to a CPU NumPy array."""
+    if isinstance(value, np.ndarray):
+        return value
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        return value.detach().cpu().numpy()
+    if hasattr(value, "asnumpy"):
+        return value.asnumpy()
+    return np.asarray(value)
+
+
 def _sample_positions(frame_count: int, count: int) -> list[int]:
     if frame_count <= 0 or count <= 0:
         return []
@@ -321,7 +332,7 @@ def main() -> int:
         positions = _sample_positions(len(reader), int(args.frames_per_source))
         if not positions:
             raise ValueError(f"No decodable frames: {path}")
-        frames = reader.get_batch(positions).asnumpy()
+        frames = _batch_to_numpy(reader.get_batch(positions))
         source_record = {
             "clip_id": row.get("clip_id"),
             "source_group_uid": row.get("source_group_uid"),
