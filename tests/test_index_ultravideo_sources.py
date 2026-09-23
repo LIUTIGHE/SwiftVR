@@ -54,13 +54,14 @@ class UltraVideoIndexTest(unittest.TestCase):
             path = Path(tmp) / "short.csv"
             path.write_text(
                 "clip_id,url,frame_width,frame_height,fps\n"
-                "clip-a,https://example.test/a,3840,2160,24\n",
+                "clip-a.mp4,https://example.test/a,3840,2160,24\n",
                 encoding="utf-8",
             )
             rows, fields = _TOOL._read_metadata(path)
             self.assertIn("clip_id", fields)
             self.assertEqual(rows["clip-a"]["frame_width"], "3840")
             self.assertEqual(rows["clip-a"]["fps"], "24")
+            self.assertEqual(rows["clip-a"]["_metadata_clip_id"], "clip-a.mp4")
 
 
 if __name__ == "__main__":
