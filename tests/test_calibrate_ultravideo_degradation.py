@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -20,6 +21,18 @@ _SPEC.loader.exec_module(_TOOL)
 
 
 class UltraVideoDegradationCalibrationTest(unittest.TestCase):
+    def test_direct_script_help_imports_from_repo_root(self):
+        completed = subprocess.run(
+            [sys.executable, str(_TOOL_PATH), "--help"],
+            cwd=str(_REPO_ROOT),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("Calibrate a deterministic synthetic UltraVideo degradation", completed.stdout)
+
     def test_source_balanced_selection_uses_distinct_groups(self):
         rows = [
             {"source_group_uid": "a", "clip_id": "a0"},
