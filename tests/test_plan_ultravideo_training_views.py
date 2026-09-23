@@ -82,6 +82,39 @@ class UltraVideoTrainingViewPlannerTest(unittest.TestCase):
         self.assertGreater(metrics["structural_motion_l1"], 0.0)
         self.assertGreaterEqual(metrics["temporal_spike_ratio"], 1.0)
 
+    def test_global_spike_guard_excludes_obvious_cut_when_pool_is_sufficient(self):
+        candidates = []
+        for index in range(12):
+            candidates.append(
+                {
+                    "candidate_index": index,
+                    "raw_frame_start": index * 3,
+                    "raw_frame_stride": 1,
+                    "raw_frame_positions": list(range(index * 3, index * 3 + 13)),
+                    "crop_box_hq": [index * 2, index * 4, 128, 128],
+                    "horizontal_flip": False,
+                    "hr_highpass_l1": 0.01,
+                    "clean_sr_highpass_gap": 0.002 + index * 0.001,
+                    "structural_motion_l1": 0.01 + index * 0.001,
+                    "raw_motion_l1": 0.01,
+                    "luma_motion_l1": 0.001,
+                    "temporal_spike_ratio": 100.0 if index == 11 else 1.5,
+                }
+            )
+        selected = _TOOL._select_views(
+            candidates,
+            clip_length=13,
+            stride=1,
+            detail_count=4,
+            detail_motion_count=2,
+            random_count=2,
+            diversity_weight=0.35,
+            spike_limit=4.0,
+            global_spike_limit=10.0,
+            seed=9,
+        )
+        self.assertNotIn(11, {item["candidate_index"] for item in selected})
+
     def test_selector_returns_4_2_2_without_duplicates(self):
         candidates = []
         for index in range(16):
@@ -110,6 +143,7 @@ class UltraVideoTrainingViewPlannerTest(unittest.TestCase):
             random_count=2,
             diversity_weight=0.35,
             spike_limit=4.0,
+            global_spike_limit=10.0,
             seed=9,
         )
         self.assertEqual(len(selected), 8)
