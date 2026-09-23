@@ -205,6 +205,10 @@ def main() -> int:
         "planned_clip_count": planned_clip_count,
         "skipped_clip_count": len(skipped),
         "selected_view_count": len(plans),
+        "global_spike_guard_fallback_count": sum(
+            int(item.get("global_spike_guard_fallback_count", 0))
+            for item in summaries
+        ),
         "selected_category_counts": dict(sorted(categories.items())),
         "selected_metric_distributions": {
             name: _quantiles([float(row[name]) for row in plans])
