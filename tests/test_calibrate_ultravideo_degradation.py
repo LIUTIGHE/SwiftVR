@@ -68,6 +68,14 @@ class UltraVideoDegradationCalibrationTest(unittest.TestCase):
         self.assertEqual(image.size[0] % 3, 0)
         self.assertEqual(image.size[1] % 3, 0)
 
+    def test_refined_presets_reduce_noise_from_strong(self):
+        strong = _TOOL.PRESETS["strong"]
+        for name in ("strong_clean", "strong_clean_tail", "strong_low_noise"):
+            self.assertLess(
+                _TOOL.PRESETS[name]["noise_std_max_255"],
+                strong["noise_std_max_255"],
+            )
+
     def test_degradation_is_deterministic_for_same_inputs(self):
         image = Image.fromarray(
             np.tile(np.arange(96, dtype=np.uint8)[None, :, None], (72, 1, 3)),
