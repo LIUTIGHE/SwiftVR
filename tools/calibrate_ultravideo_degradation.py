@@ -59,6 +59,30 @@ PRESETS: dict[str, dict[str, float]] = {
         "jpeg_quality_min": 48.0,
         "jpeg_quality_max": 93.0,
     },
+    "strong_clean": {
+        "blur_sigma_min": 0.25,
+        "blur_sigma_max": 2.10,
+        "resize_min": 0.48,
+        "noise_std_max_255": 1.50,
+        "jpeg_quality_min": 56.0,
+        "jpeg_quality_max": 95.0,
+    },
+    "strong_clean_tail": {
+        "blur_sigma_min": 0.25,
+        "blur_sigma_max": 2.35,
+        "resize_min": 0.45,
+        "noise_std_max_255": 1.50,
+        "jpeg_quality_min": 56.0,
+        "jpeg_quality_max": 95.0,
+    },
+    "strong_low_noise": {
+        "blur_sigma_min": 0.25,
+        "blur_sigma_max": 2.10,
+        "resize_min": 0.48,
+        "noise_std_max_255": 0.75,
+        "jpeg_quality_min": 52.0,
+        "jpeg_quality_max": 94.0,
+    },
 }
 
 TARGET_METRICS = ("hq_lr_psnr", "highpass_retention_ratio")
@@ -307,7 +331,10 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=tuple(sorted(PRESETS)),
         default=None,
-        help="Candidate preset; repeat to select several. Defaults to light/base/strong.",
+        help=(
+            "Candidate preset; repeat to select several. Defaults to light/base/strong. "
+            "Use strong_clean/strong_clean_tail/strong_low_noise for local refinement."
+        ),
     )
     return parser.parse_args()
 
@@ -356,7 +383,6 @@ def main() -> int:
                             args.seed,
                             row.get("clip_id"),
                             local_index,
-                            preset_name,
                             "noise",
                         )
                         * (2**32 - 1)
