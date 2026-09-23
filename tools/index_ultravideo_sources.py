@@ -90,13 +90,17 @@ def _read_metadata(path: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
         rows: dict[str, dict[str, str]] = {}
         duplicates: list[str] = []
         for row in reader:
-            clip_id = str(row.get("clip_id", "") or "").strip()
-            if not clip_id:
+            raw_clip_id = str(row.get("clip_id", "") or "").strip()
+            if not raw_clip_id:
                 continue
+            clip_name = Path(raw_clip_id).name
+            clip_id = clip_name[:-4] if clip_name.lower().endswith(".mp4") else clip_name
             if clip_id in rows:
                 duplicates.append(clip_id)
                 continue
-            rows[clip_id] = {str(key): str(value or "") for key, value in row.items()}
+            normalized = {str(key): str(value or "") for key, value in row.items()}
+            normalized["_metadata_clip_id"] = raw_clip_id
+            rows[clip_id] = normalized
     if duplicates:
         raise ValueError(
             f"Metadata contains duplicate clip_id values; examples={sorted(set(duplicates))[:10]}"
@@ -230,6 +234,7 @@ def main() -> int:
                 "dataset": "UltraVideo",
                 "subset": "short",
                 "clip_id": clip_id,
+                "metadata_clip_id": str(meta.get("_metadata_clip_id", "") or "") or None,
                 "raw_video": str(video_path),
                 "shard": int(shard_index),
                 "split": split,
