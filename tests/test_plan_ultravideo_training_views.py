@@ -120,6 +120,17 @@ class UltraVideoTrainingViewPlannerTest(unittest.TestCase):
         )
         self.assertNotIn(11, {item["candidate_index"] for item in selected})
 
+    def test_shard_partition_is_disjoint_and_complete(self):
+        rows = list(range(11))
+        shards = [
+            [value for index, value in enumerate(rows) if index % 3 == shard]
+            for shard in range(3)
+        ]
+        self.assertEqual(sorted(value for shard in shards for value in shard), rows)
+        self.assertFalse(set(shards[0]) & set(shards[1]))
+        self.assertFalse(set(shards[0]) & set(shards[2]))
+        self.assertFalse(set(shards[1]) & set(shards[2]))
+
     def test_selector_returns_4_2_2_without_duplicates(self):
         candidates = []
         for index in range(16):
