@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan eight deterministic SwiftVR training views per UltraVideo pilot clip.
+"""Plan deterministic SwiftVR training views per UltraVideo pilot clip.
 
 The planner is read-only with respect to raw media. It decodes a deterministic
 candidate pool from each selected UltraVideo clip, builds canonical clean HR/HQ
@@ -9,8 +9,8 @@ frames in memory, scores:
 - structural motion: adjacent HQ change after removing per-frame mean luma;
 - temporal spike ratio: rejects obvious cuts from the motion-focused pool.
 
-It then selects 4 detail views, 2 detail+motion views and 2 unbiased random
-views with a soft spatio-temporal overlap penalty. The output is a lightweight
+It selects configurable detail / detail+motion / random quotas with a soft
+spatio-temporal overlap penalty. The output is a lightweight
 JSONL view plan; no HR/HQ/LR training pixels are materialized here.
 """
 
@@ -346,10 +346,35 @@ def _select_views(
     random_count: int,
     diversity_weight: float,
     spike_limit: float,
+    global_spike_limit: float,
     seed: int,
 ) -> list[dict[str, object]]:
-    if len(candidates) < detail_count + detail_motion_count + random_count:
+    requested = detail_count + detail_motion_count + random_count
+    if len(candidates) < requested:
         raise ValueError("Candidate pool is smaller than requested selected views")
+    if global_spike_limit <= 0:
+        raise ValueError("global_spike_limit must be positive")
+
+    safe = [
+        item
+        for item in candidates
+        if float(item["temporal_spike_ratio"]) <= float(global_spike_limit)
+    ]
+    if len(safe) < requested:
+        rejected = sorted(
+            (
+                item
+                for item in candidates
+                if float(item["temporal_spike_ratio"]) > float(global_spike_limit)
+            ),
+            key=lambda item: (
+                float(item["temporal_spike_ratio"]),
+                int(item["candidate_index"]),
+            ),
+        )
+        safe.extend(rejected[: requested - len(safe)])
+    candidates = safe
+
     gaps = [float(item["clean_sr_highpass_gap"]) for item in candidates]
     detail_rank = _rank_normalized(gaps)
     motion_rank = _rank_normalized(
@@ -447,6 +472,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-count", type=int, default=2)
     parser.add_argument("--diversity-weight", type=float, default=0.35)
     parser.add_argument("--spike-limit", type=float, default=4.0)
+    parser.add_argument(
+        "--global-spike-limit",
+        type=float,
+        default=10.0,
+        help=(
+            "Wide scene-cut guard applied to every selection category. "
+            "If too few candidates remain, the lowest-spike rejected candidates "
+            "are used only to preserve the requested view count."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260923)
     parser.add_argument("--max-records", type=int, default=0)
     return parser.parse_args()
@@ -462,6 +497,10 @@ def main() -> int:
         raise ValueError("motion-score-frames must be in [2, clip-length]")
     if args.decode_batch_size <= 0:
         raise ValueError("decode-batch-size must be positive")
+    if args.spike_limit <= 0 or args.global_spike_limit <= 0:
+        raise ValueError("spike limits must be positive")
+    if args.spike_limit > args.global_spike_limit:
+        raise ValueError("spike-limit must not exceed global-spike-limit")
     requested = args.detail_count + args.detail_motion_count + args.random_count
     if requested <= 0 or args.candidate_count < requested:
         raise ValueError("candidate-count must cover all requested selected views")
@@ -583,6 +622,7 @@ def main() -> int:
             random_count=int(args.random_count),
             diversity_weight=float(args.diversity_weight),
             spike_limit=float(args.spike_limit),
+            global_spike_limit=float(args.global_spike_limit),
             seed=_stable_seed(seed, "random_selection"),
         )
         selected.sort(
@@ -674,6 +714,7 @@ def main() -> int:
         "cadence": "stride=2 for fps>=45, otherwise stride=1",
         "diversity_weight": float(args.diversity_weight),
         "spike_limit": float(args.spike_limit),
+        "global_spike_limit": float(args.global_spike_limit),
         "seed": int(args.seed),
         "selected_metric_distributions": {
             name: _quantiles(values)
@@ -685,6 +726,7 @@ def main() -> int:
             "The view selector uses only clean HR/HQ content; it is independent of synthetic degradation parameters.",
             "detail ranks clean 3x SR high-frequency loss within each clip.",
             "detail_motion combines within-clip detail and structural-motion ranks and excludes candidates above the temporal spike limit.",
+            "All categories also use a wide global temporal-spike guard to avoid obvious scene cuts.",
             "random views remain unbiased apart from the same diversity penalty.",
             "Motion scoring uses evenly spaced HQ-resolution proxy frames to bound native 4K/8K decode memory.",
             "Detail scoring decodes only the center native-resolution frame for each candidate.",
