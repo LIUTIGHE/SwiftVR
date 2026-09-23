@@ -33,6 +33,24 @@ class UltraVideoDegradationCalibrationTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         self.assertIn("Calibrate a deterministic synthetic UltraVideo degradation", completed.stdout)
 
+    def test_batch_to_numpy_accepts_torch_tensor(self):
+        import torch
+
+        value = torch.arange(12, dtype=torch.uint8).reshape(1, 2, 2, 3)
+        array = _TOOL._batch_to_numpy(value)
+        self.assertIsInstance(array, np.ndarray)
+        self.assertEqual(array.shape, (1, 2, 2, 3))
+        self.assertTrue(np.array_equal(array, value.numpy()))
+
+    def test_batch_to_numpy_accepts_asnumpy_object(self):
+        class FakeDecordArray:
+            def asnumpy(self):
+                return np.zeros((2, 3), dtype=np.uint8)
+
+        array = _TOOL._batch_to_numpy(FakeDecordArray())
+        self.assertIsInstance(array, np.ndarray)
+        self.assertEqual(array.shape, (2, 3))
+
     def test_source_balanced_selection_uses_distinct_groups(self):
         rows = [
             {"source_group_uid": "a", "clip_id": "a0"},
