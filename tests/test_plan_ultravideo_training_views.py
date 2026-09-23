@@ -52,6 +52,11 @@ class UltraVideoTrainingViewPlannerTest(unittest.TestCase):
         )
         self.assertEqual(left, right)
         self.assertEqual(len(left), 12)
+        self.assertEqual(len({item["raw_frame_start"] for item in left}), 4)
+        self.assertEqual(
+            [item["temporal_candidate_index"] for item in left],
+            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3],
+        )
         for item in left:
             positions = item["raw_frame_positions"]
             self.assertEqual(len(positions), 13)
