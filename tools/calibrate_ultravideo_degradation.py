@@ -17,12 +17,19 @@ import hashlib
 import io
 import json
 import math
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 from PIL import Image, ImageFilter
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS = ROOT / "tools"
+for search_root in (ROOT, TOOLS):
+    if str(search_root) not in sys.path:
+        sys.path.insert(0, str(search_root))
 
 from tools.profile_triplet_degradation import _pair_metrics, _quantiles
 
