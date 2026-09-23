@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import math
+import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -150,6 +151,7 @@ def _candidate_specs(
     crop_size: int,
     candidate_count: int,
     seed: int,
+    spatial_candidates_per_time: int = 3,
 ) -> list[dict[str, object]]:
     stride = _cadence_stride(fps)
     raw_span = (clip_length - 1) * stride + 1
@@ -161,10 +163,31 @@ def _candidate_specs(
     max_start = frame_count - raw_span
     max_top = hq_height - crop_size
     max_left = hq_width - crop_size
+    spatial_per_time = int(spatial_candidates_per_time)
+    if spatial_per_time <= 0:
+        raise ValueError("spatial_candidates_per_time must be positive")
     rng = np.random.default_rng(int(seed))
+    temporal_count = int(math.ceil(int(candidate_count) / spatial_per_time))
+    possible_starts = max_start + 1
+    if possible_starts >= temporal_count:
+        temporal_starts = [
+            int(value)
+            for value in rng.choice(
+                possible_starts,
+                size=temporal_count,
+                replace=False,
+            ).tolist()
+        ]
+    else:
+        temporal_starts = [
+            int(rng.integers(0, max_start + 1))
+            for _ in range(temporal_count)
+        ]
+
     specs: list[dict[str, object]] = []
     for candidate_index in range(int(candidate_count)):
-        start = int(rng.integers(0, max_start + 1))
+        temporal_index = candidate_index // spatial_per_time
+        start = temporal_starts[temporal_index]
         top = int(rng.integers(0, max_top + 1))
         left = int(rng.integers(0, max_left + 1))
         horizontal_flip = bool(rng.integers(0, 2))
@@ -172,6 +195,7 @@ def _candidate_specs(
         specs.append(
             {
                 "candidate_index": candidate_index,
+                "temporal_candidate_index": temporal_index,
                 "raw_frame_start": start,
                 "raw_frame_stride": stride,
                 "raw_frame_positions": frame_positions,
@@ -456,6 +480,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=int, default=3)
     parser.add_argument("--candidate-count", type=int, default=24)
     parser.add_argument(
+        "--spatial-candidates-per-time",
+        type=int,
+        default=3,
+        help=(
+            "Reuse each sampled temporal window for this many spatial candidates. "
+            "This reduces expensive random video seeks without reducing the total candidate pool."
+        ),
+    )
+    parser.add_argument(
         "--motion-score-frames",
         type=int,
         default=7,
@@ -493,6 +526,8 @@ def main() -> int:
         raise ValueError("clip-length must be positive and satisfy T=4k+1")
     if args.crop_size <= 0 or args.scale <= 0 or args.candidate_count <= 0:
         raise ValueError("crop-size, scale and candidate-count must be positive")
+    if args.spatial_candidates_per_time <= 0:
+        raise ValueError("spatial-candidates-per-time must be positive")
     if args.motion_score_frames < 2 or args.motion_score_frames > args.clip_length:
         raise ValueError("motion-score-frames must be in [2, clip-length]")
     if args.decode_batch_size <= 0:
@@ -553,6 +588,7 @@ def main() -> int:
             crop_size=int(args.crop_size),
             candidate_count=int(args.candidate_count),
             seed=seed,
+            spatial_candidates_per_time=int(args.spatial_candidates_per_time),
         )
         if len(specs) < requested:
             skipped.append(
@@ -583,34 +619,75 @@ def main() -> int:
                 for offset in score_offsets
             }
         )
+        center_specs: dict[int, list[Mapping[str, object]]] = {}
+        for spec in specs:
+            middle_position = int(
+                spec["raw_frame_positions"][int(args.clip_length) // 2]
+            )
+            center_specs.setdefault(middle_position, []).append(spec)
+        center_positions = sorted(center_specs)
+
+        verbose_clip = record_index <= 3 or record_index % 25 == 0 or record_index == len(rows)
+        if verbose_clip:
+            print(
+                f"[{record_index}/{len(rows)}] start clip={clip_id} "
+                f"source={source_width}x{source_height} fps={fps:g} frames={frame_count} "
+                f"candidates={len(specs)} temporal_windows={len(center_positions)} "
+                f"motion_positions={len(motion_positions)}",
+                flush=True,
+            )
+
+        stage_started = time.perf_counter()
         hq_proxy_frames = _decode_hq_proxy_frames(
             reader,
             motion_positions,
             hq_size=hq_size,
             batch_size=int(args.decode_batch_size),
         )
+        if verbose_clip:
+            print(
+                f"[{record_index}/{len(rows)}] motion proxies ready "
+                f"in {time.perf_counter() - stage_started:.1f}s",
+                flush=True,
+            )
+
+        detail_by_candidate: dict[int, dict[str, float]] = {}
+        stage_started = time.perf_counter()
+        for batch_start in range(0, len(center_positions), int(args.decode_batch_size)):
+            batch_positions = center_positions[
+                batch_start : batch_start + int(args.decode_batch_size)
+            ]
+            decoded_centers = _batch_to_numpy(reader.get_batch(batch_positions))
+            for local_index, middle_position in enumerate(batch_positions):
+                raw_middle = decoded_centers[local_index]
+                for spec in center_specs[middle_position]:
+                    detail_by_candidate[int(spec["candidate_index"])] = _detail_score(
+                        raw_middle,
+                        spec,
+                        canonical_hr_size=(hr_width, hr_height),
+                        crop_size=int(args.crop_size),
+                        scale=int(args.scale),
+                    )
+            del decoded_centers
+        if verbose_clip:
+            print(
+                f"[{record_index}/{len(rows)}] detail centers ready "
+                f"in {time.perf_counter() - stage_started:.1f}s",
+                flush=True,
+            )
+
         candidates: list[dict[str, object]] = []
         for spec in specs:
-            middle_position = int(
-                spec["raw_frame_positions"][int(args.clip_length) // 2]
-            )
-            raw_middle = _batch_to_numpy(reader.get_batch([middle_position]))[0]
-            detail = _detail_score(
-                raw_middle,
-                spec,
-                canonical_hr_size=(hr_width, hr_height),
-                crop_size=int(args.crop_size),
-                scale=int(args.scale),
-            )
             motion = _motion_score(
                 hq_proxy_frames,
                 spec,
                 score_offsets=score_offsets,
                 crop_size=int(args.crop_size),
             )
+            detail = detail_by_candidate[int(spec["candidate_index"])]
             candidates.append({**spec, **detail, **motion})
-            del raw_middle
-        del hq_proxy_frames
+        del hq_proxy_frames, detail_by_candidate
+
 
         stride = _cadence_stride(fps)
         selected = _select_views(
@@ -705,6 +782,7 @@ def main() -> int:
         },
         "selected_category_counts": dict(sorted(category_counts.items())),
         "candidate_count": int(args.candidate_count),
+        "spatial_candidates_per_time": int(args.spatial_candidates_per_time),
         "motion_score_frames": int(args.motion_score_frames),
         "decode_batch_size": int(args.decode_batch_size),
         "clip_length": int(args.clip_length),
@@ -728,7 +806,9 @@ def main() -> int:
             "detail_motion combines within-clip detail and structural-motion ranks and excludes candidates above the temporal spike limit.",
             "All categories also use a wide global temporal-spike guard to avoid obvious scene cuts.",
             "random views remain unbiased apart from the same diversity penalty.",
+            "Temporal candidate windows are reused across several spatial crops to reduce compressed-video random seeks.",
             "Motion scoring uses evenly spaced HQ-resolution proxy frames to bound native 4K/8K decode memory.",
+            "Center native frames are decoded in batches and reused across spatial candidates sharing a temporal window.",
             "Detail scoring decodes only the center native-resolution frame for each candidate.",
             "No training pixels are materialized by this planner.",
         ],
