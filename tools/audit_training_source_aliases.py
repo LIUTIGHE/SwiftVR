@@ -138,10 +138,14 @@ def main() -> int:
 
     selected_ids = _stable_order(list(cross_variant), args.seed)[: args.sample_count]
     comparisons: list[dict[str, object]] = []
+    controls: list[dict[str, object]] = []
     exact_frame_matches = 0
     compared_frames = 0
     rgb_maes: list[float] = []
     thumbnail_maes: list[float] = []
+
+    control_rgb_maes: list[float] = []
+    control_thumbnail_maes: list[float] = []
 
     for sample_id in selected_ids:
         variants = sorted(cross_variant[sample_id], key=lambda record: (_record_uid(record)))
@@ -177,6 +181,37 @@ def main() -> int:
             )
         print(f"checked alias {sample_id}", flush=True)
 
+    if len(selected_ids) > 1:
+        for position, sample_id in enumerate(selected_ids):
+            other_id = selected_ids[(position + 1) % len(selected_ids)]
+            left_variants = sorted(cross_variant[sample_id], key=lambda record: _record_uid(record))
+            right_variants = sorted(cross_variant[other_id], key=lambda record: _record_uid(record))
+            left = left_variants[0]
+            right = right_variants[-1]
+            common_count = min(left.frame_count, right.frame_count)
+            frame_rows: list[dict[str, object]] = []
+            for frame_position in _positions(common_count, args.frames_per_pair):
+                frame = _compare_frame(
+                    left.hr_paths[frame_position],
+                    right.hr_paths[frame_position],
+                    args.thumbnail_max_side,
+                )
+                frame["position"] = int(frame_position)
+                frame_rows.append(frame)
+                if isinstance(frame["rgb_mae"], float):
+                    control_rgb_maes.append(float(frame["rgb_mae"]))
+                if isinstance(frame["thumbnail_mae"], float):
+                    control_thumbnail_maes.append(float(frame["thumbnail_mae"]))
+            controls.append(
+                {
+                    "left_sample_id": sample_id,
+                    "right_sample_id": other_id,
+                    "left_record_uid": _record_uid(left),
+                    "right_record_uid": _record_uid(right),
+                    "frames": frame_rows,
+                }
+            )
+
     report = {
         "kind": "swiftvr_training_source_alias_sample_audit_v1",
         "manifests": [str(path.expanduser().resolve()) for path in args.manifest],
@@ -198,8 +233,22 @@ def main() -> int:
         "rgb_mae_max": float(np.max(rgb_maes)) if rgb_maes else None,
         "thumbnail_mae_mean": float(np.mean(thumbnail_maes)) if thumbnail_maes else None,
         "thumbnail_mae_max": float(np.max(thumbnail_maes)) if thumbnail_maes else None,
+        "control_rgb_mae_mean": float(np.mean(control_rgb_maes)) if control_rgb_maes else None,
+        "control_rgb_mae_min": float(np.min(control_rgb_maes)) if control_rgb_maes else None,
+        "control_thumbnail_mae_mean": (
+            float(np.mean(control_thumbnail_maes)) if control_thumbnail_maes else None
+        ),
+        "control_thumbnail_mae_min": (
+            float(np.min(control_thumbnail_maes)) if control_thumbnail_maes else None
+        ),
+        "matched_to_control_thumbnail_mae_ratio": (
+            float(np.mean(thumbnail_maes) / np.mean(control_thumbnail_maes))
+            if thumbnail_maes and control_thumbnail_maes and np.mean(control_thumbnail_maes) > 0
+            else None
+        ),
         "seed": int(args.seed),
         "comparisons": comparisons,
+        "controls": controls,
         "interpretation": (
             "Exact equality on sampled decoded HR frames is strong evidence that same sample_id "
             "plain/text records duplicate the same clean source despite living at different paths. "
@@ -208,7 +257,12 @@ def main() -> int:
         ),
     }
     _write_json(args.output.expanduser().resolve(), report)
-    print(json.dumps({key: value for key, value in report.items() if key != "comparisons"}, indent=2))
+    print(
+        json.dumps(
+            {key: value for key, value in report.items() if key not in {"comparisons", "controls"}},
+            indent=2,
+        )
+    )
     return 0
 
 
