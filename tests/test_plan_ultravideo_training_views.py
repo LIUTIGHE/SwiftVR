@@ -61,6 +61,27 @@ class UltraVideoTrainingViewPlannerTest(unittest.TestCase):
             self.assertGreaterEqual(x, 0)
             self.assertEqual((height, width), (128, 128))
 
+    def test_motion_score_uses_selected_proxy_frames(self):
+        import numpy as np
+
+        spec = {
+            "raw_frame_positions": list(range(13)),
+            "crop_box_hq": [0, 0, 4, 4],
+        }
+        frames = {}
+        for index in (0, 2, 4, 6, 8, 10, 12):
+            value = np.full((8, 8, 3), 20 + index, dtype=np.uint8)
+            value[:, index % 4 : (index % 4) + 2] = 100
+            frames[index] = value
+        metrics = _TOOL._motion_score(
+            frames,
+            spec,
+            score_offsets=(0, 2, 4, 6, 8, 10, 12),
+            crop_size=4,
+        )
+        self.assertGreater(metrics["structural_motion_l1"], 0.0)
+        self.assertGreaterEqual(metrics["temporal_spike_ratio"], 1.0)
+
     def test_selector_returns_4_2_2_without_duplicates(self):
         candidates = []
         for index in range(16):
