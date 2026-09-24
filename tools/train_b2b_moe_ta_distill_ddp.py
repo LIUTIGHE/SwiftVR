@@ -130,6 +130,53 @@ def _validate_args(args) -> tuple[int, ...]:
     return frame_indices
 
 
+def _make_train_loader(
+    dataset,
+    *,
+    rank: int,
+    world_size: int,
+    epoch: int,
+    args,
+    mixed_training: bool,
+):
+    if not mixed_training or args.domain_mixing == "natural":
+        return stage_a.make_train_loader(
+            dataset,
+            rank=rank,
+            world_size=world_size,
+            epoch=epoch,
+            args=args,
+        )
+
+    if not isinstance(dataset, ConcatDataset) or len(dataset.datasets) != 2:
+        raise TypeError("Balanced mixed training requires a two-domain ConcatDataset")
+    sampler = BalancedTwoDomainDistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        seed=args.seed,
+        drop_last=True,
+    )
+    sampler.set_epoch(epoch)
+    worker_kwargs = dataloader_worker_kwargs(
+        num_workers=args.num_workers,
+        prefetch_factor=getattr(args, "prefetch_factor", 2),
+        persistent_workers=bool(
+            getattr(args, "persistent_workers", False)
+            and int(args.num_workers) > 0
+        ),
+    )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=False,
+        drop_last=True,
+        pin_memory=args.pin_memory,
+        **worker_kwargs,
+    )
+
+
 def _gradient_summary_allow_sparse_experts(module) -> dict[str, object]:
     total_sq = 0.0
     gradient_tensors = 0
@@ -367,13 +414,35 @@ def main() -> int:
             and visualize_every > 0
         )
         run_config = {
-            "trainer": "b2b_d1024_moe_d1536_ta_distill_ddp_v1",
-            "experiment": "d1024_1s12e2a_vs_d768_compute_matched_race",
+            "trainer": "b2b_d1024_moe_d1536_ta_distill_ddp_v2",
+            "experiment": (
+                "m8a_full_boost_mixed_data"
+                if mixed_training
+                else "d1024_1s12e2a_vs_d768_compute_matched_race"
+            ),
             "base_checkpoint": str(base_root),
             "student_init": str(student_root),
             "student_shape": shape,
             "student_parameters": sum(parameter.numel() for parameter in transformer.parameters()),
             "teacher_cache": str(args.teacher_cache.expanduser().resolve()),
+            "legacy_teacher_cache": str(args.teacher_cache.expanduser().resolve()),
+            "ultravideo_teacher_cache": (
+                None
+                if args.ultravideo_teacher_cache is None
+                else str(args.ultravideo_teacher_cache.expanduser().resolve())
+            ),
+            "ultravideo_materialized_manifest": (
+                None
+                if args.ultravideo_materialized_manifest is None
+                else str(args.ultravideo_materialized_manifest.expanduser().resolve())
+            ),
+            "mixed_training": bool(mixed_training),
+            "domain_mixing": args.domain_mixing if mixed_training else None,
+            "legacy_training_samples": len(legacy_dataset),
+            "ultravideo_training_samples": (
+                0 if ultr_video_dataset is None else len(ultr_video_dataset)
+            ),
+            "training_dataset_length": len(train_dataset),
             "training_teacher": "b2a_d1536_teaching_assistant",
             "training_teacher_cache_kind": TA_CACHE_KIND,
             "val_teacher_cache": None if args.val_teacher_cache is None else str(args.val_teacher_cache.expanduser().resolve()),
@@ -489,7 +558,14 @@ def main() -> int:
 
         autocast_enabled = dtype in (torch.float16, torch.bfloat16)
         while global_step < args.max_steps:
-            loader = stage_a.make_train_loader(train_dataset, rank=rank, world_size=world_size, epoch=epoch, args=args)
+            loader = _make_train_loader(
+                train_dataset,
+                rank=rank,
+                world_size=world_size,
+                epoch=epoch,
+                args=args,
+                mixed_training=mixed_training,
+            )
             if len(loader) < args.gradient_accumulation_steps:
                 raise RuntimeError("Per-rank epoch is shorter than gradient accumulation")
             iterator = iter(loader)
