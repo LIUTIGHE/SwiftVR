@@ -15,6 +15,7 @@ from tools.train_b2b_moe_ta_distill_ddp import (
     TA_CACHE_KIND,
     STAGE_A_CACHE_KIND,
     _router_metrics_from_counts,
+    _validate_args,
     build_parser,
 )
 
@@ -40,6 +41,38 @@ class MoETATrainerConfigTests(unittest.TestCase):
         self.assertEqual(STAGE_A_CACHE_KIND, "swiftvr_b2a_stage_a_teacher_velocity")
         self.assertEqual(LOCKED_SPEC.top_k, 2)
         self.assertEqual(LOCKED_SPEC.num_experts, 12)
+
+    def test_parser_accepts_optional_ultravideo_mixed_training(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--base-checkpoint", "base",
+            "--student-init", "student",
+            "--teacher-cache", "ta-cache",
+            "--manifest", "train.jsonl",
+            "--max-steps", "20",
+            "--output-dir", "out",
+            "--ultravideo-materialized-manifest", "ultra.jsonl",
+            "--ultravideo-teacher-cache", "ultra-cache",
+            "--domain-mixing", "balanced",
+        ])
+        _validate_args(args)
+        self.assertEqual(str(args.ultravideo_materialized_manifest), "ultra.jsonl")
+        self.assertEqual(str(args.ultravideo_teacher_cache), "ultra-cache")
+        self.assertEqual(args.domain_mixing, "balanced")
+
+    def test_ultravideo_mixed_args_must_be_paired(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--base-checkpoint", "base",
+            "--student-init", "student",
+            "--teacher-cache", "ta-cache",
+            "--manifest", "train.jsonl",
+            "--max-steps", "20",
+            "--output-dir", "out",
+            "--ultravideo-materialized-manifest", "ultra.jsonl",
+        ])
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            _validate_args(args)
 
     def test_router_metric_balanced_case(self):
         counts = [100.0] * 12
