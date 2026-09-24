@@ -56,6 +56,7 @@ from swiftvr.training.b2b_moe_training import (
     router_summary,
     set_router_stats_collection,
 )
+from swiftvr.training.input_pipeline import dataloader_worker_kwargs
 from swiftvr.training.reference import sha256_file
 from swiftvr.training.mixed_distillation import (
     BalancedTwoDomainDistributedSampler,
@@ -228,12 +229,15 @@ def main() -> int:
             raise RuntimeError(f"{torch.cuda.get_device_name(device)} does not support BF16")
         seed_everything(args.seed + rank)
 
-        train_cache = TeacherVelocityCache(args.teacher_cache)
-        if train_cache.metadata.get("kind") != TA_CACHE_KIND:
-            raise ValueError(f"MoE TA training requires {TA_CACHE_KIND!r}, got {train_cache.metadata.get('kind')!r}")
-        train_dataset = stage_a.build_cached_dataset(
+        legacy_cache = TeacherVelocityCache(args.teacher_cache)
+        if legacy_cache.metadata.get("kind") != TA_CACHE_KIND:
+            raise ValueError(
+                f"MoE TA training requires {TA_CACHE_KIND!r}, "
+                f"got {legacy_cache.metadata.get('kind')!r}"
+            )
+        legacy_dataset = stage_a.build_cached_dataset(
             args.manifest,
-            train_cache,
+            legacy_cache,
             split=args.split,
             path_root=args.path_root,
             clip_length=args.clip_length,
@@ -246,6 +250,42 @@ def main() -> int:
             verify_paths=args.verify_paths,
             load_hq=False,
         )
+
+        mixed_training = args.ultravideo_materialized_manifest is not None
+        ultr_video_dataset = None
+        ultr_video_cache = None
+        if mixed_training:
+            ultr_video_manifest = args.ultravideo_materialized_manifest.expanduser().resolve()
+            ultr_video_cache = TeacherVelocityCache(args.ultravideo_teacher_cache)
+            if ultr_video_cache.metadata.get("kind") != TA_CACHE_KIND:
+                raise ValueError(
+                    f"UltraVideo TA cache requires {TA_CACHE_KIND!r}, "
+                    f"got {ultr_video_cache.metadata.get('kind')!r}"
+                )
+            ultr_video_dataset = UltraVideoMaterializedLRDataset(
+                ultr_video_manifest,
+                verify_paths=args.verify_paths,
+            )
+            validate_ultravideo_teacher_cache(
+                ultr_video_cache,
+                materialized_manifest=ultr_video_manifest,
+                dataset_length=len(ultr_video_dataset),
+            )
+            train_dataset = ConcatDataset(
+                [
+                    TaggedDataset(legacy_dataset, "legacy"),
+                    TaggedDataset(ultr_video_dataset, "ultravideo"),
+                ]
+            )
+            train_cache = MixedTeacherVelocityCache(
+                {
+                    "legacy": legacy_cache,
+                    "ultravideo": ultr_video_cache,
+                }
+            )
+        else:
+            train_dataset = legacy_dataset
+            train_cache = legacy_cache
 
         val_cache = None
         val_loader = None
