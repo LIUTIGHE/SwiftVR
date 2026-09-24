@@ -20,7 +20,7 @@ from typing import Mapping
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = ROOT / "tools"
@@ -37,6 +37,7 @@ from tools.smoke_training_forward import (
     resolve_runtime_dtype,
     validate_folded_checkpoint,
 )
+from swiftvr.data import UltraVideoMaterializedLRDataset
 from swiftvr.models import ReAE, WanTransformer3DModelPromptFreeNoTimeMoE
 from swiftvr.training import (
     TeacherVelocityCache,
@@ -56,6 +57,12 @@ from swiftvr.training.b2b_moe_training import (
     set_router_stats_collection,
 )
 from swiftvr.training.reference import sha256_file
+from swiftvr.training.mixed_distillation import (
+    BalancedTwoDomainDistributedSampler,
+    MixedTeacherVelocityCache,
+    TaggedDataset,
+    validate_ultravideo_teacher_cache,
+)
 
 TA_CACHE_KIND = "swiftvr_b2b_d1536_ta_velocity"
 STAGE_A_CACHE_KIND = "swiftvr_b2a_stage_a_teacher_velocity"
@@ -70,6 +77,24 @@ def build_parser():
         type=float,
         default=0.01,
         help="Weight on mean per-block Switch/Dense2MoE load-balance loss.",
+    )
+    parser.add_argument(
+        "--ultravideo-materialized-manifest",
+        type=Path,
+        default=None,
+        help="Optional merged LR-only UltraVideo materialized manifest for mixed-domain training.",
+    )
+    parser.add_argument(
+        "--ultravideo-teacher-cache",
+        type=Path,
+        default=None,
+        help="D1536 TA cache built for --ultravideo-materialized-manifest.",
+    )
+    parser.add_argument(
+        "--domain-mixing",
+        choices=("natural", "balanced"),
+        default="balanced",
+        help="When UltraVideo is enabled, use natural concat proportions or exact 50:50 domains.",
     )
     parser.set_defaults(
         student_hidden_dim=LOCKED_SPEC.hidden_dim,
@@ -86,6 +111,10 @@ def _validate_args(args) -> tuple[int, ...]:
     frame_indices = base._validate_args(args)
     if args.router_balance_weight < 0:
         raise ValueError("--router-balance-weight must be non-negative")
+    if (args.ultravideo_materialized_manifest is None) != (args.ultravideo_teacher_cache is None):
+        raise ValueError(
+            "--ultravideo-materialized-manifest and --ultravideo-teacher-cache must be provided together"
+        )
     locked = {
         "student_hidden_dim": LOCKED_SPEC.hidden_dim,
         "student_num_heads": LOCKED_SPEC.num_heads,
