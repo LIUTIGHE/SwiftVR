@@ -25,6 +25,11 @@ class UltraVideoLRMaterializationAuditTest(unittest.TestCase):
         self.assertEqual(_TOOL._canonical_geometry_from_raw(raw_4k), (3840, 2160))
         self.assertEqual(_TOOL._canonical_geometry_from_raw(raw_8k), (3840, 2160))
 
+    def test_clean_reference_applies_planned_flip(self):
+        base = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+        flipped = np.ascontiguousarray(base[:, ::-1])
+        self.assertTrue(np.array_equal(flipped[:, ::-1], base))
+
     def test_canonical_geometry_preserves_non_16_9_height(self):
         raw = np.zeros((2026, 3840, 3), dtype=np.uint8)
         width, height = _TOOL._canonical_geometry_from_raw(raw)
