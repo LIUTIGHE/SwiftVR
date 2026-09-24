@@ -54,6 +54,7 @@ class MoETATrainerConfigTests(unittest.TestCase):
             "--ultravideo-materialized-manifest", "ultra.jsonl",
             "--ultravideo-teacher-cache", "ultra-cache",
             "--domain-mixing", "balanced",
+            "--validate-every", "0",
         ])
         _validate_args(args)
         self.assertEqual(str(args.ultravideo_materialized_manifest), "ultra.jsonl")
@@ -70,6 +71,7 @@ class MoETATrainerConfigTests(unittest.TestCase):
             "--max-steps", "20",
             "--output-dir", "out",
             "--ultravideo-materialized-manifest", "ultra.jsonl",
+            "--validate-every", "0",
         ])
         with self.assertRaisesRegex(ValueError, "provided together"):
             _validate_args(args)
