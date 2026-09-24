@@ -80,6 +80,12 @@ def build_parser():
         help="Weight on mean per-block Switch/Dense2MoE load-balance loss.",
     )
     parser.add_argument(
+        "--training-teacher",
+        choices=("ta", "stage_a"),
+        default="ta",
+        help="Training velocity teacher: D1536 TA or Stage-A D3072 prompt-free/no-time.",
+    )
+    parser.add_argument(
         "--ultravideo-materialized-manifest",
         type=Path,
         default=None,
@@ -276,10 +282,14 @@ def main() -> int:
             raise RuntimeError(f"{torch.cuda.get_device_name(device)} does not support BF16")
         seed_everything(args.seed + rank)
 
+        expected_training_cache_kind = (
+            TA_CACHE_KIND if args.training_teacher == "ta" else STAGE_A_CACHE_KIND
+        )
         legacy_cache = TeacherVelocityCache(args.teacher_cache)
-        if legacy_cache.metadata.get("kind") != TA_CACHE_KIND:
+        if legacy_cache.metadata.get("kind") != expected_training_cache_kind:
             raise ValueError(
-                f"MoE TA training requires {TA_CACHE_KIND!r}, "
+                f"Training teacher {args.training_teacher!r} requires "
+                f"{expected_training_cache_kind!r}, "
                 f"got {legacy_cache.metadata.get('kind')!r}"
             )
         legacy_dataset = stage_a.build_cached_dataset(
@@ -304,9 +314,10 @@ def main() -> int:
         if mixed_training:
             ultr_video_manifest = args.ultravideo_materialized_manifest.expanduser().resolve()
             ultr_video_cache = TeacherVelocityCache(args.ultravideo_teacher_cache)
-            if ultr_video_cache.metadata.get("kind") != TA_CACHE_KIND:
+            if ultr_video_cache.metadata.get("kind") != expected_training_cache_kind:
                 raise ValueError(
-                    f"UltraVideo TA cache requires {TA_CACHE_KIND!r}, "
+                    f"UltraVideo training teacher {args.training_teacher!r} requires "
+                    f"{expected_training_cache_kind!r}, "
                     f"got {ultr_video_cache.metadata.get('kind')!r}"
                 )
             ultr_video_dataset = UltraVideoMaterializedLRDataset(
@@ -443,8 +454,13 @@ def main() -> int:
                 0 if ultr_video_dataset is None else len(ultr_video_dataset)
             ),
             "training_dataset_length": len(train_dataset),
-            "training_teacher": "b2a_d1536_teaching_assistant",
-            "training_teacher_cache_kind": TA_CACHE_KIND,
+            "training_teacher": (
+                "b2a_d1536_teaching_assistant"
+                if args.training_teacher == "ta"
+                else "stage_a_d3072_prompt_free_no_time"
+            ),
+            "training_teacher_mode": args.training_teacher,
+            "training_teacher_cache_kind": expected_training_cache_kind,
             "val_teacher_cache": None if args.val_teacher_cache is None else str(args.val_teacher_cache.expanduser().resolve()),
             "validation_teacher": "stage_a_d3072_reference",
             "validation_teacher_cache_kind": STAGE_A_CACHE_KIND,
