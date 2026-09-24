@@ -117,16 +117,21 @@ class BalancedTwoDomainDistributedSampler(Sampler[int]):
         if not 0 <= self.rank < self.num_replicas:
             raise ValueError("rank must be in [0, num_replicas)")
 
-        self.per_domain_global = max(self.length_a, self.length_b)
-        global_total = 2 * self.per_domain_global
+        requested_per_domain = max(self.length_a, self.length_b)
         if self.drop_last:
-            self.total_size = (
-                global_total // self.num_replicas
+            self.per_domain_global = (
+                requested_per_domain // self.num_replicas
             ) * self.num_replicas
+            if self.per_domain_global <= 0:
+                raise ValueError(
+                    "Largest domain is smaller than num_replicas with drop_last=True"
+                )
         else:
-            self.total_size = (
-                (global_total + self.num_replicas - 1) // self.num_replicas
+            self.per_domain_global = (
+                (requested_per_domain + self.num_replicas - 1)
+                // self.num_replicas
             ) * self.num_replicas
+        self.total_size = 2 * self.per_domain_global
         self.num_samples = self.total_size // self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
@@ -179,11 +184,11 @@ class BalancedTwoDomainDistributedSampler(Sampler[int]):
         order = torch.randperm(len(combined), generator=generator).tolist()
         shuffled = [combined[index] for index in order]
 
-        if self.drop_last:
-            shuffled = shuffled[: self.total_size]
-        elif len(shuffled) < self.total_size:
-            padding = self.total_size - len(shuffled)
-            shuffled.extend(shuffled[:padding])
+        if len(shuffled) != self.total_size:
+            raise RuntimeError(
+                f"Balanced sampler built {len(shuffled)} global indices, "
+                f"expected {self.total_size}"
+            )
 
         rank_indices = shuffled[self.rank : self.total_size : self.num_replicas]
         if len(rank_indices) != self.num_samples:
