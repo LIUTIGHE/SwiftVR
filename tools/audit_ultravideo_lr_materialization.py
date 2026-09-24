@@ -52,12 +52,41 @@ def _load_lr_center(row: dict[str, object]) -> np.ndarray:
     return np.transpose(center, (1, 2, 0)).astype(np.uint8, copy=False)
 
 
+def _canonical_geometry_from_raw(raw: np.ndarray, target_width: int = 3840) -> tuple[int, int]:
+    height, width = raw.shape[:2]
+    if width > int(target_width):
+        scale = float(target_width) / float(width)
+        width = int(target_width)
+        height = max(1, round(height * scale))
+    width -= width % 3
+    height -= height % 3
+    if width <= 0 or height <= 0:
+        raise ValueError("Canonical dimensions collapsed after divisibility crop")
+    return int(width), int(height)
+
+
 def _clean_center(row: dict[str, object]) -> np.ndarray:
     positions = [int(value) for value in row["frame_indices"]]
     position = positions[len(positions) // 2]
     reader = _decord_reader(str(row["raw_video"]))
     raw = _batch_to_numpy(reader.get_batch([position]))[0]
-    return np.asarray(_clean_hq_crop(raw, row), dtype=np.uint8)
+
+    adapted = dict(row)
+    if "canonical_hr_width" not in adapted or "canonical_hr_height" not in adapted:
+        width, height = _canonical_geometry_from_raw(raw)
+        adapted["canonical_hr_width"] = width
+        adapted["canonical_hr_height"] = height
+    if "crop_box_hq" not in adapted:
+        crop_size = int(adapted.get("crop_size", 0))
+        if crop_size <= 0:
+            raise ValueError("Legacy materialized row lacks positive crop_size")
+        adapted["crop_box_hq"] = [
+            int(adapted["crop_top"]),
+            int(adapted["crop_left"]),
+            crop_size,
+            crop_size,
+        ]
+    return np.asarray(_clean_hq_crop(raw, adapted), dtype=np.uint8)
 
 
 def _severity(row: dict[str, object]) -> float:
@@ -158,6 +187,7 @@ def main() -> int:
         "notes": [
             "Metrics use only the center frame of each fixed 13-frame view.",
             "This is a sanity audit of the new broad degradation support, not a legacy-histogram matching objective.",
+            "Older smoke manifests without canonical geometry are reconstructed with the same 3840-wide planner rule.",
         ],
     }
     _write_json(output / "summary.json", summary)
