@@ -51,12 +51,13 @@ def _resize_btchw(
 
 
 def prepare_training_batch(
-    batch: Mapping[str, torch.Tensor],
+    batch: Mapping[str, object],
     *,
     input_key: str = "lr",
     target_key: str = "hr",
     auxiliary_key: Optional[str] = "hq",
     upscale_mode: str = "bilinear",
+    allow_missing_target: bool = False,
 ) -> dict[str, Optional[torch.Tensor]]:
     """Align an LR/HQ/HR batch to deployment-time output geometry.
 
@@ -67,35 +68,87 @@ def prepare_training_batch(
 
     The default target is ``hr``. The clean 720p ``hq`` sequence is retained as
     an aligned auxiliary reference but is not included in the base loss.
+
+    ``allow_missing_target=True`` is reserved for velocity-only distillation
+    datasets that intentionally store only LR. In that mode the deployment target
+    geometry is inferred from collated ``target_height``/``target_width``
+    metadata, falling back to a uniform collated ``scale`` value. The returned
+    target is ``None``; callers that optimize or visualize RGB targets must keep
+    the default strict behavior.
     """
 
     if input_key not in batch:
         raise KeyError(f"Missing input tensor {input_key!r}")
-    if target_key not in batch:
-        raise KeyError(f"Missing target tensor {target_key!r}")
 
     lq = batch[input_key]
-    target = batch[target_key]
+    if not isinstance(lq, torch.Tensor):
+        raise TypeError(f"Batch input {input_key!r} must be a tensor")
     _validate_video(input_key, lq)
-    _validate_video(target_key, target)
 
-    if lq.shape[:3] != target.shape[:3]:
-        raise ValueError(
-            f"{input_key} and {target_key} must share [B,T,C], got "
-            f"{tuple(lq.shape[:3])} vs {tuple(target.shape[:3])}"
-        )
+    target = batch.get(target_key)
+    if target is None:
+        if not allow_missing_target:
+            raise KeyError(f"Missing target tensor {target_key!r}")
 
-    target_size = (int(target.shape[-2]), int(target.shape[-1]))
+        def _uniform_int(name: str) -> int | None:
+            value = batch.get(name)
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                flattened = value.detach().cpu().reshape(-1)
+                if flattened.numel() == 0:
+                    raise ValueError(f"Batch metadata {name!r} is empty")
+                first = int(flattened[0].item())
+                if not bool(torch.all(flattened == first).item()):
+                    raise ValueError(f"Batch metadata {name!r} must be uniform")
+                return first
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                values = [int(item) for item in value]
+                if not values:
+                    raise ValueError(f"Batch metadata {name!r} is empty")
+                if any(item != values[0] for item in values[1:]):
+                    raise ValueError(f"Batch metadata {name!r} must be uniform")
+                return values[0]
+            return int(value)
+
+        target_height = _uniform_int("target_height")
+        target_width = _uniform_int("target_width")
+        if (target_height is None) != (target_width is None):
+            raise ValueError("target_height and target_width must be provided together")
+        if target_height is None:
+            scale = _uniform_int("scale")
+            if scale is None or scale <= 0:
+                raise ValueError(
+                    "LR-only distillation batch requires positive scale or explicit target geometry"
+                )
+            target_height = int(lq.shape[-2]) * scale
+            target_width = int(lq.shape[-1]) * scale
+        if target_height <= 0 or target_width <= 0:
+            raise ValueError("Inferred target geometry must be positive")
+        target_size = (target_height, target_width)
+    else:
+        if not isinstance(target, torch.Tensor):
+            raise TypeError(f"Batch target {target_key!r} must be a tensor")
+        _validate_video(target_key, target)
+
+        if lq.shape[:3] != target.shape[:3]:
+            raise ValueError(
+                f"{input_key} and {target_key} must share [B,T,C], got "
+                f"{tuple(lq.shape[:3])} vs {tuple(target.shape[:3])}"
+            )
+        target_size = (int(target.shape[-2]), int(target.shape[-1]))
+
     lq_input = _resize_btchw(lq, target_size, upscale_mode)
 
     hq_reference = None
     if auxiliary_key is not None and auxiliary_key in batch:
         hq_reference = batch[auxiliary_key]
         _validate_video(auxiliary_key, hq_reference)
-        if hq_reference.shape[:3] != target.shape[:3]:
+        reference_shape = target.shape[:3] if isinstance(target, torch.Tensor) else lq.shape[:3]
+        if hq_reference.shape[:3] != reference_shape:
             raise ValueError(
-                f"{auxiliary_key} and {target_key} must share [B,T,C], got "
-                f"{tuple(hq_reference.shape[:3])} vs {tuple(target.shape[:3])}"
+                f"{auxiliary_key} must share [B,T,C] with the input/target, got "
+                f"{tuple(hq_reference.shape[:3])} vs {tuple(reference_shape)}"
             )
         hq_reference = _resize_btchw(hq_reference, target_size, upscale_mode)
 
