@@ -138,11 +138,13 @@ class B2BMoEVelocityDistillationForward(nn.Module):
         )
 
     def forward(self, batch) -> dict[str, torch.Tensor]:
-        prepared = prepare_training_batch(batch)
+        prepared = prepare_training_batch(batch, allow_missing_target=True)
         lq_input = prepared["lq_input"]
         target = prepared["target"]
-        if not isinstance(lq_input, torch.Tensor) or not isinstance(target, torch.Tensor):
-            raise TypeError("Prepared batch is missing lq_input/target tensors")
+        if not isinstance(lq_input, torch.Tensor):
+            raise TypeError("Prepared batch is missing lq_input tensor")
+        if target is not None and not isinstance(target, torch.Tensor):
+            raise TypeError("Prepared target must be a tensor or None")
         z_lq_ntchw = encode_reae_clip(self.reae, lq_input, require_4k_plus_1=True)
         z_lq = z_lq_ntchw.permute(0, 2, 1, 3, 4).contiguous()
         velocity, balance_loss = forward_moe_transformer_training(
