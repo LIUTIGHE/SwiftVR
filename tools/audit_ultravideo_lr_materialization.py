@@ -86,7 +86,12 @@ def _clean_center(row: dict[str, object]) -> np.ndarray:
             crop_size,
             crop_size,
         ]
-    return np.asarray(_clean_hq_crop(raw, adapted), dtype=np.uint8)
+    clean = np.asarray(_clean_hq_crop(raw, adapted), dtype=np.uint8)
+    if bool(adapted.get("horizontal_flip", False)):
+        clean = np.ascontiguousarray(clean[:, ::-1])
+    if bool(adapted.get("vertical_flip", False)):
+        clean = np.ascontiguousarray(clean[::-1, :])
+    return clean
 
 
 def _severity(row: dict[str, object]) -> float:
