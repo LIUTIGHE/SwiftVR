@@ -61,6 +61,21 @@ class MoETATrainerConfigTests(unittest.TestCase):
         self.assertEqual(str(args.ultravideo_teacher_cache), "ultra-cache")
         self.assertEqual(args.domain_mixing, "balanced")
 
+    def test_parser_accepts_stage_a_training_teacher(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--base-checkpoint", "base",
+            "--student-init", "student",
+            "--teacher-cache", "stage-a-cache",
+            "--manifest", "train.jsonl",
+            "--max-steps", "20",
+            "--output-dir", "out",
+            "--training-teacher", "stage_a",
+            "--validate-every", "0",
+        ])
+        _validate_args(args)
+        self.assertEqual(args.training_teacher, "stage_a")
+
     def test_ultravideo_mixed_args_must_be_paired(self):
         parser = build_parser()
         args = parser.parse_args([
