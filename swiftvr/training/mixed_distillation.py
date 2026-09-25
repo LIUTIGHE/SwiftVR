@@ -14,7 +14,27 @@ from .reference import sha256_file
 
 
 class TaggedDataset(Dataset):
-    """Attach a teacher-cache domain tag without changing the wrapped sample."""
+    """Normalize a fixed velocity-distillation sample and attach its cache domain.
+
+    Mixed legacy/UltraVideo batches must expose an identical mapping schema so
+    PyTorch's default collate can combine both domains. RGB targets/auxiliaries
+    are intentionally removed here because this mixed path optimizes cached
+    velocity only; validation remains on the original legacy dataset path.
+    """
+
+    _IDENTITY_KEYS = (
+        "sample_id",
+        "record_uid",
+        "variant",
+        "frame_indices",
+        "crop_top",
+        "crop_left",
+        "horizontal_flip",
+        "vertical_flip",
+        "distillation_index",
+        "distillation_view_index",
+        "distillation_view_seed",
+    )
 
     def __init__(self, dataset: Dataset, tag: str) -> None:
         self.dataset = dataset
@@ -31,8 +51,30 @@ class TaggedDataset(Dataset):
         sample = self.dataset[int(index)]
         if not isinstance(sample, Mapping):
             raise TypeError("TaggedDataset requires mapping samples")
-        result = dict(sample)
-        result["teacher_cache_domain"] = self.tag
+        lr = sample.get("lr")
+        if not isinstance(lr, torch.Tensor) or lr.ndim != 4:
+            raise TypeError("TaggedDataset requires LR tensor [T,C,H,W]")
+        missing = [key for key in self._IDENTITY_KEYS if key not in sample]
+        if missing:
+            raise KeyError(f"Velocity-distillation sample is missing identity keys: {missing}")
+        scale = int(sample.get("scale", 0))
+        if scale <= 0:
+            raise ValueError("Velocity-distillation sample requires positive scale")
+        target_height = int(sample.get("target_height", int(lr.shape[-2]) * scale))
+        target_width = int(sample.get("target_width", int(lr.shape[-1]) * scale))
+        if target_height != int(lr.shape[-2]) * scale:
+            raise ValueError("target_height does not match LR height * scale")
+        if target_width != int(lr.shape[-1]) * scale:
+            raise ValueError("target_width does not match LR width * scale")
+
+        result = {
+            "lr": lr,
+            **{key: sample[key] for key in self._IDENTITY_KEYS},
+            "scale": scale,
+            "target_height": target_height,
+            "target_width": target_width,
+            "teacher_cache_domain": self.tag,
+        }
         return result
 
 
