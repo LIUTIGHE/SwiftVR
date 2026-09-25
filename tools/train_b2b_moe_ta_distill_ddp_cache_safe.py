@@ -180,8 +180,13 @@ def _configure_architecture(architecture: str) -> None:
             name = Path(path).name
             if name == "run_config.json":
                 payload["trainer"] = trainer_id
-                payload["experiment"] = experiment
-                payload["curriculum_phase"] = phase
+                if bool(payload.get("mixed_training", False)):
+                    teacher_mode = str(payload.get("training_teacher_mode", "unknown"))
+                    payload["experiment"] = f"m8a_mixed_data_{teacher_mode}_refinement"
+                    payload["curriculum_phase"] = "M8A_mixed_data_refinement"
+                else:
+                    payload["experiment"] = experiment
+                    payload["curriculum_phase"] = phase
                 payload["architecture"] = architecture
             elif name in {"best.json", "summary.json"}:
                 payload["architecture"] = architecture
@@ -194,7 +199,10 @@ def _configure_architecture(architecture: str) -> None:
             metadata = dict(metadata)
             metadata["trainer"] = trainer_id
             metadata["architecture"] = architecture
-            metadata["curriculum_phase"] = phase
+            if bool(metadata.get("mixed_training", False)):
+                metadata["curriculum_phase"] = "M8A_mixed_data_refinement"
+            else:
+                metadata["curriculum_phase"] = phase
             kwargs["metadata"] = metadata
         return _original_save_snapshot(*args, **kwargs)
 
