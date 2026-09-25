@@ -10,9 +10,9 @@ Architecture modes:
 * ``--architecture m8-d1024-l20`` selects the M8-A hardware-oriented
   D1024/H8/L20 1S12E2A depth-pruned student.
 
-All architecture-gate modes train from the cached D1536 teaching assistant and
-validate against Stage-A D3072. ``--stage-a-refine`` remains the M6 direct
-Stage-A-refinement mode and is intentionally restricted to M5.
+Architecture-gate modes validate against Stage-A D3072. The underlying trainer's
+``--training-teacher`` selects D1536 TA or Stage-A D3072 for training. The legacy
+``--stage-a-refine`` compatibility flag remains restricted to M5.
 
 Rank-0 validation runs under ``torch.inference_mode()`` while training resumes
 with autograd enabled. SwiftVR shifted-window attention keeps process-local CUDA
@@ -164,11 +164,11 @@ def _configure_architecture(architecture: str) -> None:
         return
 
     if architecture == M7A_MOE_ARCHITECTURE:
-        trainer_id = "b2b_m7a_d1152_l25_moe_d1536_ta_distill_ddp_v1"
+        trainer_id = "b2b_m7a_d1152_l25_moe_velocity_distill_ddp_v2"
         experiment = "m7a_d1152_l25_vs_m5_d1024_l30_compute_matched_race"
         phase = "M7A_width_depth_architecture_gate"
     elif architecture == M8_MOE_ARCHITECTURE:
-        trainer_id = "b2b_m8_d1024_l20_moe_d1536_ta_distill_ddp_v1"
+        trainer_id = "b2b_m8_d1024_l20_moe_velocity_distill_ddp_v2"
         experiment = "m8_d1024_l20_hardware_oriented_depth_gate"
         phase = "M8A_d1024_l20_architecture_gate"
     else:
@@ -183,8 +183,6 @@ def _configure_architecture(architecture: str) -> None:
                 payload["experiment"] = experiment
                 payload["curriculum_phase"] = phase
                 payload["architecture"] = architecture
-                payload["training_teacher"] = "b2a_d1536_teaching_assistant"
-                payload["training_teacher_cache_kind"] = trainer.TA_CACHE_KIND
             elif name in {"best.json", "summary.json"}:
                 payload["architecture"] = architecture
                 payload["curriculum_phase"] = phase
@@ -197,7 +195,6 @@ def _configure_architecture(architecture: str) -> None:
             metadata["trainer"] = trainer_id
             metadata["architecture"] = architecture
             metadata["curriculum_phase"] = phase
-            metadata["training_teacher"] = "b2a_d1536_teaching_assistant"
             kwargs["metadata"] = metadata
         return _original_save_snapshot(*args, **kwargs)
 
@@ -313,12 +310,12 @@ def main() -> int:
         )
     elif architecture == M7A_MOE_ARCHITECTURE:
         print(
-            "[M7-A] D1152/H9/L25 1S12E2A enabled: training teacher = D1536 TA",
+            "[M7-A] D1152/H9/L25 1S12E2A enabled; training teacher selected by --training-teacher",
             flush=True,
         )
     elif architecture == M8_MOE_ARCHITECTURE:
         print(
-            "[M8-A] D1024/H8/L20 1S12E2A enabled: training teacher = D1536 TA",
+            "[M8-A] D1024/H8/L20 1S12E2A enabled; training teacher selected by --training-teacher",
             flush=True,
         )
     if lr_schedule_total_steps is not None:
