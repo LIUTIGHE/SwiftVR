@@ -36,6 +36,8 @@ class _DictDataset(Dataset):
             "distillation_index": int(index),
             "distillation_view_index": 0,
             "distillation_view_seed": 1,
+            "scale": 3,
+            "hr": torch.zeros(3, 3, 24, 24),
         }
 
 
@@ -55,6 +57,36 @@ class MixedDistillationTest(unittest.TestCase):
         sample = tagged[1]
         self.assertEqual(sample["teacher_cache_domain"], "legacy")
         self.assertNotIn("teacher_cache_domain", source[1])
+
+    def test_tagged_datasets_collate_to_identical_velocity_schema(self):
+        from torch.utils.data import DataLoader
+
+        legacy = TaggedDataset(_DictDataset(1, "a"), "legacy")
+        ultra = TaggedDataset(_DictDataset(1, "b"), "ultravideo")
+        dataset = ConcatDataset([legacy, ultra])
+        batch = next(iter(DataLoader(dataset, batch_size=2, shuffle=False)))
+        self.assertEqual(set(batch), {
+            "lr",
+            "sample_id",
+            "record_uid",
+            "variant",
+            "frame_indices",
+            "crop_top",
+            "crop_left",
+            "horizontal_flip",
+            "vertical_flip",
+            "distillation_index",
+            "distillation_view_index",
+            "distillation_view_seed",
+            "scale",
+            "target_height",
+            "target_width",
+            "teacher_cache_domain",
+        })
+        self.assertNotIn("hr", batch)
+        self.assertEqual(batch["teacher_cache_domain"], ["legacy", "ultravideo"])
+        self.assertTrue(torch.equal(batch["target_height"], torch.tensor([24, 24])))
+        self.assertTrue(torch.equal(batch["target_width"], torch.tensor([24, 24])))
 
     def test_balanced_sampler_is_exact_global_50_50(self):
         left = TaggedDataset(_DictDataset(3, "a"), "legacy")
