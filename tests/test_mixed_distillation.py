@@ -25,6 +25,7 @@ class _DictDataset(Dataset):
     def __getitem__(self, index: int):
         return {
             "value": f"{self.prefix}{index}",
+            "lr": torch.zeros(3, 3, 8, 8, dtype=torch.float32),
             "frame_indices": torch.tensor([0, 1, 2], dtype=torch.int64),
             "record_uid": f"{self.prefix}:{index}",
             "sample_id": f"{self.prefix}{index}",
