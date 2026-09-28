@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TOOL_PATH = _REPO_ROOT / "tools" / "run_m8_fullboost_custom_compare.py"
@@ -37,6 +41,41 @@ class RunM8FullBoostCustomCompareTest(unittest.TestCase):
             [sys.executable, "-c", "raise SystemExit(99)"],
             dry_run=True,
         )
+
+
+    def test_auto_detail_crops_are_target_coordinates_and_non_overlapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "frames"
+            image_dir.mkdir()
+            frame = np.zeros((120, 200, 3), dtype=np.uint8)
+            # Two separated textured areas.
+            yy, xx = np.indices((40, 40))
+            texture = (((xx + yy) % 2) * 255).astype(np.uint8)
+            frame[10:50, 10:50, :] = texture[..., None]
+            frame[60:100, 140:180, :] = texture[..., None]
+            Image.fromarray(frame).save(image_dir / "00000.png")
+
+            crops = _TOOL._auto_detail_crops(
+                image_dir,
+                upscale=3,
+                frame_indices=[0],
+                count=2,
+                target_crop_size=90,
+                iou_threshold=0.10,
+            )
+            self.assertEqual(len(crops), 2)
+            parsed = []
+            for value in crops:
+                _, raw = value.split(":", 1)
+                x, y, w, h = map(int, raw.split(","))
+                self.assertEqual((w, h), (90, 90))
+                self.assertGreaterEqual(x, 0)
+                self.assertGreaterEqual(y, 0)
+                self.assertLessEqual(x + w, 600)
+                self.assertLessEqual(y + h, 360)
+                parsed.append((x, y, w, h))
+            self.assertLessEqual(_TOOL._box_iou(parsed[0], parsed[1]), 0.10)
 
 
 if __name__ == "__main__":
