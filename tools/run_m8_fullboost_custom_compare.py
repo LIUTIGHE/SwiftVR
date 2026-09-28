@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -482,13 +483,11 @@ def main() -> int:
         and comparison_dir.exists()
         and any(comparison_dir.iterdir())
     ):
-        if not args.skip_existing:
-            raise FileExistsError(
-                f"Comparison output is not empty: {comparison_dir}; "
-                "use a new --output-dir or --skip-existing"
-            )
-        print(f"[reuse] comparison directory already exists: {comparison_dir}")
-        return 0
+        print(
+            f"[rebuild] removing stale comparison output: {comparison_dir}",
+            flush=True,
+        )
+        shutil.rmtree(comparison_dir)
 
     compare_command = [
         sys.executable,
