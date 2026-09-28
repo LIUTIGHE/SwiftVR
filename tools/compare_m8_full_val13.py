@@ -53,9 +53,12 @@ from swiftvr.training import (
     VideoMetricAccumulator,
     decode_student_prediction,
     decode_teacher_prediction,
+    encode_reae_clip,
+    prepare_prompt_free_no_time_transformer_for_training,
+    prepare_training_batch,
 )
 from swiftvr.training.b2b_moe import transformer_moe_shape
-from swiftvr.training.b2b_moe_training import B2BMoEVelocityDistillationForward
+from swiftvr.training.b2b_moe_training import forward_moe_transformer_training
 from swiftvr.training.perceptual_review import make_comparison_frame, parse_csv_ints
 
 
@@ -295,7 +298,9 @@ def main() -> int:
             raise RuntimeError("CUDA requested but unavailable")
         torch.cuda.set_device(device)
         if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-            raise RuntimeError(f"{torch.cuda.get_device_name(device)} does not support BF16")
+            raise RuntimeError(
+                f"{torch.cuda.get_device_name(device)} does not support BF16"
+            )
 
     out_root = args.output_dir.expanduser().resolve()
     if out_root.exists() and any(out_root.iterdir()):
@@ -329,52 +334,19 @@ def main() -> int:
 
     base_root = args.base_checkpoint.expanduser().resolve()
     reae = ReAE(str(base_root / args.reae_filename)).to(
-        device=device, dtype=dtype
+        device=device,
+        dtype=dtype,
     ).eval()
-
-    models: OrderedDict[str, B2BMoEVelocityDistillationForward] = OrderedDict()
-    shapes: dict[str, object] = {}
-    for label, checkpoint in model_specs:
-        transformer = WanTransformer3DModelPromptFreeNoTimeMoE.from_pretrained(
-            str(checkpoint),
-            subfolder=args.transformer_subfolder,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(device=device, dtype=dtype)
-        shape = transformer_moe_shape(transformer)
-        if int(shape["num_layers"]) != 20:
-            raise ValueError(
-                f"{label}: expected M8 L20 checkpoint, got shape={shape}"
-            )
-        model = B2BMoEVelocityDistillationForward(
-            reae,
-            transformer,
-            attention_backend=args.attention_backend,
-            gradient_checkpointing=False,
-        ).to(device=device).eval()
-        models[label] = model
-        shapes[label] = shape
-
-    aggregate_velocity = {
-        label: DistillationMetricAccumulator() for label in labels
-    }
-    aggregate_stage_a = {
-        label: VideoMetricAccumulator() for label in labels
-    }
-    aggregate_gt = {
-        label: VideoMetricAccumulator() for label in labels
-    }
-    aggregate_teacher_gt = VideoMetricAccumulator()
-
-    records: list[dict[str, object]] = []
-    overview_middle: list[Image.Image] = []
-    overview_detail: list[Image.Image] = []
-    video_errors: list[dict[str, str]] = []
 
     autocast_enabled = device.type == "cuda" and dtype in (
         torch.float16,
         torch.bfloat16,
     )
+
+    # Build the immutable common val13 bank exactly once.  This avoids repeating
+    # ReAE encoding and Stage-A decoding for every compared M8 checkpoint.
+    bank: list[dict[str, object]] = []
+    aggregate_teacher_gt = VideoMetricAccumulator()
     with torch.inference_mode():
         for sample_index, batch_cpu in enumerate(loader):
             if sample_index >= args.max_samples:
@@ -385,44 +357,24 @@ def main() -> int:
                 dtype=dtype,
             )
             batch = move_video_batch(batch_cpu, device=device, dtype=dtype)
-
-            outputs: OrderedDict[str, Mapping[str, object]] = OrderedDict()
-            predictions: OrderedDict[str, torch.Tensor] = OrderedDict()
             with torch.autocast(
                 device_type=device.type,
                 dtype=dtype if autocast_enabled else torch.float32,
                 enabled=autocast_enabled,
             ):
-                for label, model in models.items():
-                    output = model(batch)
-                    outputs[label] = output
-                first_output = outputs[baseline_label]
-                z_lq = first_output["z_lq"]
-                target = first_output["target"]
-                if not isinstance(z_lq, torch.Tensor) or not isinstance(target, torch.Tensor):
-                    raise TypeError("M8 validation requires z_lq/target tensors")
-                for label, output in outputs.items():
-                    candidate_z = output["z_lq"]
-                    candidate_target = output["target"]
-                    if not isinstance(candidate_z, torch.Tensor) or not torch.equal(
-                        candidate_z, z_lq
-                    ):
-                        raise RuntimeError(
-                            f"{label}: ReAE encoding differs from baseline"
-                        )
-                    if not isinstance(candidate_target, torch.Tensor) or not torch.equal(
-                        candidate_target, target
-                    ):
-                        raise RuntimeError(f"{label}: GT target differs from baseline")
-                    velocity = output["velocity"]
-                    if not isinstance(velocity, torch.Tensor):
-                        raise TypeError(f"{label}: velocity is not a tensor")
-                    predictions[label] = decode_student_prediction(
-                        reae=reae,
-                        z_lq=z_lq,
-                        student_velocity=velocity,
-                        output_frames=int(target.shape[1]),
-                    )
+                prepared = prepare_training_batch(batch)
+                lq_input = prepared["lq_input"]
+                target = prepared["target"]
+                if not isinstance(lq_input, torch.Tensor) or not isinstance(
+                    target, torch.Tensor
+                ):
+                    raise TypeError("val13 bank requires LR/HR tensors")
+                z_lq_ntchw = encode_reae_clip(
+                    reae,
+                    lq_input,
+                    require_4k_plus_1=True,
+                )
+                z_lq = z_lq_ntchw.permute(0, 2, 1, 3, 4).contiguous()
                 teacher_prediction = decode_teacher_prediction(
                     reae=reae,
                     z_lq=z_lq,
@@ -430,169 +382,305 @@ def main() -> int:
                     output_frames=int(target.shape[1]),
                 )
 
-            name = _sample_name(batch_cpu, sample_index)
-            model_record: dict[str, object] = {}
-            for label in labels:
-                output = outputs[label]
-                velocity = output["velocity"]
-                assert isinstance(velocity, torch.Tensor)
-                prediction = predictions[label]
-                model_record[label] = {
-                    "velocity_stage_a": _velocity_metrics(
-                        velocity, teacher_velocity
+            teacher_cpu = teacher_prediction.detach().float().cpu()
+            target_cpu = target.detach().float().cpu()
+            aggregate_teacher_gt.update(
+                teacher_cpu,
+                target_cpu,
+                clamp=True,
+            )
+            bank.append(
+                {
+                    "index": sample_index,
+                    "sample": _sample_name(batch_cpu, sample_index),
+                    "lq_input": lq_input.detach().float().cpu(),
+                    "target": target_cpu,
+                    "z_lq": z_lq.detach().to(device="cpu", dtype=dtype),
+                    "teacher_velocity": teacher_velocity.detach().to(
+                        device="cpu",
+                        dtype=dtype,
                     ),
-                    "stage_a": _rgb_metrics(
-                        prediction, teacher_prediction
-                    ),
-                    "gt": _rgb_metrics(prediction, target),
+                    "teacher_prediction": teacher_cpu,
+                    "stage_a_gt": _rgb_metrics(teacher_cpu, target_cpu),
+                    "predictions": OrderedDict(),
+                    "models": {},
                 }
-                aggregate_velocity[label].update(velocity, teacher_velocity)
-                aggregate_stage_a[label].update(
-                    prediction, teacher_prediction, clamp=True
-                )
-                aggregate_gt[label].update(prediction, target, clamp=True)
-            teacher_gt = _rgb_metrics(teacher_prediction, target)
-            aggregate_teacher_gt.update(teacher_prediction, target, clamp=True)
-
-            record: dict[str, object] = {
-                "index": sample_index,
-                "sample": name,
-                "models": model_record,
-                "stage_a_gt": teacher_gt,
-            }
-            records.append(record)
-
-            sample_dir = out_root / name
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            lq = outputs[baseline_label]["lq_input"]
-            if not isinstance(lq, torch.Tensor):
-                raise TypeError("Baseline output lacks lq_input tensor")
-            lq_cpu = lq[0].detach().float().cpu()
-            gt_cpu = target[0].detach().float().cpu()
-            teacher_cpu = teacher_prediction[0].detach().float().cpu()
-            prediction_cpu = OrderedDict(
-                (label, prediction[0].detach().float().cpu())
-                for label, prediction in predictions.items()
-            )
-            frames = int(target.shape[1])
-            valid_frames = [index for index in frame_indices if index < frames]
-            if not valid_frames:
-                raise ValueError(
-                    f"No selected frame lies inside {frames}-frame clip"
-                )
-
-            comparison_video: list[Image.Image] = []
-            difference_video: list[Image.Image] = []
-            middle_index = frames // 2
-            for frame_index in range(frames):
-                comparison_panels = OrderedDict()
-                comparison_panels["LQ bicubic"] = lq_cpu[frame_index]
-                comparison_panels["Stage-A D3072"] = teacher_cpu[frame_index]
-                for label in labels:
-                    comparison_panels[label] = prediction_cpu[label][frame_index]
-                comparison_panels["GT"] = gt_cpu[frame_index]
-                comparison = make_comparison_frame(comparison_panels)
-
-                difference_panels = OrderedDict()
-                for label in labels:
-                    difference_panels[
-                        f"|{label}-StageA| x{args.difference_scale:g}"
-                    ] = (
-                        prediction_cpu[label][frame_index]
-                        - teacher_cpu[frame_index]
-                    ).abs().mul(args.difference_scale).clamp(0, 1)
-                difference_panels[
-                    f"|StageA-GT| x{args.difference_scale:g}"
-                ] = (
-                    teacher_cpu[frame_index] - gt_cpu[frame_index]
-                ).abs().mul(args.difference_scale).clamp(0, 1)
-                difference = make_comparison_frame(difference_panels)
-
-                comparison_video.append(comparison)
-                difference_video.append(difference)
-
-                if frame_index in valid_frames:
-                    comparison.save(
-                        sample_dir / f"comparison_frame_{frame_index:03d}.png"
-                    )
-                    difference.save(
-                        sample_dir / f"difference_frame_{frame_index:03d}.png"
-                    )
-                    top, left, crop = _detail_roi(
-                        teacher_cpu[frame_index],
-                        args.detail_crop_size,
-                    )
-                    detail_panels = OrderedDict()
-                    detail_panels["Stage-A D3072"] = teacher_cpu[frame_index]
-                    for label in labels:
-                        detail_panels[label] = prediction_cpu[label][frame_index]
-                    detail_panels["GT"] = gt_cpu[frame_index]
-                    detail = _detail_frame(
-                        detail_panels,
-                        top=top,
-                        left=left,
-                        crop=crop,
-                        display_size=args.detail_display_size,
-                    )
-                    detail.save(
-                        sample_dir
-                        / f"detail_frame_{frame_index:03d}_y{top}_x{left}.png"
-                    )
-                    if frame_index == middle_index:
-                        overview_detail.append(detail)
-
-                if frame_index == middle_index:
-                    overview_middle.append(comparison)
-
-            if not args.no_videos:
-                for filename, content in (
-                    ("comparison.mp4", comparison_video),
-                    ("differences.mp4", difference_video),
-                ):
-                    try:
-                        _write_video(
-                            sample_dir / filename,
-                            content,
-                            args.fps,
-                        )
-                    except Exception as exc:
-                        video_errors.append(
-                            {
-                                "sample": name,
-                                "file": filename,
-                                "error": f"{type(exc).__name__}: {exc}",
-                            }
-                        )
-
-            (sample_dir / "metrics.json").write_text(
-                json.dumps(record, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-
-            flat = _flatten_record(record, labels, baseline_label)
-            status = " ".join(
-                f"{label}:StageA={float(model_record[label]['stage_a']['psnr']):.3f}"
-                for label in labels
             )
             print(
-                f"[{sample_index + 1}/{min(len(dataset), args.max_samples)}] "
-                f"{name} {status}",
+                f"[bank {sample_index + 1}/{min(len(dataset), args.max_samples)}] "
+                f"{bank[-1]['sample']}",
                 flush=True,
             )
 
-    if not records:
+    if not bank:
         raise RuntimeError("No validation samples were evaluated")
 
     aggregate_models: dict[str, object] = {}
-    for label in labels:
-        aggregate_models[label] = {
-            "shape": shapes[label],
-            "velocity_stage_a": aggregate_velocity[label].compute(),
-            "stage_a": aggregate_stage_a[label].compute(),
-            "gt": aggregate_gt[label].compute(),
-        }
-    aggregate_teacher_gt_metrics = aggregate_teacher_gt.compute()
+    shapes: dict[str, object] = {}
 
+    # Load one M8 checkpoint at a time.  Predictions are moved to CPU before the
+    # next checkpoint is loaded, so comparison breadth does not multiply GPU VRAM.
+    for model_index, (label, checkpoint) in enumerate(model_specs):
+        print(
+            f"[model {model_index + 1}/{len(model_specs)}] loading "
+            f"{label} from {checkpoint}",
+            flush=True,
+        )
+        transformer = WanTransformer3DModelPromptFreeNoTimeMoE.from_pretrained(
+            str(checkpoint),
+            subfolder=args.transformer_subfolder,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        shape = transformer_moe_shape(transformer)
+        if int(shape["num_layers"]) != 20:
+            raise ValueError(
+                f"{label}: expected M8 L20 checkpoint, got shape={shape}"
+            )
+        prepare_prompt_free_no_time_transformer_for_training(
+            transformer,
+            attention_backend=args.attention_backend,
+        )
+        transformer.to(device=device, dtype=dtype).eval()
+        shapes[label] = shape
+
+        velocity_acc = DistillationMetricAccumulator()
+        stage_a_acc = VideoMetricAccumulator()
+        gt_acc = VideoMetricAccumulator()
+
+        with torch.inference_mode():
+            for sample_position, sample in enumerate(bank):
+                z_lq = sample["z_lq"]
+                teacher_velocity = sample["teacher_velocity"]
+                target = sample["target"]
+                teacher_prediction = sample["teacher_prediction"]
+                if not isinstance(z_lq, torch.Tensor):
+                    raise TypeError("val13 bank z_lq is invalid")
+                if not isinstance(teacher_velocity, torch.Tensor):
+                    raise TypeError("val13 bank teacher velocity is invalid")
+                if not isinstance(target, torch.Tensor):
+                    raise TypeError("val13 bank target is invalid")
+                if not isinstance(teacher_prediction, torch.Tensor):
+                    raise TypeError("val13 bank teacher prediction is invalid")
+
+                z_device = z_lq.to(
+                    device=device,
+                    dtype=dtype,
+                    non_blocking=device.type == "cuda",
+                )
+                teacher_velocity_device = teacher_velocity.to(
+                    device=device,
+                    dtype=dtype,
+                    non_blocking=device.type == "cuda",
+                )
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=dtype if autocast_enabled else torch.float32,
+                    enabled=autocast_enabled,
+                ):
+                    velocity, _balance = forward_moe_transformer_training(
+                        transformer,
+                        z_device,
+                        gradient_checkpointing=False,
+                    )
+                    prediction = decode_student_prediction(
+                        reae=reae,
+                        z_lq=z_device,
+                        student_velocity=velocity,
+                        output_frames=int(target.shape[1]),
+                    )
+
+                velocity_cpu = velocity.detach().float().cpu()
+                prediction_cpu = prediction.detach().float().cpu()
+                teacher_velocity_cpu = teacher_velocity.float()
+                velocity_metrics = _velocity_metrics(
+                    velocity_cpu,
+                    teacher_velocity_cpu,
+                )
+                stage_a_metrics = _rgb_metrics(
+                    prediction_cpu,
+                    teacher_prediction,
+                )
+                gt_metrics = _rgb_metrics(prediction_cpu, target)
+
+                sample_models = sample["models"]
+                predictions = sample["predictions"]
+                if not isinstance(sample_models, dict):
+                    raise TypeError("val13 model metric bank is invalid")
+                if not isinstance(predictions, OrderedDict):
+                    raise TypeError("val13 prediction bank is invalid")
+                sample_models[label] = {
+                    "velocity_stage_a": velocity_metrics,
+                    "stage_a": stage_a_metrics,
+                    "gt": gt_metrics,
+                }
+                predictions[label] = prediction_cpu
+
+                velocity_acc.update(velocity_cpu, teacher_velocity_cpu)
+                stage_a_acc.update(
+                    prediction_cpu,
+                    teacher_prediction,
+                    clamp=True,
+                )
+                gt_acc.update(prediction_cpu, target, clamp=True)
+
+                print(
+                    f"  [{sample_position + 1}/{len(bank)}] "
+                    f"{sample['sample']} StageA="
+                    f"{float(stage_a_metrics['psnr']):.3f} "
+                    f"GT={float(gt_metrics['psnr']):.3f}",
+                    flush=True,
+                )
+
+        aggregate_models[label] = {
+            "shape": shape,
+            "velocity_stage_a": velocity_acc.compute(),
+            "stage_a": stage_a_acc.compute(),
+            "gt": gt_acc.compute(),
+        }
+
+        del transformer
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    records: list[dict[str, object]] = []
+    overview_middle: list[Image.Image] = []
+    overview_detail: list[Image.Image] = []
+    video_errors: list[dict[str, str]] = []
+
+    # Export after all model predictions are resident on CPU.
+    for sample in bank:
+        sample_index = int(sample["index"])
+        name = str(sample["sample"])
+        lq = sample["lq_input"]
+        target = sample["target"]
+        teacher_prediction = sample["teacher_prediction"]
+        predictions = sample["predictions"]
+        model_record = sample["models"]
+        if not isinstance(lq, torch.Tensor):
+            raise TypeError("val13 LQ bank is invalid")
+        if not isinstance(target, torch.Tensor):
+            raise TypeError("val13 target bank is invalid")
+        if not isinstance(teacher_prediction, torch.Tensor):
+            raise TypeError("val13 teacher bank is invalid")
+        if not isinstance(predictions, OrderedDict):
+            raise TypeError("val13 prediction bank is invalid")
+        if not isinstance(model_record, dict):
+            raise TypeError("val13 metric bank is invalid")
+
+        record: dict[str, object] = {
+            "index": sample_index,
+            "sample": name,
+            "models": model_record,
+            "stage_a_gt": sample["stage_a_gt"],
+        }
+        records.append(record)
+
+        sample_dir = out_root / name
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        lq_cpu = lq[0]
+        gt_cpu = target[0]
+        teacher_cpu = teacher_prediction[0]
+        prediction_cpu = OrderedDict(
+            (label, predictions[label][0]) for label in labels
+        )
+
+        frames = int(target.shape[1])
+        valid_frames = [index for index in frame_indices if index < frames]
+        if not valid_frames:
+            raise ValueError(
+                f"No selected frame lies inside {frames}-frame clip"
+            )
+        middle_index = frames // 2
+        comparison_video: list[Image.Image] = []
+        difference_video: list[Image.Image] = []
+
+        for frame_index in range(frames):
+            comparison_panels = OrderedDict()
+            comparison_panels["LQ bicubic"] = lq_cpu[frame_index]
+            comparison_panels["Stage-A D3072"] = teacher_cpu[frame_index]
+            for label in labels:
+                comparison_panels[label] = prediction_cpu[label][frame_index]
+            comparison_panels["GT"] = gt_cpu[frame_index]
+            comparison = make_comparison_frame(comparison_panels)
+
+            difference_panels = OrderedDict()
+            for label in labels:
+                difference_panels[
+                    f"|{label}-StageA| x{args.difference_scale:g}"
+                ] = (
+                    prediction_cpu[label][frame_index]
+                    - teacher_cpu[frame_index]
+                ).abs().mul(args.difference_scale).clamp(0, 1)
+            difference_panels[
+                f"|StageA-GT| x{args.difference_scale:g}"
+            ] = (
+                teacher_cpu[frame_index] - gt_cpu[frame_index]
+            ).abs().mul(args.difference_scale).clamp(0, 1)
+            difference = make_comparison_frame(difference_panels)
+
+            comparison_video.append(comparison)
+            difference_video.append(difference)
+
+            if frame_index in valid_frames:
+                comparison.save(
+                    sample_dir / f"comparison_frame_{frame_index:03d}.png"
+                )
+                difference.save(
+                    sample_dir / f"difference_frame_{frame_index:03d}.png"
+                )
+                top, left, crop = _detail_roi(
+                    teacher_cpu[frame_index],
+                    args.detail_crop_size,
+                )
+                detail_panels = OrderedDict()
+                detail_panels["Stage-A D3072"] = teacher_cpu[frame_index]
+                for label in labels:
+                    detail_panels[label] = prediction_cpu[label][frame_index]
+                detail_panels["GT"] = gt_cpu[frame_index]
+                detail = _detail_frame(
+                    detail_panels,
+                    top=top,
+                    left=left,
+                    crop=crop,
+                    display_size=args.detail_display_size,
+                )
+                detail.save(
+                    sample_dir
+                    / f"detail_frame_{frame_index:03d}_y{top}_x{left}.png"
+                )
+                if frame_index == middle_index:
+                    overview_detail.append(detail)
+
+            if frame_index == middle_index:
+                overview_middle.append(comparison)
+
+        if not args.no_videos:
+            for filename, content in (
+                ("comparison.mp4", comparison_video),
+                ("differences.mp4", difference_video),
+            ):
+                try:
+                    _write_video(
+                        sample_dir / filename,
+                        content,
+                        args.fps,
+                    )
+                except Exception as exc:
+                    video_errors.append(
+                        {
+                            "sample": name,
+                            "file": filename,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+
+        (sample_dir / "metrics.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    aggregate_teacher_gt_metrics = aggregate_teacher_gt.compute()
     flat_rows = [
         _flatten_record(record, labels, baseline_label)
         for record in records
@@ -635,6 +723,10 @@ def main() -> int:
             "Detail ROIs are selected only from Stage-A D3072 high-frequency energy."
         ),
         "gt_role": "diagnostic comparison reference",
+        "execution_note": (
+            "Common ReAE z_lq and Stage-A teacher prediction are computed once; "
+            "M8 checkpoints are loaded sequentially to bound VRAM."
+        ),
     }
 
     (out_root / "aggregate_metrics.json").write_text(
