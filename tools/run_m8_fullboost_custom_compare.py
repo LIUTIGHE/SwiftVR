@@ -28,7 +28,15 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
+TOOLS_ROOT = ROOT / "tools"
+for search_root in (ROOT, TOOLS_ROOT):
+    if str(search_root) not in sys.path:
+        sys.path.insert(0, str(search_root))
+
+from compare_720p3x_outputs import FrameSource
 
 
 DEFAULTS = {
@@ -78,6 +86,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Optional crop LABEL:x,y,w,h; repeat for multiple crops.",
+    )
+    p.add_argument(
+        "--auto-crops",
+        type=int,
+        default=3,
+        help=(
+            "Automatically select this many non-overlapping high-detail crops "
+            "from the LQ input when building comparison strips. Default: 3. "
+            "Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--auto-crop-size",
+        type=int,
+        default=960,
+        help="Square crop size in target/SR coordinates. Default: 960.",
+    )
+    p.add_argument(
+        "--auto-crop-iou-threshold",
+        type=float,
+        default=0.10,
+        help="Maximum overlap IoU between automatically selected crops.",
     )
     p.add_argument(
         "--basiccnn",
@@ -131,6 +161,144 @@ def _require_path(path: Path, label: str) -> Path:
 
 def _has_pngs(path: Path) -> bool:
     return path.is_dir() and any(path.glob("*.png"))
+
+
+
+def _parse_frame_indices(value: str) -> list[int]:
+    values: list[int] = []
+    for raw in str(value).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        index = int(raw)
+        if index < 0:
+            raise ValueError("frame indices must be non-negative")
+        if index not in values:
+            values.append(index)
+    return values
+
+
+def _box_iou(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    left = max(ax, bx)
+    top = max(ay, by)
+    right = min(ax + aw, bx + bw)
+    bottom = min(ay + ah, by + bh)
+    intersection = max(0, right - left) * max(0, bottom - top)
+    if intersection <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - intersection
+    return float(intersection / max(union, 1))
+
+
+def _window_candidates(
+    energy: np.ndarray,
+    *,
+    crop_w: int,
+    crop_h: int,
+) -> list[tuple[float, int, int]]:
+    height, width = energy.shape
+    crop_w = min(int(crop_w), width)
+    crop_h = min(int(crop_h), height)
+    if crop_w <= 0 or crop_h <= 0:
+        raise ValueError("auto crop dimensions must be positive")
+
+    integral = np.pad(
+        energy.astype(np.float64, copy=False).cumsum(0).cumsum(1),
+        ((1, 0), (1, 0)),
+        mode="constant",
+    )
+    stride_x = max(8, crop_w // 8)
+    stride_y = max(8, crop_h // 8)
+    xs = list(range(0, max(width - crop_w, 0) + 1, stride_x))
+    ys = list(range(0, max(height - crop_h, 0) + 1, stride_y))
+    if xs[-1] != width - crop_w:
+        xs.append(width - crop_w)
+    if ys[-1] != height - crop_h:
+        ys.append(height - crop_h)
+
+    candidates: list[tuple[float, int, int]] = []
+    area = float(crop_w * crop_h)
+    for y in ys:
+        y2 = y + crop_h
+        for x in xs:
+            x2 = x + crop_w
+            total = (
+                integral[y2, x2]
+                - integral[y, x2]
+                - integral[y2, x]
+                + integral[y, x]
+            )
+            candidates.append((float(total / area), x, y))
+    candidates.sort(reverse=True)
+    return candidates
+
+
+def _auto_detail_crops(
+    input_path: Path,
+    *,
+    upscale: int,
+    frame_indices: Sequence[int],
+    count: int,
+    target_crop_size: int,
+    iou_threshold: float,
+) -> list[str]:
+    if count <= 0:
+        return []
+    source = FrameSource(input_path)
+    valid = [index for index in frame_indices if index < len(source)]
+    if not valid:
+        valid = [0]
+    # Keep the auto-selector cheap and deterministic on long videos.
+    valid = valid[: min(len(valid), 5)]
+
+    energy_sum: np.ndarray | None = None
+    for index in valid:
+        frame = source.frame(index).astype(np.float32) / 255.0
+        gray = (
+            0.299 * frame[..., 0]
+            + 0.587 * frame[..., 1]
+            + 0.114 * frame[..., 2]
+        )
+        gx = np.zeros_like(gray)
+        gy = np.zeros_like(gray)
+        gx[:, :-1] = np.abs(gray[:, 1:] - gray[:, :-1])
+        gy[:-1, :] = np.abs(gray[1:, :] - gray[:-1, :])
+        energy = gx + gy
+        energy_sum = energy if energy_sum is None else energy_sum + energy
+    assert energy_sum is not None
+    energy_mean = energy_sum / float(len(valid))
+
+    target_w = int(source.width) * int(upscale)
+    target_h = int(source.height) * int(upscale)
+    crop_target = min(int(target_crop_size), target_w, target_h)
+    crop_lq_w = max(1, int(round(crop_target / float(upscale))))
+    crop_lq_h = max(1, int(round(crop_target / float(upscale))))
+
+    candidates = _window_candidates(
+        energy_mean,
+        crop_w=crop_lq_w,
+        crop_h=crop_lq_h,
+    )
+    selected: list[tuple[int, int, int, int]] = []
+    for _score, x_lq, y_lq in candidates:
+        x = min(int(x_lq * upscale), target_w - crop_target)
+        y = min(int(y_lq * upscale), target_h - crop_target)
+        box = (x, y, crop_target, crop_target)
+        if any(_box_iou(box, previous) > iou_threshold for previous in selected):
+            continue
+        selected.append(box)
+        if len(selected) >= count:
+            break
+
+    return [
+        f"auto_detail_{index + 1}:{x},{y},{w},{h}"
+        for index, (x, y, w, h) in enumerate(selected)
+    ]
 
 
 def _run(
@@ -234,6 +402,10 @@ def main() -> int:
         raise ValueError("dit-overlap must be non-negative")
     if args.basiccnn_index_scale <= 0 or args.basiccnn_index_offset < 0:
         raise ValueError("BasicCNN index mapping is invalid")
+    if args.auto_crops < 0 or args.auto_crop_size <= 0:
+        raise ValueError("auto-crops must be non-negative and auto-crop-size positive")
+    if not 0.0 <= args.auto_crop_iou_threshold < 1.0:
+        raise ValueError("auto-crop-iou-threshold must be in [0,1)")
 
     output_root = (
         _resolve(args.output_dir)
@@ -324,6 +496,19 @@ def main() -> int:
         "--lq",
         str(input_path),
     ]
+
+    auto_crops = _auto_detail_crops(
+        input_path,
+        upscale=args.upscale,
+        frame_indices=_parse_frame_indices(args.frame_indices),
+        count=args.auto_crops,
+        target_crop_size=args.auto_crop_size,
+        iou_threshold=args.auto_crop_iou_threshold,
+    )
+    if auto_crops:
+        print("\n[auto detail crops]", flush=True)
+        for crop in auto_crops:
+            print(f"  {crop}", flush=True)
     for label, output in method_outputs:
         compare_command.extend(["--method", f"{label}={output}"])
 
@@ -352,7 +537,7 @@ def main() -> int:
             str(args.panel_width),
         ]
     )
-    for crop in args.crop:
+    for crop in [*auto_crops, *args.crop]:
         compare_command.extend(["--crop", crop])
 
     _run(compare_command, dry_run=bool(args.dry_run))
@@ -373,6 +558,8 @@ def main() -> int:
         ],
         "basiccnn": None if args.basiccnn is None else str(_resolve(args.basiccnn)),
         "comparison_dir": str(comparison_dir),
+        "auto_crops": auto_crops,
+        "manual_crops": list(args.crop),
     }
     (output_root / "run_summary.json").write_text(
         json.dumps(summary, indent=2),
