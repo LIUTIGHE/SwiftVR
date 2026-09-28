@@ -56,6 +56,7 @@ from swiftvr.training import (
     encode_reae_clip,
     prepare_prompt_free_no_time_transformer_for_training,
     prepare_training_batch,
+    temporal_difference_mse,
 )
 from swiftvr.training.b2b_moe import transformer_moe_shape
 from swiftvr.training.b2b_moe_training import forward_moe_transformer_training
@@ -271,6 +272,9 @@ def _flatten_record(
         row[f"{prefix}_stage_a_ssim"] = stage_a_metrics["ssim"]
         row[f"{prefix}_gt_psnr"] = gt_metrics["psnr"]
         row[f"{prefix}_gt_ssim"] = gt_metrics["ssim"]
+        row[f"{prefix}_gt_temporal_difference_mse"] = metrics[
+            "gt_temporal_difference_mse"
+        ]
         row[f"{prefix}_delta_stage_a_psnr_vs_{_safe_name(baseline, 'baseline')}"] = (
             float(stage_a_metrics["psnr"]) - float(baseline_stage_a["psnr"])
         )
@@ -402,6 +406,12 @@ def main() -> int:
                     ),
                     "teacher_prediction": teacher_cpu,
                     "stage_a_gt": _rgb_metrics(teacher_cpu, target_cpu),
+                    "stage_a_gt_temporal_difference_mse": float(
+                        temporal_difference_mse(
+                            teacher_cpu,
+                            target_cpu,
+                        ).item()
+                    ),
                     "predictions": OrderedDict(),
                     "models": {},
                 }
@@ -447,6 +457,8 @@ def main() -> int:
         velocity_acc = DistillationMetricAccumulator()
         stage_a_acc = VideoMetricAccumulator()
         gt_acc = VideoMetricAccumulator()
+        gt_temporal_sum = 0.0
+        gt_temporal_samples = 0
 
         with torch.inference_mode():
             for sample_position, sample in enumerate(bank):
@@ -502,6 +514,12 @@ def main() -> int:
                     teacher_prediction,
                 )
                 gt_metrics = _rgb_metrics(prediction_cpu, target)
+                gt_temporal = float(
+                    temporal_difference_mse(
+                        prediction_cpu,
+                        target,
+                    ).item()
+                )
 
                 sample_models = sample["models"]
                 predictions = sample["predictions"]
@@ -513,6 +531,7 @@ def main() -> int:
                     "velocity_stage_a": velocity_metrics,
                     "stage_a": stage_a_metrics,
                     "gt": gt_metrics,
+                    "gt_temporal_difference_mse": gt_temporal,
                 }
                 predictions[label] = prediction_cpu
 
@@ -523,6 +542,8 @@ def main() -> int:
                     clamp=True,
                 )
                 gt_acc.update(prediction_cpu, target, clamp=True)
+                gt_temporal_sum += gt_temporal
+                gt_temporal_samples += 1
 
                 print(
                     f"  [{sample_position + 1}/{len(bank)}] "
@@ -537,6 +558,9 @@ def main() -> int:
             "velocity_stage_a": velocity_acc.compute(),
             "stage_a": stage_a_acc.compute(),
             "gt": gt_acc.compute(),
+            "gt_temporal_difference_mse": (
+                gt_temporal_sum / max(gt_temporal_samples, 1)
+            ),
         }
 
         del transformer
@@ -573,6 +597,9 @@ def main() -> int:
             "sample": name,
             "models": model_record,
             "stage_a_gt": sample["stage_a_gt"],
+            "stage_a_gt_temporal_difference_mse": sample[
+                "stage_a_gt_temporal_difference_mse"
+            ],
         }
         records.append(record)
 
@@ -717,6 +744,13 @@ def main() -> int:
         "samples": len(records),
         "aggregate_models": aggregate_models,
         "stage_a_gt": aggregate_teacher_gt_metrics,
+        "stage_a_gt_temporal_difference_mse": (
+            sum(
+                float(sample["stage_a_gt_temporal_difference_mse"])
+                for sample in bank
+            )
+            / len(bank)
+        ),
         "win_counts_vs_baseline": win_counts,
         "video_errors": video_errors,
         "selection_note": (
@@ -765,7 +799,8 @@ def main() -> int:
             f"StageA_PSNR={float(stage_metrics['psnr']):.4f} "
             f"StageA_SSIM={float(stage_metrics['ssim']):.6f} "
             f"GT_PSNR={float(gt_metrics['psnr']):.4f} "
-            f"GT_SSIM={float(gt_metrics['ssim']):.6f}"
+            f"GT_SSIM={float(gt_metrics['ssim']):.6f} "
+            f"GT_TempMSE={float(metrics['gt_temporal_difference_mse']):.6f}"
         )
     print(
         "Stage-A -> GT: "
