@@ -43,6 +43,7 @@ class CompareM8FullVal13Test(unittest.TestCase):
                 },
                 "stage_a": {"psnr": stage_psnr, "ssim": 0.9},
                 "gt": {"psnr": gt_psnr, "ssim": 0.8},
+                "gt_temporal_difference_mse": 0.01,
             }
 
         record = {
