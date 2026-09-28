@@ -23,18 +23,27 @@ _SPEC.loader.exec_module(_TOOL)
 class RunM8FullBoostCustomCompareTest(unittest.TestCase):
     def test_parser_only_requires_input(self):
         parser = _TOOL.build_parser()
-        args = parser.parse_args(["--input", "demo.mp4"])
+        args = parser.parse_args([
+            "--input", "demo.mp4",
+            "--basiccnn", "tiny.mp4",
+        ])
         self.assertEqual(str(args.input), "demo.mp4")
         self.assertEqual(args.cuda_visible_devices, "7")
         self.assertEqual(args.frame_indices, "0,8,16,24,32")
         self.assertEqual(args.panel_width, 960)
 
-    def test_default_candidates_match_current_fullboost_race(self):
-        self.assertTrue(str(_TOOL.DEFAULTS["m8a"]).endswith("step_00030000"))
-        self.assertTrue(str(_TOOL.DEFAULTS["ta1500"]).endswith("step_00001500"))
-        self.assertTrue(str(_TOOL.DEFAULTS["ta4000"]).endswith("step_00004000"))
-        self.assertTrue(str(_TOOL.DEFAULTS["stagea3500"]).endswith("step_00003500"))
-        self.assertIn("epoch_099_step_00024552", str(_TOOL.DEFAULTS["decoder"]))
+    def test_default_current_node_is_ta1500_with_m9a1(self):
+        self.assertTrue(
+            str(_TOOL.DEFAULTS["current"]).endswith("step_00001500")
+        )
+        self.assertIn(
+            "m8a_fullboost_ta_5k_v1",
+            str(_TOOL.DEFAULTS["current"]),
+        )
+        self.assertIn(
+            "epoch_099_step_00024552",
+            str(_TOOL.DEFAULTS["decoder"]),
+        )
 
     def test_run_dry_run_does_not_execute(self):
         _TOOL._run(
