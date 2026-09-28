@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Run custom-input visual comparison for the current M8 Full-Boost candidates.
+"""Run a custom-input comparison for the current SwiftVR compression node.
 
-Only --input is required.  By default this evaluates:
+The comparison intentionally contains only four visual sources:
 
+  * LQ (added by compare_720p3x_outputs.py)
   * Original SwiftVR
-  * M8-A 30k + M9-A1 decoder
-  * TA Full-Boost step 1500 + M9-A1 decoder
-  * TA Full-Boost step 4000 + M9-A1 decoder
-  * Stage-A Full-Boost step 3500 + M9-A1 decoder
+  * Current experiment node (default: TA Full-Boost step 1500 + M9-A1)
+  * Tiny CNN
 
-and then invokes tools/compare_720p3x_outputs.py on the generated PNG sequences.
+The current compressed node is always assembled through
+scripts/inference_custom_components.py so Transformer and decoder lineage remain
+explicit. Tiny-CNN video input is normalized to 30 FPS by default, matching the
+historical custom-input comparison workflow.
 
-Optional --basiccnn adds an externally generated restoration video/directory.
-Repeat --crop LABEL:x,y,w,h for custom detail strips.
-
-The tool runs methods sequentially on one visible GPU so VRAM usage does not scale
-with the number of compared checkpoints.
+Full-frame montage is only an overview. The wrapper also adds automatic
+model-agnostic high-detail crops from the LQ input, plus any manual --crop
+regions supplied by the user.
 """
 
 from __future__ import annotations
@@ -43,27 +43,31 @@ from compare_720p3x_outputs import FrameSource
 DEFAULTS = {
     "original": Path("checkpoints"),
     "base": Path("checkpoints_prompt_free_no_time"),
-    "m8a": Path("outputs/b2b/m8a_d1024_l20_gate200k/checkpoints/step_00030000"),
-    "ta1500": Path("outputs/b2b/m8a_fullboost_ta_5k_v1/checkpoints/step_00001500"),
-    "ta4000": Path("outputs/b2b/m8a_fullboost_ta_5k_v1/checkpoints/step_00004000"),
-    "stagea3500": Path("outputs/b2b/m8a_fullboost_stagea_5k_v1/checkpoints/step_00003500"),
+    "current": Path(
+        "outputs/b2b/m8a_fullboost_ta_5k_v1/checkpoints/step_00001500"
+    ),
     "decoder": Path(
         "outputs/b2b/m9a1_factorized_m8a30k/checkpoints/"
         "epoch_099_step_00024552/tiny_decoder"
     ),
 }
 
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", type=Path, required=True)
+    p.add_argument(
+        "--basiccnn",
+        type=Path,
+        required=True,
+        help="Tiny-CNN restoration video/image directory.",
+    )
     p.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help=(
             "Root output directory. Default: "
-            "outputs/custom/<input_stem>_m8_fullboost_compare"
+            "outputs/custom/<input_stem>_current_compare"
         ),
     )
     p.add_argument(
@@ -94,8 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help=(
             "Automatically select this many non-overlapping high-detail crops "
-            "from the LQ input when building comparison strips. Default: 3. "
-            "Set 0 to disable."
+            "from LQ. Default: 3; set 0 to disable."
         ),
     )
     p.add_argument(
@@ -108,46 +111,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-crop-iou-threshold",
         type=float,
         default=0.10,
-        help="Maximum overlap IoU between automatically selected crops.",
     )
-    p.add_argument(
-        "--basiccnn",
-        type=Path,
-        default=None,
-        help="Optional external restoration video/image directory.",
-    )
+
     p.add_argument("--basiccnn-label", default="Tiny CNN")
     p.add_argument("--basiccnn-index-scale", type=int, default=1)
     p.add_argument("--basiccnn-index-offset", type=int, default=0)
     p.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Reuse a method output directory when it already contains PNGs.",
+        "--basiccnn-fps",
+        type=float,
+        default=30.0,
+        help="Normalize Tiny-CNN video to this FPS before comparison. Default: 30.",
     )
     p.add_argument(
-        "--no-original",
+        "--no-basiccnn-fps-normalize",
         action="store_true",
-        help="Skip Original SwiftVR if only comparing compressed candidates.",
+        help="Use Tiny-CNN video directly without FPS normalization.",
+    )
+
+    p.add_argument(
+        "--current-label",
+        default="Current FullBoost",
+        help="Display label for the current experiment node.",
+    )
+    p.add_argument(
+        "--current-checkpoint",
+        type=Path,
+        default=DEFAULTS["current"],
+        help="Current MoE Transformer checkpoint; default is TA FullBoost step1500.",
+    )
+    p.add_argument("--original-checkpoint", type=Path, default=DEFAULTS["original"])
+    p.add_argument("--base-checkpoint", type=Path, default=DEFAULTS["base"])
+    p.add_argument("--decoder-checkpoint", type=Path, default=DEFAULTS["decoder"])
+
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Reuse completed Original/Current PNG inference outputs.",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print commands and resolved paths without running inference/comparison.",
+        help="Print resolved commands without running them.",
     )
-
-    p.add_argument("--original-checkpoint", type=Path, default=DEFAULTS["original"])
-    p.add_argument("--base-checkpoint", type=Path, default=DEFAULTS["base"])
-    p.add_argument("--m8a-checkpoint", type=Path, default=DEFAULTS["m8a"])
-    p.add_argument("--ta1500-checkpoint", type=Path, default=DEFAULTS["ta1500"])
-    p.add_argument("--ta4000-checkpoint", type=Path, default=DEFAULTS["ta4000"])
-    p.add_argument(
-        "--stagea3500-checkpoint",
-        type=Path,
-        default=DEFAULTS["stagea3500"],
-    )
-    p.add_argument("--decoder-checkpoint", type=Path, default=DEFAULTS["decoder"])
     return p
-
 
 def _resolve(path: Path) -> Path:
     return path.expanduser().resolve()
@@ -390,8 +396,45 @@ def _run_m8(
         args.attention_backend,
         "--png",
     ]
-    _run(command, env=env)
+    _run(command, env=env, dry_run=bool(args.dry_run))
 
+
+
+def _prepare_basiccnn(
+    *,
+    source: Path,
+    output_root: Path,
+    fps: float,
+    normalize: bool,
+    skip_existing: bool,
+    dry_run: bool,
+) -> Path:
+    source = _require_path(source, "Tiny CNN output")
+    if source.is_dir() or not normalize:
+        return source
+    if fps <= 0:
+        raise ValueError("basiccnn-fps must be positive")
+
+    output = output_root / f"tinycnn_fps{fps:g}.mp4"
+    if skip_existing and output.is_file() and output.stat().st_size > 0:
+        print(f"[reuse] Tiny CNN normalized video: {output}", flush=True)
+        return output
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"setpts=N/({fps:g}*TB)",
+        "-r",
+        f"{fps:g}",
+        "-vsync",
+        "cfr",
+        str(output),
+    ]
+    _run(command, dry_run=dry_run)
+    return output
 
 def main() -> int:
     args = build_parser().parse_args()
@@ -412,70 +455,66 @@ def main() -> int:
         _resolve(args.output_dir)
         if args.output_dir is not None
         else _resolve(
-            Path("outputs/custom")
-            / f"{input_path.stem}_m8_fullboost_compare"
+            Path("outputs/custom") / f"{input_path.stem}_current_compare"
         )
     )
     if not args.dry_run:
         output_root.mkdir(parents=True, exist_ok=True)
 
-    original = _require_path(args.original_checkpoint, "Original SwiftVR checkpoint")
-    base = _require_path(args.base_checkpoint, "prompt-free/no-time base checkpoint")
-    decoder = _require_path(args.decoder_checkpoint, "M9-A1 decoder checkpoint")
-
-    candidates = [
-        ("M8-A", _require_path(args.m8a_checkpoint, "M8-A checkpoint"), "m8a"),
-        (
-            "TA-1500",
-            _require_path(args.ta1500_checkpoint, "TA1500 checkpoint"),
-            "ta1500",
-        ),
-        (
-            "TA-4000",
-            _require_path(args.ta4000_checkpoint, "TA4000 checkpoint"),
-            "ta4000",
-        ),
-        (
-            "StageA-3500",
-            _require_path(args.stagea3500_checkpoint, "StageA3500 checkpoint"),
-            "stagea3500",
-        ),
-    ]
+    original = _require_path(
+        args.original_checkpoint,
+        "Original SwiftVR checkpoint",
+    )
+    base = _require_path(
+        args.base_checkpoint,
+        "prompt-free/no-time base checkpoint",
+    )
+    current = _require_path(
+        args.current_checkpoint,
+        "current experiment checkpoint",
+    )
+    decoder = _require_path(
+        args.decoder_checkpoint,
+        "M9-A1 decoder checkpoint",
+    )
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
 
-    method_outputs: list[tuple[str, Path]] = []
+    original_output = output_root / "original_swiftvr"
+    if args.skip_existing and _has_pngs(original_output):
+        print(f"[reuse] Original SwiftVR: {original_output}", flush=True)
+    else:
+        _run_original(
+            input_path=input_path,
+            output_path=original_output,
+            checkpoint=original,
+            args=args,
+            env=env,
+        )
 
-    if not args.no_original:
-        original_output = output_root / "original_swiftvr"
-        if args.skip_existing and _has_pngs(original_output):
-            print(f"[reuse] Original SwiftVR: {original_output}", flush=True)
-        else:
-            _run_original(
-                input_path=input_path,
-                output_path=original_output,
-                checkpoint=original,
-                args=args,
-                env=env,
-            )
-        method_outputs.append(("Original SwiftVR", original_output))
+    current_output = output_root / "current"
+    if args.skip_existing and _has_pngs(current_output):
+        print(f"[reuse] {args.current_label}: {current_output}", flush=True)
+    else:
+        _run_m8(
+            input_path=input_path,
+            output_path=current_output,
+            base_checkpoint=base,
+            transformer_checkpoint=current,
+            decoder_checkpoint=decoder,
+            args=args,
+            env=env,
+        )
 
-    for label, checkpoint, dirname in candidates:
-        output = output_root / dirname
-        if args.skip_existing and _has_pngs(output):
-            print(f"[reuse] {label}: {output}", flush=True)
-        else:
-            _run_m8(
-                input_path=input_path,
-                output_path=output,
-                base_checkpoint=base,
-                transformer_checkpoint=checkpoint,
-                decoder_checkpoint=decoder,
-                args=args,
-                env=env,
-            )
-        method_outputs.append((label, output))
+    basiccnn = _prepare_basiccnn(
+        source=args.basiccnn,
+        output_root=output_root,
+        fps=float(args.basiccnn_fps),
+        normalize=not bool(args.no_basiccnn_fps_normalize),
+        skip_existing=bool(args.skip_existing),
+        dry_run=bool(args.dry_run),
+    )
 
     comparison_dir = output_root / "comparison"
     if (
@@ -489,13 +528,6 @@ def main() -> int:
         )
         shutil.rmtree(comparison_dir)
 
-    compare_command = [
-        sys.executable,
-        "tools/compare_720p3x_outputs.py",
-        "--lq",
-        str(input_path),
-    ]
-
     auto_crops = _auto_detail_crops(
         input_path,
         upscale=args.upscale,
@@ -508,34 +540,31 @@ def main() -> int:
         print("\n[auto detail crops]", flush=True)
         for crop in auto_crops:
             print(f"  {crop}", flush=True)
-    for label, output in method_outputs:
-        compare_command.extend(["--method", f"{label}={output}"])
 
-    if args.basiccnn is not None:
-        basiccnn = _require_path(args.basiccnn, "BasicCNN output")
-        compare_command.extend(
-            [
-                "--basiccnn",
-                str(basiccnn),
-                "--basiccnn-label",
-                args.basiccnn_label,
-                "--basiccnn-index-scale",
-                str(args.basiccnn_index_scale),
-                "--basiccnn-index-offset",
-                str(args.basiccnn_index_offset),
-            ]
-        )
-
-    compare_command.extend(
-        [
-            "--output-dir",
-            str(comparison_dir),
-            "--frame-indices",
-            args.frame_indices,
-            "--panel-width",
-            str(args.panel_width),
-        ]
-    )
+    compare_command = [
+        sys.executable,
+        "tools/compare_720p3x_outputs.py",
+        "--lq",
+        str(input_path),
+        "--method",
+        f"Original SwiftVR={original_output}",
+        "--method",
+        f"{args.current_label}={current_output}",
+        "--basiccnn",
+        str(basiccnn),
+        "--basiccnn-label",
+        args.basiccnn_label,
+        "--basiccnn-index-scale",
+        str(args.basiccnn_index_scale),
+        "--basiccnn-index-offset",
+        str(args.basiccnn_index_offset),
+        "--output-dir",
+        str(comparison_dir),
+        "--frame-indices",
+        args.frame_indices,
+        "--panel-width",
+        str(args.panel_width),
+    ]
     for crop in [*auto_crops, *args.crop]:
         compare_command.extend(["--crop", crop])
 
@@ -546,16 +575,16 @@ def main() -> int:
         return 0
 
     summary = {
-        "kind": "m8_fullboost_custom_input_compare_v1",
+        "kind": "current_node_custom_input_compare_v2",
         "input": str(input_path),
         "output_root": str(output_root),
         "cuda_visible_devices": str(args.cuda_visible_devices),
+        "original_checkpoint": str(original),
+        "current_label": args.current_label,
+        "current_checkpoint": str(current),
         "decoder_checkpoint": str(decoder),
-        "methods": [
-            {"label": label, "output": str(path)}
-            for label, path in method_outputs
-        ],
-        "basiccnn": None if args.basiccnn is None else str(_resolve(args.basiccnn)),
+        "basiccnn_source": str(_resolve(args.basiccnn)),
+        "basiccnn_compared": str(basiccnn),
         "comparison_dir": str(comparison_dir),
         "auto_crops": auto_crops,
         "manual_crops": list(args.crop),
@@ -566,7 +595,6 @@ def main() -> int:
     )
     print(f"\nCustom comparison complete: {comparison_dir}", flush=True)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
