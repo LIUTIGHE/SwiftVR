@@ -98,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip Original SwiftVR if only comparing compressed candidates.",
     )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands and resolved paths without running inference/comparison.",
+    )
 
     p.add_argument("--original-checkpoint", type=Path, default=DEFAULTS["original"])
     p.add_argument("--base-checkpoint", type=Path, default=DEFAULTS["base"])
@@ -128,8 +133,15 @@ def _has_pngs(path: Path) -> bool:
     return path.is_dir() and any(path.glob("*.png"))
 
 
-def _run(command: Sequence[str], *, env: dict[str, str] | None = None) -> None:
+def _run(
+    command: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+    dry_run: bool = False,
+) -> None:
     print("\n$", " ".join(command), flush=True)
+    if dry_run:
+        return
     subprocess.run(
         list(command),
         cwd=str(ROOT),
@@ -167,7 +179,7 @@ def _run_original(
         args.attention_backend,
         "--png",
     ]
-    _run(command, env=env)
+    _run(command, env=env, dry_run=bool(args.dry_run))
 
 
 def _run_m8(
@@ -231,7 +243,8 @@ def main() -> int:
             / f"{input_path.stem}_m8_fullboost_compare"
         )
     )
-    output_root.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        output_root.mkdir(parents=True, exist_ok=True)
 
     original = _require_path(args.original_checkpoint, "Original SwiftVR checkpoint")
     base = _require_path(args.base_checkpoint, "prompt-free/no-time base checkpoint")
@@ -292,7 +305,11 @@ def main() -> int:
         method_outputs.append((label, output))
 
     comparison_dir = output_root / "comparison"
-    if comparison_dir.exists() and any(comparison_dir.iterdir()):
+    if (
+        not args.dry_run
+        and comparison_dir.exists()
+        and any(comparison_dir.iterdir())
+    ):
         if not args.skip_existing:
             raise FileExistsError(
                 f"Comparison output is not empty: {comparison_dir}; "
@@ -338,7 +355,11 @@ def main() -> int:
     for crop in args.crop:
         compare_command.extend(["--crop", crop])
 
-    _run(compare_command)
+    _run(compare_command, dry_run=bool(args.dry_run))
+
+    if args.dry_run:
+        print("\nDry-run complete; no inference outputs were written.", flush=True)
+        return 0
 
     summary = {
         "kind": "m8_fullboost_custom_input_compare_v1",
