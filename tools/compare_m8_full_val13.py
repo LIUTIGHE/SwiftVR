@@ -41,8 +41,10 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+TOOLS_ROOT = ROOT / "tools"
+for search_root in (ROOT, TOOLS_ROOT):
+    if str(search_root) not in sys.path:
+        sys.path.insert(0, str(search_root))
 
 from tools import train_teacher_distillation_ddp as stage_a
 from tools.smoke_training_forward import move_video_batch
