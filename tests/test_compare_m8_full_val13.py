@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -17,6 +18,18 @@ _SPEC.loader.exec_module(_TOOL)
 
 
 class CompareM8FullVal13Test(unittest.TestCase):
+    def test_direct_script_help_imports_from_repo_root(self):
+        completed = subprocess.run(
+            [sys.executable, str(_TOOL_PATH), "--help"],
+            cwd=str(_REPO_ROOT),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("Compare any number of M8/MoE checkpoints", completed.stdout)
+
     def test_parse_models_preserves_order_and_baseline(self):
         values = [
             "M8A=outputs/m8a",
