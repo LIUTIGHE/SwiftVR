@@ -44,6 +44,8 @@ def build_parser():
     p.add_argument("--torch_compile", action="store_true", help="Enable torch.compile. Disabled by default to avoid long recompilation on dynamic paths.",)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--chunk-trace", default=None,
+                   help="Optional fresh diagnostic directory; requires --png and zero DiT overlap.")
     p.add_argument("--quiet", action="store_true")
     return p
 
@@ -55,6 +57,11 @@ def main():
         args.device, dtype=args.dtype,
         attention_backend=args.attention_backend,
         torch_compile=args.torch_compile)
+
+    trace = None
+    if args.chunk_trace is not None:
+        from swiftvr.streaming.chunk_trace import ChunkTrace
+        trace = ChunkTrace(pipe, args.chunk_trace, args)
 
     stats = pipe.restore_video(
         args.input, args.output,
@@ -70,6 +77,9 @@ def main():
         queue_size=args.queue_size,
         verbose=not args.quiet,
     )
+
+    if trace is not None:
+        trace.finish(stats)
 
     print(f"\nDone. {stats['frames']} frames in {stats['seconds']:.2f}s "
           f"({stats['fps']:.2f} fps) -> {stats['output']}")
