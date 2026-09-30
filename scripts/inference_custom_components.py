@@ -91,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="bfloat16",
         choices=("bfloat16", "float16", "float32"),
     )
+    p.add_argument("--chunk-trace", default=None,
+                   help="Optional fresh diagnostic directory; requires --png and zero DiT overlap.")
     p.add_argument("--quiet", action="store_true")
     return p
 
@@ -221,6 +223,11 @@ def main() -> int:
         flush=True,
     )
 
+    trace = None
+    if args.chunk_trace is not None:
+        from swiftvr.streaming.chunk_trace import ChunkTrace
+        trace = ChunkTrace(pipe, args.chunk_trace, args)
+
     stats = pipe.restore_video(
         args.input,
         args.output,
@@ -236,6 +243,8 @@ def main() -> int:
         queue_size=args.queue_size,
         verbose=not args.quiet,
     )
+    if trace is not None:
+        trace.finish(stats)
     print(
         f"\nDone. {stats['frames']} frames in {stats['seconds']:.2f}s "
         f"({stats['fps']:.2f} fps) -> {stats['output']}"
