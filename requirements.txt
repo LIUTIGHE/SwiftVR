@@ -14,3 +14,5 @@ decord==0.6.0
 imageio==2.37.2
 imageio-ffmpeg==0.6.0
 
+# Optional training visualization used by tools/jsonl_to_tensorboard.py.
+tensorboard>=2.16,<3
