@@ -77,7 +77,8 @@ def main() -> int:
     print(f"Total decoded frames: {total}; metadata fps: {fps:g}")
     print(f"Indices displayed: {indices}")
     print(f"Contact sheet: {target}")
-    print("Choose START_FRAME at the beginning of sustained camera motion.")
+    print("Choose START_FRAME about 48-64 source frames BEFORE sustained motion,")
+    print("so the FIRST chunks have warm-up context before the motion ROI is evaluated.")
     return 0
 
 
