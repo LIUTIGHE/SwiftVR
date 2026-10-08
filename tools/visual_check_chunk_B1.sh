@@ -6,7 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 GPU="${GPU:-7}"
 VIDEO="${VIDEO:-Wetland1}"      # Wetland1, Mangrove1, or both
-: "${START_FRAME:?Set START_FRAME to the ORIGINAL decoded frame index where camera motion starts. Use tools/preview_video_motion_windows.py.}"
+: "${START_FRAME:?Set START_FRAME to an ORIGINAL decoded frame index roughly 48-64 frames BEFORE sustained camera motion. Use tools/preview_video_motion_windows.py.}"
 FRAMES="${FRAMES:-161}"         # Must be 4k+1. Increase to 193/241 if useful.
 ROI="${ROI:-960,540,960,960}"  # x,y,w,h in unpadded SR output pixels; never resized
 INPUT1="${INPUT1:-../data/yuv_S_10bit/720p_mp4/S5_Wetland1_1920x1080p444_10bit.mp4}"
