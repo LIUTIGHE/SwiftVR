@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from swiftvr.models.reae_slim_decoder import M8_DECODER76_CHANNELS, VARIANT_CHANNELS
+from swiftvr.models.transformer_prompt_free_no_time_moe import WanTransformer3DModelPromptFreeNoTimeMoE
+from swiftvr.training.m8_joint import (
+    M8JointDecoupledLossWeights,
+    M8JointLossWeights,
+    m8_joint_decoupled_objective,
+    m8_joint_objective,
+)
+from tools.train_m8_joint_coadapt_ddp import _configure_trainable_scope
+
+
+class M8DecoderArchitectureTests(unittest.TestCase):
+    def test_decoder76_variant_is_locked(self):
+        self.assertEqual(M8_DECODER76_CHANNELS, (128, 96, 64, 64))
+        self.assertEqual(tuple(VARIANT_CHANNELS["m8decoder76"]), M8_DECODER76_CHANNELS)
+
+
+class M8JointScopeTests(unittest.TestCase):
+    def _tiny_transformer(self):
+        return WanTransformer3DModelPromptFreeNoTimeMoE(
+            patch_size=(1, 2, 2),
+            num_attention_heads=2,
+            attention_head_dim=8,
+            in_channels=4,
+            out_channels=4,
+            ffn_dim=24,
+            num_layers=4,
+            rope_max_seq_len=32,
+            enable_swa=False,
+            self_attn_window_hw=(2, 2),
+            adapter_dim=4,
+            shared_expert_dim=16,
+            normal_expert_dim=4,
+            num_experts=4,
+            top_k=2,
+        )
+
+    def test_early_blocks_only_adapter_router_and_tail_is_full(self):
+        transformer = self._tiny_transformer()
+        decoder = nn.Sequential(nn.Conv2d(4, 4, 1), nn.ReLU(), nn.Conv2d(4, 4, 1))
+        groups, report = _configure_trainable_scope(transformer, decoder, tail_full_blocks=2)
+
+        self.assertEqual(report["tail_start_block"], 2)
+        self.assertTrue(groups["transformer_light"])
+        self.assertTrue(groups["transformer_tail"])
+        self.assertTrue(groups["decoder"])
+
+        for block_index, block in enumerate(transformer.blocks):
+            for name, parameter in block.named_parameters():
+                if block_index >= 2:
+                    self.assertTrue(parameter.requires_grad, f"tail parameter frozen: {block_index}.{name}")
+                elif "prompt_free_adapter" in name or name.startswith("ffn.router"):
+                    self.assertTrue(parameter.requires_grad, f"light parameter frozen: {block_index}.{name}")
+                else:
+                    self.assertFalse(parameter.requires_grad, f"early trunk unexpectedly trainable: {block_index}.{name}")
+
+        self.assertTrue(all(parameter.requires_grad for parameter in decoder.parameters()))
+
+
+class M8JointObjectiveTests(unittest.TestCase):
+    def test_teacher_only_objective_is_finite_and_differentiable(self):
+        torch.manual_seed(0)
+        student_velocity = torch.randn(2, 4, 3, 5, 6, requires_grad=True)
+        teacher_velocity = torch.randn_like(student_velocity)
+        z_lq = torch.randn_like(student_velocity)
+        student_rgb = torch.rand(2, 5, 3, 12, 14, requires_grad=True)
+        teacher_rgb = torch.rand_like(student_rgb)
+        router_balance = student_velocity.new_tensor(1.05, requires_grad=True)
+        weights = M8JointLossWeights(teacher_lpips=0.0)
+
+        objective = m8_joint_objective(
+            student_velocity=student_velocity,
+            teacher_velocity=teacher_velocity,
+            z_lq=z_lq,
+            student_prediction=student_rgb,
+            teacher_prediction=teacher_rgb,
+            router_balance_loss=router_balance,
+            perceptual=None,
+            weights=weights,
+        )
+        self.assertTrue(torch.isfinite(objective["loss"]))
+        self.assertNotIn("gt", " ".join(objective.keys()).lower())
+        objective["loss"].backward()
+        self.assertIsNotNone(student_velocity.grad)
+        self.assertIsNotNone(student_rgb.grad)
+        self.assertIsNotNone(router_balance.grad)
+        self.assertTrue(torch.isfinite(student_velocity.grad).all())
+        self.assertTrue(torch.isfinite(student_rgb.grad).all())
+
+    def test_decoupled_objective_is_finite_and_has_expected_terms(self):
+        torch.manual_seed(1)
+        student_velocity = torch.randn(2, 4, 3, 5, 6, requires_grad=True)
+        teacher_velocity = torch.randn_like(student_velocity)
+        z_lq = torch.randn_like(student_velocity)
+        compact_rgb = torch.rand(2, 5, 3, 12, 14, requires_grad=True)
+        full_student_rgb = torch.rand_like(compact_rgb, requires_grad=True)
+        teacher_rgb = torch.rand_like(compact_rgb)
+        router_balance = student_velocity.new_tensor(1.02, requires_grad=True)
+        weights = M8JointDecoupledLossWeights(
+            system_lpips=0.0,
+            decoder_teacher_lpips=0.0,
+        )
+
+        objective = m8_joint_decoupled_objective(
+            student_velocity=student_velocity,
+            teacher_velocity=teacher_velocity,
+            z_lq=z_lq,
+            compact_prediction=compact_rgb,
+            full_student_prediction=full_student_rgb,
+            teacher_prediction=teacher_rgb,
+            router_balance_loss=router_balance,
+            perceptual=None,
+            weights=weights,
+        )
+        expected = {
+            "system_rgb_l1",
+            "system_rgb_temporal_mse",
+            "decoder_teacher_l2",
+            "decoder_teacher_temporal_mse",
+        }
+        self.assertTrue(expected.issubset(objective))
+        self.assertNotIn("gt", " ".join(objective.keys()).lower())
+        self.assertTrue(torch.isfinite(objective["loss"]))
+        objective["loss"].backward()
+        self.assertIsNotNone(student_velocity.grad)
+        self.assertIsNotNone(compact_rgb.grad)
+        self.assertIsNotNone(full_student_rgb.grad)
+        self.assertTrue(torch.isfinite(compact_rgb.grad).all())
+        self.assertTrue(torch.isfinite(full_student_rgb.grad).all())
+
+    def test_decoder_same_latent_target_is_detached_from_full_student(self):
+        torch.manual_seed(2)
+        shape_v = (1, 2, 2, 3, 3)
+        shape_rgb = (1, 3, 3, 6, 6)
+        student_velocity = torch.randn(*shape_v, requires_grad=True)
+        teacher_velocity = torch.randn_like(student_velocity)
+        z_lq = torch.randn_like(student_velocity)
+        compact_rgb = torch.rand(*shape_rgb, requires_grad=True)
+        full_student_rgb = torch.rand(*shape_rgb, requires_grad=True)
+        teacher_rgb = torch.rand_like(compact_rgb)
+        router_balance = student_velocity.new_tensor(1.0, requires_grad=True)
+        weights = M8JointDecoupledLossWeights(
+            velocity_nmse=0.0,
+            velocity_cosine=0.0,
+            latent_spatial=0.0,
+            latent_temporal=0.0,
+            system_rgb_l1=0.0,
+            system_lpips=0.0,
+            system_rgb_temporal=0.0,
+            decoder_teacher_l2=1.0,
+            decoder_teacher_lpips=0.0,
+            decoder_teacher_temporal=0.0,
+            router_balance=0.0,
+        )
+        objective = m8_joint_decoupled_objective(
+            student_velocity=student_velocity,
+            teacher_velocity=teacher_velocity,
+            z_lq=z_lq,
+            compact_prediction=compact_rgb,
+            full_student_prediction=full_student_rgb,
+            teacher_prediction=teacher_rgb,
+            router_balance_loss=router_balance,
+            perceptual=None,
+            weights=weights,
+        )
+        objective["loss"].backward()
+        self.assertGreater(float(compact_rgb.grad.abs().sum()), 0.0)
+        # full_student is a detached teacher for the decoder recovery branch.
+        self.assertIsNotNone(full_student_rgb.grad)
+        self.assertEqual(float(full_student_rgb.grad.abs().sum()), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
