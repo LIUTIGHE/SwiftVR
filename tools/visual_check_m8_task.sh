@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Explicit inference + composition, no hidden model-selection wrapper.
 # prepare: run Original once. validate CHECKPOINT OUT: run only current student.
+# compose CHECKPOINT OUT: retry composition after a failure, with no GPU inference.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-MODE="${1:?Use prepare or validate CHECKPOINT OUTPUT}"
+MODE="${1:?Use prepare, validate CHECKPOINT OUTPUT, or compose CHECKPOINT OUTPUT}"
 GPU="${GPU:-7}"
 export CUSTOM_REF_ROOT="${CUSTOM_REF_ROOT:?Set a new custom reference bank directory}"
 export INPUT1="${INPUT1:-../data/yuv_S_10bit/720p_mp4/S5_Wetland1_1920x1080p444_10bit.mp4}"
@@ -68,10 +69,14 @@ print('Prepared',root/'reference.json')
 PY
   exit 0
 fi
-[[ "$MODE" == validate ]] || { echo "Unknown mode: $MODE" >&2; exit 2; }
+[[ "$MODE" == validate || "$MODE" == compose ]] || { echo "Unknown mode: $MODE" >&2; exit 2; }
 export CURRENT="${2:?Current checkpoint required}"
 export OUT="${3:?New validation output root required}"
-test ! -e "$OUT" || { echo "Use new validation output, do not reuse stale PNGs: $OUT" >&2; exit 1; }
+if [[ "$MODE" == validate ]]; then
+  test ! -e "$OUT" || { echo "Use new validation output, do not reuse stale PNGs: $OUT" >&2; exit 1; }
+else
+  test -d "$OUT" || { echo "Composition retry requires the existing output: $OUT" >&2; exit 1; }
+fi
 # Read the immutable bank instead of trusting changing INPUT/BASIC environment variables.
 python - <<'PY'
 import json,os
@@ -83,7 +88,7 @@ for s in m['original_files']+[c[k] for c in m['clips'] for k in ('input','basic'
     if (st.st_size,st.st_mtime_ns)!=(s['size'],s['mtime_ns']): raise ValueError(f'Reference changed: {p}')
 PY
 mkdir -p "$OUT"
-exec > >(tee "$OUT/visual_check.log") 2>&1
+exec > >(tee -a "$OUT/visual_check.log") 2>&1
 for NAME in Wetland1 Mangrove1; do
   INPUT=$(python - "$NAME" <<'PY'
 import json,os,sys
@@ -92,12 +97,28 @@ m=json.loads((Path(os.environ['CUSTOM_REF_ROOT'])/'reference.json').read_text())
 print(next(c['input']['path'] for c in m['clips'] if c['name']==sys.argv[1]))
 PY
 )
+  if [[ "$MODE" == validate ]]; then
   CUDA_VISIBLE_DEVICES="$GPU" python scripts/inference_custom_components.py \
     --input "$INPUT" --output "$OUT/$NAME/current_png" \
     --base-checkpoint "$BASE" --transformer-checkpoint "$CURRENT" \
     --transformer-type moe --decoder-type m9a1 --decoder-checkpoint "$A1" \
     --upscale 3 --clip-len 24 --dit-overlap 0 --dtype bfloat16 \
     --attention-backend sdpa --png
+  elif [[ -f "$OUT/$NAME/complete.json" ]]; then
+    python - "$OUT/$NAME/complete.json" <<'PYCOMPLETE'
+import json,os,sys
+from pathlib import Path
+m=json.loads(Path(sys.argv[1]).read_text())
+if Path(m['current']).resolve()!=Path(os.environ['CURRENT']).resolve():
+    raise ValueError('Completed comparison belongs to a different checkpoint')
+PYCOMPLETE
+    echo "[reuse completed comparison] $NAME"
+    continue
+  else
+    test -d "$OUT/$NAME/current_png" || { echo "No saved Current PNGs for $NAME" >&2; exit 1; }
+    # Remove only the incomplete derived MKV, never input/reference/inference frames.
+    rm -f "$OUT/$NAME/native_fourway.mkv"
+  fi
   # Reuse canonical FrameSource and length alignment. Only compose native ROI here.
   python - "$NAME" <<'PY'
 import json,os,subprocess,sys
