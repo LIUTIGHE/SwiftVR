@@ -64,7 +64,7 @@ def build_parser():
     p.add_argument("--no-gradient-checkpointing", action="store_true")
     p.add_argument("--custom-hook", type=Path, default=ROOT / "tools/visual_check_m8_task.sh")
     p.add_argument("--custom-ref-root", type=Path, help="Prepared Original/TinyCNN reference bank")
-    p.add_argument("--smoke-steps", type=int, default=0, help="Partial HR allowed; GT-only backward; no custom validation. Not a quality result.")
+    p.add_argument("--smoke-steps", type=int, default=0, help="Partial HR allowed; verify GT+GAN gradients. Not a visual-quality result.")
     return p
 
 
@@ -446,7 +446,7 @@ def main():
                 if due_val: validate(step,path)
         if rank==0:
             write_json(a.output_dir / "summary.json", {"step":step,"status":"p2_smoke_pass" if a.smoke_steps else "completed_budget",
-                       "gt_only_backward_checked":bool(a.smoke_steps), "visual_quality_pass":False,
+                       "p2_gradient_smoke_checked":bool(a.smoke_steps), "visual_quality_pass":False,
                        "seconds_this_invocation":time.perf_counter()-started, "config":config})
     finally:
         if world>1 and dist.is_initialized(): dist.destroy_process_group()
