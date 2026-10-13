@@ -137,7 +137,11 @@ def build_parser():
     p.add_argument("--base-checkpoint", type=Path, required=True)
     p.add_argument("--student-init", type=Path, required=True)
     p.add_argument("--decoder-checkpoint", type=Path, required=True)
-    p.add_argument("--legacy-view-cache", type=Path, required=True, help="FULL cache metadata only; velocity tensors are not read")
+    p.add_argument("--legacy-view-cache", type=Path, required=True)
+    p.add_argument("--ultra-teacher-cache", type=Path, required=True)
+    p.add_argument("--recipe", choices=("teacher_perceptual","teacher_texture"), required=True)
+    p.add_argument("--teacher-lpips-weight", type=float, default=0.2)
+    p.add_argument("--teacher-texture-weight", type=float, default=0.1)
     p.add_argument("--val-view-cache", type=Path, required=True)
     p.add_argument("--ultra-pairs", type=Path, action="append", required=True)
     p.add_argument("--path-root", type=Path, default=Path("."))
@@ -166,7 +170,7 @@ def build_parser():
     p.add_argument("--no-gradient-checkpointing", action="store_true")
     p.add_argument("--custom-hook", type=Path, default=ROOT / "tools/visual_check_m8_task.sh")
     p.add_argument("--custom-ref-root", type=Path, help="Prepared Original/TinyCNN reference bank")
-    p.add_argument("--smoke-steps", type=int, default=0, help="Partial HR allowed; GT-only backward; no custom validation. Not a quality result.")
+    p.add_argument("--smoke-steps", type=int, default=0, help="Teacher identity and gradient smoke; no quality claim")
     return p
 
 
@@ -179,11 +183,12 @@ def check_args(a):
         raise ValueError("Invalid worker/smoke/warmup settings")
     if a.max_steps > a.schedule_steps or not math.isfinite(a.learning_rate) or a.learning_rate <= 0:
         raise ValueError("Invalid stop/schedule/learning rate")
-    for key in ("pixel_weight", "temporal_weight", "lpips_weight", "router_weight"):
+    for key in ("pixel_weight", "temporal_weight", "lpips_weight", "router_weight",
+                "teacher_lpips_weight", "teacher_texture_weight"):
         if not math.isfinite(getattr(a, key)) or getattr(a, key) < 0:
             raise ValueError("Loss weights must be finite/nonnegative")
-    if a.pixel_weight + a.temporal_weight + a.lpips_weight <= 0:
-        raise ValueError("Need an actual GT objective")
+    if a.pixel_weight + a.temporal_weight + a.lpips_weight <= 0 or a.teacher_lpips_weight <= 0:
+        raise ValueError("T1 requires positive GT and teacher LPIPS supervision")
     if (a.lpips_weight or not a.smoke_steps) and a.lpips_weights is None:
         raise ValueError("Both formal runs require local LPIPS weights for comparable validation")
     if not a.smoke_steps and a.custom_ref_root is None:
@@ -194,7 +199,8 @@ def check_args(a):
     a.ultra_pairs = [p.expanduser().resolve() for p in a.ultra_pairs]
     required = [a.base_checkpoint / "reae.safetensors", a.student_init / "transformer/config.json",
                 a.decoder_checkpoint / "config.json", a.decoder_checkpoint / "model.safetensors",
-                a.legacy_view_cache / "metadata.json", a.val_view_cache / "metadata.json", *a.ultra_pairs]
+                a.legacy_view_cache / "metadata.json", a.val_view_cache / "metadata.json",
+                 a.ultra_teacher_cache / "metadata.json", *a.ultra_pairs]
     if a.lpips_weights:
         required.append(a.lpips_weights)
     if a.resume:
@@ -204,7 +210,8 @@ def check_args(a):
     for path in required:
         if not path.is_file():
             raise FileNotFoundError(path)
-    immutable = [a.base_checkpoint, a.student_init, a.decoder_checkpoint, a.legacy_view_cache, a.val_view_cache]
+    immutable = [a.base_checkpoint, a.student_init, a.decoder_checkpoint,
+                 a.legacy_view_cache, a.ultra_teacher_cache, a.val_view_cache]
     for path in immutable:
         if a.output_dir == path or path in a.output_dir.parents or a.output_dir in path.parents:
             raise ValueError("Output must be separate from all immutable source trees")
@@ -255,7 +262,27 @@ def main():
     from swiftvr.training.b2b_moe_training import B2BMoEVelocityDistillationForward, set_router_stats_collection
     from swiftvr.training.mixed_distillation import BalancedTwoDomainDistributedSampler
     from swiftvr.training.m8_task import M8TaskForward, LocalLPIPS, task_objective, phase_errors
+    from swiftvr.training.distillation import TeacherVelocityCache, decode_teacher_prediction
+    from swiftvr.training.mixed_distillation import MixedTeacherVelocityCache
+    from torch.utils.checkpoint import checkpoint as activation_checkpoint
     from swiftvr.training.stage3 import VideoMetricAccumulator
+
+    class TeacherTaskForward(M8TaskForward):
+        def forward(self, batch):
+            output = self.backbone(batch)
+            target = output["target"]
+            if target is None:
+                raise ValueError("Teacher KD requires GT HR tensor")
+            latent = (output["z_lq"]-output["velocity"]).permute(0,2,1,3,4).contiguous()
+            def decode(z):
+                return self.decoder(z, output_frames=target.shape[1], clamp=False)
+            pred = (activation_checkpoint(decode, latent, use_reentrant=False)
+                    if self.checkpoint_decoder and torch.is_grad_enabled() else decode(latent))
+            if pred.shape != target.shape:
+                raise ValueError("T1 A1/GT geometry mismatch")
+            return {"prediction":pred, "target":target, "z_lq":output["z_lq"],
+                    "router_balance_loss":output["router_balance_loss"]}
+
 
     rank, local_rank = int(os.environ.get("RANK", 0)), int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
@@ -291,11 +318,23 @@ def main():
         valset, val_meta = build_legacy_pairs(a.val_view_cache, path_root=a.path_root, split="val")
         ultra, ultra_meta = build_ultra_pairs(a.ultra_pairs, allow_partial=bool(a.smoke_steps))
         if len(valset) != 13:
-            raise ValueError("P1 historical regression requires the full fixed val13")
+            raise ValueError("T1 requires full fixed val13")
         for meta in (legacy_meta, val_meta):
             if (meta["clip_length"], meta["crop_size"], meta["scale"]) != (13, 128, 3):
-                raise ValueError("P1 first experiment keeps T13/LR128/3x geometry")
-        dataset = ConcatDataset([legacy, ultra])
+                raise ValueError("T1 keeps T13/LR128/3x geometry")
+        legacy_teacher = TeacherVelocityCache(a.legacy_view_cache)
+        ultra_teacher = TeacherVelocityCache(a.ultra_teacher_cache)
+        if (legacy_teacher.metadata.get("teacher_role") != "stage_a_200k_prompt_free_no_time"
+            or ultra_teacher.metadata.get("teacher_role") != "stage_a_200k_prompt_free_no_time"):
+            raise ValueError("T1 requires Stage-A200k teacher caches, not TA")
+        if (len(legacy) != 15896 or len(ultra) != 20088
+            or len(legacy_teacher.samples_by_index) != len(legacy)):
+            raise ValueError("T1 requires full Legacy15896/Ultra20088 views")
+        validate_ultra_teacher_views(ultra_teacher, ultra.datasets, ultra_meta)
+        teacher_caches = MixedTeacherVelocityCache(
+            {"legacy":legacy_teacher, "ultravideo":ultra_teacher})
+        dataset = ConcatDataset([TeacherPairedView(legacy),
+                     ConcatDataset([TeacherPairedView(part) for part in ultra.datasets])])
         sampler = BalancedTwoDomainDistributedSampler(dataset, num_replicas=world, rank=rank, seed=a.seed)
         # Keep a balanced prefix before batching exactly as the existing sampler;
         # 50:50 describes its global epoch, not every update.
@@ -317,7 +356,8 @@ def main():
         identity_files = [a.base_checkpoint / "reae.safetensors", a.decoder_checkpoint / "config.json",
                           a.decoder_checkpoint / "model.safetensors", a.student_init / "transformer/config.json",
                           *sorted((a.student_init / "transformer").glob("*.safetensors")),
-                          a.legacy_view_cache / "metadata.json", a.val_view_cache / "metadata.json", *a.ultra_pairs]
+                          a.legacy_view_cache / "metadata.json", a.val_view_cache / "metadata.json",
+                 a.ultra_teacher_cache / "metadata.json", *a.ultra_pairs]
         identity_files += [p.parent / "hr_metadata.json" for p in a.ultra_pairs]
         identity_files.extend([Path(__file__).resolve(), ROOT / "swiftvr/training/m8_task.py",
                                ROOT / "swiftvr/data/task_pairs.py", ROOT / "swiftvr/training/b2b_moe_training.py",
@@ -330,11 +370,11 @@ def main():
         hashes = {str(p): sha256_file(p) for p in identity_files} if rank == 0 else None
         if world > 1:
             obj = [hashes]; dist.broadcast_object_list(obj, src=0); hashes = obj[0]
-        config.update(kind="m8_gt_task_posttrain_v1", hashes=hashes, world_size=world,
+        config.update(kind="m8_t1_teacher_perceptual_kd_v1", hashes=hashes, world_size=world,
                       global_batch=world*a.batch_size*a.gradient_accumulation_steps,
                       legacy_views=len(legacy), ultra_views=len(ultra),
-                      gt_role="primary_RGB_reconstruction_perceptual_temporal",
-                      teacher_role="initialization_only; cache metadata used for historical view identity",
+                      gt_role="GT_RGB_content_perceptual_temporal",
+                      teacher_role="Stage-A200k_cached_velocity_to_frozen_Original_ReAE_RGB",
                       training_protocol="whole T13, same frozen A1 weights; not cross-chunk state-matched training",
                       deployment_changed=False, gan=False)
         if rank == 0:
@@ -349,11 +389,11 @@ def main():
             str(a.student_init), subfolder="transformer", torch_dtype=torch.float32,
             low_cpu_mem_usage=True, local_files_only=True).to(device)
         if transformer_moe_shape(transformer) != expected_moe_shape(B2BMoESpec(num_layers=20)):
-            raise ValueError("P1 requires unchanged M8 D1024/H8/L20, 1 shared + 12 routed top2")
+            raise ValueError("T1 requires unchanged M8 D1024/H8/L20 1S12E2A")
         backbone = B2BMoEVelocityDistillationForward(reae, transformer, attention_backend="sdpa",
                                                     gradient_checkpointing=not a.no_gradient_checkpointing)
         transformer.requires_grad_(True)
-        closure = M8TaskForward(backbone, decoder, checkpoint_decoder=not a.no_decoder_checkpointing).train()
+        closure = TeacherTaskForward(backbone, decoder, checkpoint_decoder=not a.no_decoder_checkpointing).train()
         set_router_stats_collection(transformer, False)
         perceptual = LocalLPIPS(a.lpips_weights, frame_batch=a.lpips_frame_batch).to(device) if a.lpips_weights else None
         params = list(transformer.parameters())
@@ -393,7 +433,8 @@ def main():
                 torch.save(state, path / "training_state.tmp")
                 (path / "training_state.tmp").replace(path / "training_state.pt")
                 write_json(path / "metadata.json", {"global_step":step, "decoder_checkpoint":str(a.decoder_checkpoint),
-                                                     "train_scope":"M8_only", "gt_role":config["gt_role"]})
+                                                     "train_scope":"M8_only", "gt_role":config["gt_role"],
+                                                     "teacher_role":config["teacher_role"],"recipe":a.recipe})
                 write_json(a.output_dir / "latest.json", {"checkpoint":str(path), "global_step":step})
             barrier()
             return path
