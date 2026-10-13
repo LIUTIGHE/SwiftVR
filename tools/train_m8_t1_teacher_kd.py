@@ -513,8 +513,35 @@ def main():
                 with sync:
                     with torch.autocast("cuda", dtype=dtype, enabled=dtype == torch.bfloat16):
                         out=ddp(batch); terms=task_objective(out, perceptual=perceptual, **weights)
-                        # Smoke proves GT reaches M8, without router masking a broken decode graph.
-                        loss=terms["gt_loss"] if a.smoke_steps else terms["loss"]
+                    # Restore the frozen Stage-A teacher from strict, immutable view caches.
+                    teacher_velocity = teacher_caches.load_batch(
+                        batch_cpu, device=device, dtype=dtype)
+                    if teacher_velocity.shape != out["z_lq"].shape:
+                        raise ValueError("Stage-A teacher velocity / M8 latent shape mismatch")
+                    with torch.no_grad():
+                        teacher_rgb = decode_teacher_prediction(
+                            reae=reae, z_lq=out["z_lq"].detach(),
+                            teacher_velocity=teacher_velocity,
+                            output_frames=int(out["target"].shape[1]))
+                    if teacher_rgb.shape != out["prediction"].shape:
+                        raise ValueError("Stage-A teacher/Student RGB shape mismatch")
+                    teacher_lpips = perceptual(out["prediction"], teacher_rgb)
+                    teacher_texture = (teacher_band_energy_loss(
+                        out["prediction"], teacher_rgb, out["target"])
+                        if a.recipe == "teacher_texture" else teacher_lpips.new_zeros(()))
+                    terms["teacher_lpips"] = teacher_lpips
+                    terms["teacher_texture"] = teacher_texture
+                    terms["loss"] = terms["loss"] + a.teacher_lpips_weight * teacher_lpips
+                    if a.recipe == "teacher_texture":
+                        terms["loss"] = terms["loss"] + a.teacher_texture_weight * teacher_texture
+                    if a.smoke_steps and step == 0 and micro == 0:
+                        teacher_grad = torch.autograd.grad(
+                            teacher_lpips, params, retain_graph=True, allow_unused=True)
+                        if not any(g is not None and bool(torch.count_nonzero(g))
+                                   for g in teacher_grad):
+                            raise RuntimeError("Teacher perceptual loss cannot reach M8")
+                        del teacher_grad
+                    loss = terms["loss"]
                     (loss / a.gradient_accumulation_steps).backward()
                 for key,value in terms.items():
                     recent[key] = recent.get(key, torch.zeros((), device=device)) + value.detach() / a.gradient_accumulation_steps
@@ -522,10 +549,10 @@ def main():
             if a.smoke_steps:
                 good=any(p.grad is not None and bool(torch.count_nonzero(p.grad)) for p in params)
                 frozen_ok=all(p.grad is None for m in (closure.backbone.reae, decoder) for p in m.parameters())
-                if not good or not frozen_ok: raise RuntimeError("GT-only gradient path/frozen-scope smoke failed")
+                if not good or not frozen_ok: raise RuntimeError("T1 smoke: M8 gradient or frozen ReAE/A1 scope failed")
             optimizer.step(); optimizer.zero_grad(set_to_none=True)
             step+=1; seen+=1
-            del out, terms, loss, batch, batch_cpu
+            del out, terms, loss, batch, batch_cpu, teacher_velocity, teacher_rgb, teacher_lpips, teacher_texture
             if step % a.log_every == 0 or step == stop:
                 values=torch.stack([v for v in recent.values()]) / seen
                 if world > 1: dist.all_reduce(values); values/=world
@@ -542,8 +569,8 @@ def main():
                 path=save(step)
                 if due_val: validate(step,path)
         if rank==0:
-            write_json(a.output_dir / "summary.json", {"step":step,"status":"smoke_pass" if a.smoke_steps else "completed_budget",
-                       "gt_only_backward_checked":bool(a.smoke_steps), "visual_quality_pass":False,
+            write_json(a.output_dir / "summary.json", {"step":step,"status":"teacher_kd_smoke_pass" if a.smoke_steps else "completed_budget",
+                       "teacher_kd_gradient_checked":bool(a.smoke_steps), "visual_quality_pass":False,
                        "seconds_this_invocation":time.perf_counter()-started, "config":config})
     finally:
         if world>1 and dist.is_initialized(): dist.destroy_process_group()
