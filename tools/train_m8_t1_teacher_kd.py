@@ -189,8 +189,8 @@ def check_args(a):
             raise ValueError("Loss weights must be finite/nonnegative")
     if a.pixel_weight + a.temporal_weight + a.lpips_weight <= 0 or a.teacher_lpips_weight <= 0:
         raise ValueError("T1 requires positive GT and teacher LPIPS supervision")
-    if (a.lpips_weight or not a.smoke_steps) and a.lpips_weights is None:
-        raise ValueError("Both formal runs require local LPIPS weights for comparable validation")
+    if a.lpips_weights is None:
+        raise ValueError("Teacher perceptual KD always requires complete local LPIPS weights")
     if not a.smoke_steps and a.custom_ref_root is None:
         raise ValueError("Formal validation requires the two prepared custom references")
     for key, value in vars(a).items():
@@ -287,7 +287,7 @@ def main():
     rank, local_rank = int(os.environ.get("RANK", 0)), int(os.environ.get("LOCAL_RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     if not torch.cuda.is_available():
-        raise RuntimeError("Real-model P1 trainer requires CUDA; unit tests are CPU-only")
+        raise RuntimeError("Real-model T1 trainer requires CUDA; CPU-only unit tests are separate")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dtype = getattr(torch, a.dtype)
@@ -534,7 +534,10 @@ def main():
                     terms["loss"] = terms["loss"] + a.teacher_lpips_weight * teacher_lpips
                     if a.recipe == "teacher_texture":
                         terms["loss"] = terms["loss"] + a.teacher_texture_weight * teacher_texture
-                    if a.smoke_steps and step == 0 and micro == 0:
+                    # autograd.grad on DDP parameters bypasses the DDP reducer.
+                    # Isolate teacher-only gradients only on a ONE-GPU smoke.
+                    # Multi-GPU smoke still checks full-objective backward.
+                    if a.smoke_steps and world == 1 and step == 0 and micro == 0:
                         teacher_grad = torch.autograd.grad(
                             teacher_lpips, params, retain_graph=True, allow_unused=True)
                         if not any(g is not None and bool(torch.count_nonzero(g))
