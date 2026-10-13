@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""P1: GT RGB post-training through frozen deployment A1 into the unchanged M8.
+"""T1: GT-anchored Stage-A teacher-perceptual distillation of M8/A1.
 
-Control: GT L1 + GT frame-difference MSE. Main: additionally GT LPIPS.
-Reuses canonical deterministic datasets, balanced DDP sampler, MoE forward,
-A1 forward and metrics. No teacher velocity/RGB targets, no GAN, no new topology.
+Teacher RGB is reconstructed from immutable Stage-A200k velocity cache through
+the frozen Original ReAE decoder; M8 trains through frozen A1. Separate T1
+entrypoint preserves P1/P2 training code, source hashes, and resume protocol.
+Recipes A=teacher LPIPS; B=A+GT-capped local teacher texture energy.
 """
 from __future__ import annotations
 
@@ -19,10 +20,116 @@ import subprocess
 import sys
 import time
 
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from safetensors import safe_open
+
 ROOT = Path(__file__).resolve().parents[1]
 for p in (ROOT, ROOT / "tools"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
+
+
+
+class TeacherPairedView(Dataset):
+    """Exactly the canonical P1 paired LR/HR, plus immutable teacher identity.
+
+    UltraVideo HR shards use LOCAL indexing; cached velocity uses GLOBAL
+    materialized_index. Never replace that identifier with the shard offset.
+    """
+
+    KEYS = ("sample_id", "record_uid", "variant", "frame_indices",
+            "crop_top", "crop_left", "horizontal_flip", "vertical_flip",
+            "distillation_index", "distillation_view_index",
+            "distillation_view_seed")
+
+    def __init__(self, paired_view):
+        self.base = paired_view
+        if paired_view.domain not in ("legacy", "ultravideo"):
+            raise ValueError("Unsupported teacher paired domain")
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, index):
+        sample = self.base.dataset[index]
+        lr = sample["lr"]
+        if self.base.hr_rows is None:
+            hr = sample["hr"]
+            pair_id = f"legacy:{sample['record_uid']}:{sample['distillation_index']}"
+        else:
+            row = self.base.hr_rows[index]
+            if int(row["materialized_index"]) != int(sample["materialized_index"]):
+                raise ValueError("UltraVideo HR and LR materialized_index mismatch")
+            with safe_open(row["hr_bundle_path"], framework="pt", device="cpu") as h:
+                hr = h.get_tensor(row["hr_bundle_key"])
+            if hr.dtype != torch.uint8:
+                raise ValueError("Expected lossless uint8 UltraVideo HR")
+            hr = hr.float().div_(255.0)
+            pair_id = row["lr_row_sha256"]
+        if (lr.ndim != 4 or hr.ndim != 4 or
+            lr.shape[:2] != hr.shape[:2] or
+            hr.shape[1] != 3 or
+            tuple(hr.shape[-2:]) !=
+            tuple(int(v) * int(sample["scale"]) for v in lr.shape[-2:])):
+            raise ValueError("Teacher paired LR/HR geometry mismatch")
+        identity = {key: sample[key] for key in self.KEYS}
+        if self.base.domain == "ultravideo":
+            identity["distillation_index"] = int(sample["materialized_index"])
+        return {"lr":lr, "hr":hr, "pair_id":pair_id, "domain":self.base.domain,
+                "teacher_cache_domain":self.base.domain, **identity}
+
+
+def validate_ultra_teacher_views(cache, ultra_parts, hr_metadatas, expected_count=20088):
+    """Check all UltraVideo identities using metadata, without opening HR frames."""
+    if cache.metadata.get("dataset_kind") != "ultravideo_materialized_lr_v1":
+        raise ValueError("Wrong UltraVideo Stage-A cache dataset_kind")
+    expected_hashes = {meta["source_manifest_sha256"] for meta in hr_metadatas}
+    if expected_hashes != {cache.metadata.get("materialized_manifest_sha256")}:
+        raise ValueError("Stage-A UltraVideo cache / paired HR manifest hash mismatch")
+    if len(cache.samples_by_index) != expected_count:
+        raise ValueError("Incomplete UltraVideo teacher cache")
+    seen = set()
+    for part in ultra_parts:
+        for row in part.dataset.rows:
+            idx = int(row["materialized_index"])
+            if idx in seen:
+                raise ValueError("Repeated UltraVideo global materialized_index")
+            seen.add(idx)
+            teacher_row = cache.samples_by_index.get(idx)
+            if teacher_row is None:
+                raise ValueError(f"Missing UltraVideo Stage-A teacher {idx}")
+            for field in ("sample_id","record_uid","variant","frame_indices",
+                          "crop_top","crop_left","horizontal_flip","vertical_flip",
+                          "view_index","view_seed"):
+                if teacher_row.get(field) != row.get(field):
+                    raise ValueError(f"UltraVideo cached teacher mismatch: {idx} {field}")
+    if seen != set(range(expected_count)):
+        raise ValueError("UltraVideo materialized_index coverage incomplete")
+
+
+def teacher_band_energy_loss(student, teacher, gt):
+    """Experimental texture-statistic term, NOT a literal paper reproduction.
+
+    Teacher band energy is capped by GT detail energy to limit hallucinations.
+    Statistical energy matching can still create noise: visual QA is mandatory.
+    """
+    if student.shape != teacher.shape or student.shape != gt.shape:
+        raise ValueError("Teacher, student and GT shape mismatch")
+    b,t,c,h,w = student.shape
+    if min(h,w) < 8:
+        raise ValueError("Band energy requires at least 8x8")
+    frames = [v.float().reshape(b*t,c,h,w) for v in
+              (student, teacher.detach(), gt.detach())]
+    total = student.new_zeros((), dtype=torch.float32)
+    for k in (3,7):
+        def energy(x):
+            high = x - F.avg_pool2d(x,kernel_size=k,stride=1,padding=k//2)
+            return (F.avg_pool2d(high.square(),kernel_size=8,stride=8)+1e-6).sqrt()
+        p, te, g = (energy(x) for x in frames)
+        total = total + (p - torch.minimum(te, 1.5*g+0.01)).abs().mean()
+    return total/2
 
 
 def build_parser():
