@@ -72,6 +72,32 @@ class TestM11ArchitectureBudget(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_config(m8,expected_moe_shape(M11A_MOE_SPEC))
 
+    def test_initializers_and_trainer_specs_agree(self):
+        from tools.build_b2b_moe_depth_init import DEPTH_TARGETS, M11A_ARCHITECTURE
+        from tools.build_b2b_moe_init import (
+            INIT_ARCHITECTURES, M11B_ARCHITECTURE, M11B_SPEC as INITIALIZER_B,
+        )
+        from tools.train_b2b_moe_ta_distill_ddp_cache_safe import (
+            _spec_for_architecture, SUPPORTED_ARCHITECTURES,
+        )
+        self.assertEqual(DEPTH_TARGETS[M11A_ARCHITECTURE],M11A_MOE_SPEC)
+        self.assertEqual(INITIALIZER_B,M11B_MOE_SPEC)
+        for name,expected in (
+            (M11A_ARCHITECTURE,M11A_MOE_SPEC),
+            (M11B_ARCHITECTURE,M11B_MOE_SPEC),
+        ):
+            self.assertIn(name,SUPPORTED_ARCHITECTURES)
+            self.assertEqual(_spec_for_architecture(name),expected)
+        self.assertIn(M11B_ARCHITECTURE,INIT_ARCHITECTURES)
+
+    def test_initializer_source_contract(self):
+        # The mature M5 source is D1024/L30, and B's TA source is D1536/L30,
+        # dense FFN8960. Both initializers must be able to fill their targets.
+        self.assertLess(M11A_MOE_SPEC.num_layers,30)
+        self.assertEqual(M11A_MOE_SPEC.hidden_dim,1024)
+        self.assertEqual(M11B_MOE_SPEC.num_layers,20)
+        self.assertLessEqual(M11B_MOE_SPEC.total_ffn_dim,8960)
+
 
 if __name__=="__main__":
     unittest.main()
