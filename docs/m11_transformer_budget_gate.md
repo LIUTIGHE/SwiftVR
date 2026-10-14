@@ -1,6 +1,6 @@
 # M11: 525–530 GFLOPs Transformer-only capacity gate
 
-Status: **architecture definition and calibrated MAC audit implemented; not trained; no new full-model runtime count yet**.
+Status: **both runtime MAC gates PASS on user's CUDA server; M11 initializers and TA trainer routing integrated but untested on real CUDA checkpoints**. No M11 training launched by these changes.
 
 ## Motivation / locked facts
 
@@ -37,8 +37,12 @@ weight sweep. The long custom sequences are the acceptance test, not val13:
 | DiT GMAC/frame, calibrated | 132.1590 | **145.3749** | **145.5283** |
 | Encoder GMAC/frame, frozen | 42.2780 | 42.2780 | 42.2780 |
 | Decoder GMAC/frame, frozen | 75.9504 | 75.9504 | 75.9504 |
-| **Whole-system GFLOPs/frame** | **500.775** | **527.207** | **527.513** |
-| 530G gate (estimate) | PASS | **PASS** | **PASS** |
+| **Whole-system GFLOPs/frame: estimate** | **500.775** | **527.207** | **527.513** |
+| **Whole-system GFLOPs/frame: runtime DiT + fixed E/A1** | previously profiled | **527.314448128** | **527.647993600** |
+| Runtime-counted DiT GMAC/frame | previously profiled | 145.428824064 | 145.595596800 |
+| Total parameters | M8 checkpoint | **283,981,760** | **415,564,480** |
+| Active parameters | M8 checkpoint | **168,356,800** | **179,314,880** |
+| 530G runtime budget gate | baseline | **PASS** | **PASS** |
 
 Canonical accounting: 1920x1088 internal output compute geometry, 24 RGB
 frames per steady-state MIDDLE chunk, six latent frames, 2x2 DiT spatial
@@ -56,8 +60,12 @@ it is a **calibrated estimate, not an independent new runtime count**.
 For M11-B the extra FFN linear cost is exactly 13.369344 GMAC/frame under
 the stated canonical routing and token-count convention. M11-A adds two
 architecturally identical blocks, and has some extrapolated non-FFN work.
-The 530G gate still needs confirmation with the real runtime counter before
-a training commitment. GPU latency and peak-memory are independent gates.
+The 530G MAC gate is now confirmed by the user's random-weight actual DiT
+forward-hook counts with frozen E/A1 costs carried from their earlier profile.
+Peak memory reported by this audit is **not training memory** (A 0.945GB,
+B 1.217GB). Hook-instrumented forward times are **not production inference
+latency** (A 0.817s, B 1.727s). GPU latency and training memory remain
+independent future gates.
 
 ## Server: configuration and MAC audit
 
@@ -118,7 +126,7 @@ candidate checkpoint, reuse the canonical C24 MIDDLE pipeline, but note that
 the existing `profile_stage_a_streaming_macs.py` loader is dense-only
 and must not be pointed at a MoE checkpoint without adaptation.
 
-## Candidate initialization / next stage (not implemented here)
+## Candidate initialization / next stage (code integrated, CUDA smoke pending)
 
 - **M11-A**: reuse trained D1024/L30 M5 blocks; prune only eight complete
   blocks to L22 with existing activation-based, edge-protected ordered mapping;
@@ -137,6 +145,64 @@ and must not be pointed at a MoE checkpoint without adaptation.
 - **Visual gates**: first at 5k, then at ~15k, final ~30k or justified plateau;
   compare Mangrove1 strength retention and Wetland1 improvement directly.
   Do not repeatedly rerun whole 4K video for every micro-checkpoint.
-- No legacy training script or inference pipeline is modified in this audit
-  commit; runtime counting and compatible initializers must be prepared before
-  starting M11-A/B training.
+- Updated compatible entrypoints (existing files; no new model class):
+  `tools/build_b2b_moe_depth_init.py` supports `--architecture m11a-d1024-l22`,
+  `tools/build_b2b_moe_init.py` supports `--architecture m11b-d1024-l20-e576`,
+  and `tools/train_b2b_moe_ta_distill_ddp_cache_safe.py` supports both
+  `--architecture` values. Existing M5/M7/M8 modes and defaults remain.
+- **Do not pass `--val-manifest` or `--val-teacher-cache`** for M11. The underlying
+  trainer still writes checkpoints at `--save-every` and the final step.
+  This deliberately disables val13 model selection and the legacy best metric.
+  Checkpoint choices are made from Mangrove1 / Wetland1 custom inference,
+  following the existing `tools/visual_check_m8_task.sh` workflow.
+- Do not begin formal runs until CUDA smoke establishes loaded model/velocity
+  tensors, shapes, full-cache matching, backwards and (for B) expanded-expert
+  gradient coverage. There has been no M11 quality validation or pretrained
+  full checkpoint yet.
+
+### Server: inspect historical checkpoints before initialization
+
+```bash
+cd /data1/a/SwiftVR
+python -m unittest discover -s tests -p 'test_m11_architecture_budget.py' -v
+
+python - <<'PY'
+from pathlib import Path
+import json
+base = Path("outputs/b2b")
+reference = base/"m8a_d1024_l20_gate200k"/"run_config.json"
+depth = base/"m8a_d1024_l20_init_from_m5"/"moe_depth_init_report.json"
+for path in (reference, depth):
+    if not path.is_file():
+        print("MISSING:", path)
+        continue
+    obj = json.loads(path.read_text())
+    print("\\nFILE:", path)
+    for key in ("base_checkpoint", "manifests", "teacher_cache",
+                "ultravideo_materialized_manifest", "ultravideo_teacher_cache",
+                "source_checkpoint", "learning_rate", "runtime_dtype",
+                "global_effective_batch_size"):
+        if key in obj:
+            print(f"  {key}: {obj[key]}")
+PY
+```
+
+The `source_checkpoint` in the original M8 depth-initialization report is
+the **trained M5 D1024/L30** source required for M11-A. For M11-B, recover the
+**D1536 TA checkpoint** by inspecting the corresponding original MoE initialization
+report, not by mistaking the 200k Stage-A D3072 for the TA.
+
+**Initialization CLI:** both existing scripts use `--base-checkpoint`,
+`--manifest` (repeatable), `--path-root`, `--output-dir` and their respective
+`--source-checkpoint` (A) or `--teacher-checkpoint` (B) plus the new
+`--architecture`. Use the exact historical manifest/view calibration
+parameters and fresh output directories. Source weights are not overwritten.
+The initialization scripts must produce `transformer/config.json`,
+`transformer/diffusion_pytorch_model.safetensors` and their old audit reports.
+
+**Training CLI:** invoke `tools/train_b2b_moe_ta_distill_ddp_cache_safe.py`
+with new `--architecture`, the initialized `--student-init`, legacy/Ultra
+TA teacher caches and the original M8-A training settings. Omit both val13
+flags, and use the existing `--save-every` cadence to export deployable
+Transformer snapshots. These are optimizer-independent research snapshots,
+not proof of convergence. Compare fixed 720p×3 Mangrove1 / Wetland1 only.
