@@ -51,6 +51,7 @@ from swiftvr.training.b2a_width import (
 from swiftvr.training.b2b_moe import (
     MOE_ARCHITECTURES,
     M5_MOE_ARCHITECTURE,
+    B2BMoESpec,
     build_moe_transformer_from_teacher,
     moe_spec_from_name,
     parameter_accounting,
@@ -62,6 +63,10 @@ from swiftvr.training.b2b_moe import (
 from swiftvr.training.distillation import DeterministicTripletViewDataset
 from swiftvr.training.reference import sha256_file
 
+M11B_ARCHITECTURE = "m11b-d1024-l20-e576"
+M11B_SPEC = B2BMoESpec(num_layers=20, normal_expert_dim=576)
+INIT_ARCHITECTURES = tuple(MOE_ARCHITECTURES) + (M11B_ARCHITECTURE,)
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
@@ -71,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument(
         "--architecture",
-        choices=tuple(MOE_ARCHITECTURES),
+        choices=INIT_ARCHITECTURES,
         default=M5_MOE_ARCHITECTURE,
         help="Sparse-MoE student architecture; default preserves the validated M5 path.",
     )
@@ -266,7 +271,8 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
-    spec = moe_spec_from_name(args.architecture)
+    spec = (M11B_SPEC if args.architecture == M11B_ARCHITECTURE
+            else moe_spec_from_name(args.architecture))
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
