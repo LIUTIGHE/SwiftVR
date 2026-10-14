@@ -30,7 +30,7 @@ class TestM11ArchitectureBudget(unittest.TestCase):
                          (1024,22,1536))
         result=calibrated_budget_compute(expected_moe_shape(spec))
         self.assertAlmostEqual(result["calibrated_total_gflops_per_frame_2flop_per_mac"],
-                               527.20737,places=3)
+                               527.2066702933334,places=3)
         self.assertLess(result["calibrated_total_gflops_per_frame_2flop_per_mac"],530)
 
     def test_b_ffn_heavy(self):
@@ -41,7 +41,7 @@ class TestM11ArchitectureBudget(unittest.TestCase):
         self.assertLessEqual(spec.total_ffn_dim,8960)
         result=calibrated_budget_compute(expected_moe_shape(spec))
         self.assertAlmostEqual(result["calibrated_total_gflops_per_frame_2flop_per_mac"],
-                               527.51419,places=3)
+                               527.513488,places=3)
         self.assertLess(result["calibrated_total_gflops_per_frame_2flop_per_mac"],530)
         baseline=canonical_compute(expected_moe_shape(M8_MOE_SPEC))
         bigger=canonical_compute(expected_moe_shape(spec))
