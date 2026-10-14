@@ -57,8 +57,11 @@ from swiftvr.training.reference import sha256_file
 
 
 M8_ARCHITECTURE = "m8-d1024-l20"
+M11A_ARCHITECTURE = "m11a-d1024-l22"
 M8_SPEC = B2BMoESpec(num_layers=20)
+M11A_SPEC = B2BMoESpec(num_layers=22)
 M5_SOURCE_SPEC = B2BMoESpec()
+DEPTH_TARGETS = {M8_ARCHITECTURE: M8_SPEC, M11A_ARCHITECTURE: M11A_SPEC}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,8 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--manifest", type=Path, action="append", required=True)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--architecture", choices=(M8_ARCHITECTURE,), default=M8_ARCHITECTURE)
-    p.add_argument("--target-layers", type=int, default=M8_SPEC.num_layers)
+    p.add_argument("--architecture", choices=tuple(DEPTH_TARGETS), default=M8_ARCHITECTURE)
+    p.add_argument("--target-layers", type=int, default=None,
+                   help="Defaults to architecture-locked depth (20 for M8, 22 for M11-A)")
     p.add_argument("--protect-edge-blocks", type=int, default=1)
     p.add_argument(
         "--region-size",
@@ -139,8 +143,9 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.num_workers < 0 or args.protect_edge_blocks < 0:
         raise ValueError("--num-workers/--protect-edge-blocks must be non-negative")
-    if args.architecture == M8_ARCHITECTURE and args.target_layers != M8_SPEC.num_layers:
-        raise ValueError(f"{M8_ARCHITECTURE} is locked to {M8_SPEC.num_layers} layers")
+    target_spec = DEPTH_TARGETS[args.architecture]
+    if args.target_layers != target_spec.num_layers:
+        raise ValueError(f"{args.architecture} is locked to {target_spec.num_layers} layers")
 
 
 def _slice_batch(batch: dict[str, object], count: int) -> dict[str, object]:
@@ -320,6 +325,8 @@ def _copy_depth_subset(
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.target_layers is None:
+        args.target_layers = DEPTH_TARGETS[args.architecture].num_layers
     _validate_args(args)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
