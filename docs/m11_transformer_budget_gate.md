@@ -71,10 +71,13 @@ cd /data1/a/SwiftVR
 python -m unittest discover -s tests -p 'test_m11_architecture_budget.py' -v
 
 M8_CONFIG=outputs/b2b/m8a_d1024_l20_gate200k/checkpoints/step_00030000/transformer/config.json
+# Select one IDLE GPU; no existing training job is touched.
+export CUDA_VISIBLE_DEVICES=7
 
 python tools/audit_b2b_moe_architecture.py \
   --architecture m11a-d1024-l22 \
   --source-config "$M8_CONFIG" --meta-parameters \
+  --runtime-count --runtime-device cuda:0 --runtime-dtype bfloat16 \
   --export-config outputs/b2b/m11_budget_audit/m11a_config.json \
   --max-total-gflops 530 \
   --output-json outputs/b2b/m11_budget_audit/m11a_report.json
@@ -82,6 +85,7 @@ python tools/audit_b2b_moe_architecture.py \
 python tools/audit_b2b_moe_architecture.py \
   --architecture m11b-d1024-l20-e576 \
   --source-config "$M8_CONFIG" --meta-parameters \
+  --runtime-count --runtime-device cuda:0 --runtime-dtype bfloat16 \
   --export-config outputs/b2b/m11_budget_audit/m11b_config.json \
   --max-total-gflops 530 \
   --output-json outputs/b2b/m11_budget_audit/m11b_report.json
@@ -93,11 +97,26 @@ initialized and saved in a proper `transformer/` checkpoint.
 
 The `--meta-parameters` option instantiates candidate modules on the
 PyTorch meta device and records exact parameter counts without downloading
-weights. It does **not** measure GPU speed or real inference MACs.
-For an auditable full-model runtime count, materialize an initialized candidate
-checkpoint and use `tools/runtime_macs.py::RuntimeMacCounter` with the canonical
-streaming MIDDLE path and an A1 decoder; do not use the dense-only
-`profile_stage_a_streaming_macs.py` loader for MoE without adapting it.
+weights. `--runtime-count` independently builds an **untrained** model from
+that JSON (no model checkpoints or data files needed), executes its MoE forward
+on latent shape **[1, in_channels, 6, 68, 120]** with SDPA and records
+actual activated Linear/Conv/attention GEMM MAC via the existing
+`RuntimeMacCounter`. It normalizes by **24 emitted RGB frames** and adds the
+locked Encoder/A1 measured costs. Each report stores both the prior calibrated
+estimate and the actual runtime-counted DiT MACs, with an independent hard
+**530G** gate. Run on an idle GPU; it allocates the full random-weight model.
+
+The MAC value is weight-independent for the existing top-2 no-dropping sparse
+routing (every token executes one shared + two routed experts), but the
+random-weight model **cannot be used for quality tests or inference**.
+The instrumented elapsed time is also NOT production latency. It does
+not include non-MAC index/gather/scatter, activation or elementwise costs; this
+is the same defined MAC convention as previous stages.
+
+For a full streaming end-to-end consistency check after initializing the
+candidate checkpoint, reuse the canonical C24 MIDDLE pipeline, but note that
+the existing `profile_stage_a_streaming_macs.py` loader is dense-only
+and must not be pointed at a MoE checkpoint without adaptation.
 
 ## Candidate initialization / next stage (not implemented here)
 
