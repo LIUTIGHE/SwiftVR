@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache-safe sparse-MoE distillation entry point for M5/M6/M7-A/M8-A.
+"""Cache-safe sparse-MoE distillation entry point for M5/M6/M7-A/M8-A/M11.
 
 Architecture modes:
 
@@ -48,8 +48,17 @@ from swiftvr.training.b2b_moe import (
 
 
 M8_MOE_ARCHITECTURE = "m8-d1024-l20"
+M11A_MOE_ARCHITECTURE = "m11a-d1024-l22"
+M11B_MOE_ARCHITECTURE = "m11b-d1024-l20-e576"
 M8_MOE_SPEC = B2BMoESpec(num_layers=20)
-SUPPORTED_ARCHITECTURES = tuple(MOE_ARCHITECTURES) + (M8_MOE_ARCHITECTURE,)
+M11A_MOE_SPEC = B2BMoESpec(num_layers=22)
+M11B_MOE_SPEC = B2BMoESpec(num_layers=20, normal_expert_dim=576)
+NEW_ARCHITECTURES = {
+    M8_MOE_ARCHITECTURE: M8_MOE_SPEC,
+    M11A_MOE_ARCHITECTURE: M11A_MOE_SPEC,
+    M11B_MOE_ARCHITECTURE: M11B_MOE_SPEC,
+}
+SUPPORTED_ARCHITECTURES = tuple(MOE_ARCHITECTURES) + tuple(NEW_ARCHITECTURES)
 
 _original_validate_rank0 = trainer.base.validate_rank0
 _original_write_json = trainer.base._write_json
@@ -150,8 +159,8 @@ def _consume_architecture() -> str:
 
 
 def _spec_for_architecture(architecture: str) -> B2BMoESpec:
-    if architecture == M8_MOE_ARCHITECTURE:
-        return M8_MOE_SPEC
+    if architecture in NEW_ARCHITECTURES:
+        return NEW_ARCHITECTURES[architecture]
     return moe_spec_from_name(architecture)
 
 
@@ -171,6 +180,14 @@ def _configure_architecture(architecture: str) -> None:
         trainer_id = "b2b_m8_d1024_l20_moe_velocity_distill_ddp_v2"
         experiment = "m8_d1024_l20_hardware_oriented_depth_gate"
         phase = "M8A_d1024_l20_architecture_gate"
+    elif architecture == M11A_MOE_ARCHITECTURE:
+        trainer_id = "m11a_d1024_l22_ta_velocity_distill"
+        experiment = "m11a_530g_transformer_depth_capacity_gate"
+        phase = "M11A_530g_no_val13_custom_validation"
+    elif architecture == M11B_MOE_ARCHITECTURE:
+        trainer_id = "m11b_d1024_l20_e576_ta_velocity_distill"
+        experiment = "m11b_530g_transformer_conditional_ffn_capacity_gate"
+        phase = "M11B_530g_no_val13_custom_validation"
     else:
         raise ValueError(f"Unsupported architecture metadata mode: {architecture}")
 
@@ -180,7 +197,7 @@ def _configure_architecture(architecture: str) -> None:
             name = Path(path).name
             if name == "run_config.json":
                 payload["trainer"] = trainer_id
-                if bool(payload.get("mixed_training", False)):
+                if bool(payload.get("mixed_training", False)) and architecture == M8_MOE_ARCHITECTURE:
                     teacher_mode = str(payload.get("training_teacher_mode", "unknown"))
                     payload["experiment"] = f"m8a_mixed_data_{teacher_mode}_refinement"
                     payload["curriculum_phase"] = "M8A_mixed_data_refinement"
@@ -199,7 +216,7 @@ def _configure_architecture(architecture: str) -> None:
             metadata = dict(metadata)
             metadata["trainer"] = trainer_id
             metadata["architecture"] = architecture
-            if bool(metadata.get("mixed_training", False)):
+            if bool(metadata.get("mixed_training", False)) and architecture == M8_MOE_ARCHITECTURE:
                 metadata["curriculum_phase"] = "M8A_mixed_data_refinement"
             else:
                 metadata["curriculum_phase"] = phase
@@ -326,6 +343,11 @@ def main() -> int:
             "[M8-A] D1024/H8/L20 1S12E2A enabled; training teacher selected by --training-teacher",
             flush=True,
         )
+    elif architecture in (M11A_MOE_ARCHITECTURE, M11B_MOE_ARCHITECTURE):
+        print(f"[M11] {architecture} enabled; Stage-A/TA velocity KD; "
+              "omit --val-manifest and --val-teacher-cache to disable val13; "
+              "Mangrove1/Wetland1 must be evaluated from saved checkpoints",
+              flush=True)
     if lr_schedule_total_steps is not None:
         print(
             f"[schedule] cosine LR horizon={lr_schedule_total_steps} "
