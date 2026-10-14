@@ -75,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write candidate transformer config JSON only; this is NOT a checkpoint")
     p.add_argument("--meta-parameters", action="store_true",
                    help="Build candidate on torch.meta to audit total/active parameter count, without weights")
+    p.add_argument("--runtime-count", action="store_true",
+                   help="Actually forward candidate random-weight MoE on canonical MIDDLE latent shape and count MACs")
+    p.add_argument("--runtime-device", default="cuda:0",
+                   help="CUDA device for runtime MAC execution; CPU may be very slow")
+    p.add_argument("--runtime-dtype", choices=("float32","bfloat16","float16"),
+                   default="bfloat16")
     p.add_argument(
         "--expected-max-delta-percent",
         type=float,
@@ -176,6 +182,77 @@ def canonical_compute(shape: dict[str, int | float]) -> dict[str, float]:
     }
 
 
+def runtime_moe_mac_count(config: dict, *, device_name: str, dtype_name: str) -> dict:
+    """Count ACTUAL model operators for one canonical steady-state MIDDLE DiT.
+
+    Weights may be randomly initialized because MoE top-k dispatch never drops
+    tokens and the linear/attention MAC counts depend on shape and routing
+    assignment counts, not learned values. This is a COMPUTE audit, not image QA.
+    E/A1 are frozen and use their previously validated fixed MAC totals.
+    """
+    import time
+    from tools.runtime_macs import RuntimeMacCounter
+    device=torch.device(device_name)
+    dtype=getattr(torch,dtype_name)
+    if device.type=="cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA runtime profiling requested but unavailable")
+        if dtype==torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("BF16 is unavailable on this CUDA GPU")
+    kwargs={k:v for k,v in config.items()
+            if k in set(inspect.signature(WanTransformer3DModelPromptFreeNoTimeMoE.__init__).parameters)-{"self"}}
+    torch.manual_seed(20261014)
+    model=WanTransformer3DModelPromptFreeNoTimeMoE(**kwargs)
+    parameters=parameter_accounting(model)
+    model=model.to(device=device,dtype=dtype)
+    model.prepare_for_inference(attention_backend="sdpa",use_torch_compile=False)
+    for block in model.blocks:
+        block.ffn.collect_router_stats=False
+    in_channels=int(config["in_channels"])
+    sample=torch.zeros((1,in_channels,6,68,120),device=device,dtype=dtype)
+    counter=RuntimeMacCounter()
+    counter.add_module("transformer",model)
+    try:
+        if device.type=="cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        started=time.perf_counter()
+        with torch.inference_mode(),counter.count(reset=True):
+            value=model(sample,return_dict=False)[0]
+        if device.type=="cuda":
+            torch.cuda.synchronize(device)
+        elapsed=time.perf_counter()-started
+        if tuple(value.shape)!=tuple(sample.shape):
+            raise ValueError("MIDDLE model geometry mismatch")
+        result=counter.summary(emitted_frames=24)
+        if result["count_errors"]:
+            raise RuntimeError(f"Runtime MAC counter failed: {result['count_errors']}")
+        if result["calls_by_type"].get("self_attn_qk",0) <= 0:
+            raise RuntimeError("Runtime SDPA MAC counter missed self-attention")
+        if result["calls_by_type"].get("cross_attn_qk",0) != 0:
+            raise RuntimeError("Unexpected cross-attention in prompt-free MoE")
+        dit=float(result["by_root_gmacs_per_output_frame"]["transformer"])
+        total=FIXED_REAE_ENCODER_GMAC+dit+FIXED_A1_DECODER_GMAC
+        return {
+            "method":"ACTUAL_RANDOM_WEIGHT_FORWARD_MAC_HOOKS",
+            "canonical_latent_shape_BCFHW":[1,in_channels,6,68,120],
+            "canonical_output_frames":24,
+            "measured_transformer_gmac_per_frame":dit,
+            "fixed_encoder_gmac_per_frame":FIXED_REAE_ENCODER_GMAC,
+            "fixed_a1_decoder_gmac_per_frame":FIXED_A1_DECODER_GMAC,
+            "total_gmac_per_frame":total,
+            "total_gflops_per_frame":2*total,
+            "parameter_accounting":parameters,
+            "operator_counts":result,
+            "hook_instrumented_seconds_not_inference_latency":elapsed,
+            "peak_allocated_gb_during_profile":(
+                torch.cuda.max_memory_allocated(device)/1e9 if device.type=="cuda" else None),
+            "unmeasured":"Frozen Encoder/A1 are carried from existing fixed canonical profiles; operator count excludes non-MAC elementwise and dispatch overhead",
+        }
+    finally:
+        counter.close()
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.expected_max_delta_percent is not None and args.expected_max_delta_percent < 0:
@@ -186,6 +263,8 @@ def main() -> int:
         raise ValueError("--export-config requires --source-config")
     if args.meta_parameters and args.source_config is None:
         raise ValueError("--meta-parameters requires --source-config")
+    if args.runtime_count and args.source_config is None:
+        raise ValueError("--runtime-count requires --source-config")
     spec = _spec(args.architecture)
     expected = expected_moe_shape(spec)
     if args.checkpoint is None:
@@ -219,6 +298,15 @@ def main() -> int:
         if params is not None and params != meta_params:
             raise ValueError("Checkpoint parameter audit disagrees with meta model")
         params = meta_params
+    runtime=None
+    if args.runtime_count:
+        runtime=runtime_moe_mac_count(source_config,
+                                     device_name=args.runtime_device,
+                                     dtype_name=args.runtime_dtype)
+        if params is None:
+            params=runtime["parameter_accounting"]
+        elif params != runtime["parameter_accounting"]:
+            raise ValueError("Meta/runtime parameter-count mismatch")
     if args.export_config:
         target = args.export_config.expanduser().resolve()
         if target.exists():
@@ -247,6 +335,12 @@ def main() -> int:
         "parameter_accounting": params,
         "compute": compute,
         "budget": calibrated,
+        "runtime_count": runtime,
+        "runtime_gate": None if runtime is None else {
+            "requested_max_total_gflops":args.max_total_gflops,
+            "pass":runtime["total_gflops_per_frame"]<=args.max_total_gflops,
+            "status":"RUNTIME_DIT_PLUS_FIXED_ENCODER_A1",
+        },
         "budget_gate": {
             "requested_max_total_gflops": args.max_total_gflops,
             "pass": passed_budget,
@@ -270,6 +364,8 @@ def main() -> int:
         output = args.output_json.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    if runtime is not None and runtime["total_gflops_per_frame"]>args.max_total_gflops:
+        raise SystemExit(f"RUNTIME 530G gate FAIL: {runtime['total_gflops_per_frame']:.4f} > {args.max_total_gflops}")
     if not passed_budget:
         raise SystemExit(f"Whole-system estimated FLOPs/frame {calibrated['calibrated_total_gflops_per_frame_2flop_per_mac']:.4f} exceeds budget {args.max_total_gflops}")
     if passed is False:
