@@ -164,7 +164,7 @@ def main() -> None:
     from swiftvr.models.transformer_prompt_free_no_time_moe import (
         WanTransformer3DModelPromptFreeNoTimeMoE,
     )
-    from swiftvr.training.forward import encode_reae_clip
+    from swiftvr.training.forward import encode_reae_clip, prepare_training_batch
     from swiftvr.training.reference import extract_transformer_sample
 
     files = _source_files(args)
@@ -226,6 +226,9 @@ def main() -> None:
                 raise ValueError("LR/GT shape or scale mismatch")
             if not bool(torch.isfinite(lr).all()) or not bool(torch.isfinite(hr).all()):
                 raise ValueError("Nonfinite LR/GT")
+            if hr.shape[-2] % 16 or hr.shape[-1] % 16:
+                raise ValueError("GT spatial dimensions must be divisible by ReAE total stride 16")
+            expected_latent_shape = (4, 48, int(hr.shape[-2]) // 16, int(hr.shape[-1]) // 16)
             pending = []
             for j, pair_id in enumerate(pair_ids):
                 relative_file = sample_file_name(global_index+j, pair_id)
@@ -239,7 +242,7 @@ def main() -> None:
                 if out_file.is_file():
                     if not args.resume:
                         raise FileExistsError(out_file)
-                    record["z_sr_shape"] = list(_verify_cached(out_file))
+                    record["z_sr_shape"] = list(_verify_cached(out_file, expected_shape=expected_latent_shape))
                 else:
                     pending.append(j)
                 records.append(record)
@@ -247,7 +250,7 @@ def main() -> None:
                 selected = lr[pending].to(device=device, dtype=dtype, non_blocking=True)
                 with torch.autocast(device_type=device.type, dtype=dtype,
                                     enabled=device.type=="cuda" and dtype != torch.float32):
-                    z_lq = encode_reae_clip(reae, selected, require_4k_plus_1=True)
+                    # SwiftVR encodes bilinearly upscaled LR at the HR output geometry.\n                    # Encoding native LR here would silently produce the wrong latent grid.\n                    prepared = prepare_training_batch(\n                        {"lr": selected, "hr": hr[pending]}, auxiliary_key=None)\n                    z_lq = encode_reae_clip(reae, prepared["lq_input"], require_4k_plus_1=True)
                     z_lq = z_lq.permute(0, 2, 1, 3, 4).contiguous()
                     velocity = extract_transformer_sample(
                         transformer(z_lq, return_dict=True))
@@ -257,7 +260,7 @@ def main() -> None:
                 for k, j in enumerate(pending):
                     index = global_index + j
                     latent = z_sr[k].detach().to("cpu", dtype=torch.float16).contiguous()
-                    if latent.shape[0] != 4 or latent.shape[1] != 48 or not bool(torch.isfinite(latent).all()):
+                    if tuple(latent.shape) != expected_latent_shape or not bool(torch.isfinite(latent).all()):
                         raise ValueError(f"Invalid latent geometry or values: sample {index}")
                     out_file = output / records[index]["file"]
                     tmp = out_file.with_name(out_file.stem + ".tmp.safetensors")
