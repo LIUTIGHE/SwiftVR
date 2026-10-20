@@ -250,7 +250,14 @@ def main() -> None:
                 selected = lr[pending].to(device=device, dtype=dtype, non_blocking=True)
                 with torch.autocast(device_type=device.type, dtype=dtype,
                                     enabled=device.type=="cuda" and dtype != torch.float32):
-                    # SwiftVR encodes bilinearly upscaled LR at the HR output geometry.\n                    # Encoding native LR here would silently produce the wrong latent grid.\n                    prepared = prepare_training_batch(\n                        {"lr": selected, "hr": hr[pending]}, auxiliary_key=None)\n                    z_lq = encode_reae_clip(reae, prepared["lq_input"], require_4k_plus_1=True)
+                    # SwiftVR encodes bilinearly upscaled LR at HR output geometry.
+                    # Encoding native LR would produce an incorrectly sized latent grid.
+                    prepared = prepare_training_batch(
+                        {"lr": selected, "hr": hr[pending]}, auxiliary_key=None
+                    )
+                    z_lq = encode_reae_clip(
+                        reae, prepared["lq_input"], require_4k_plus_1=True
+                    )
                     z_lq = z_lq.permute(0, 2, 1, 3, 4).contiguous()
                     velocity = extract_transformer_sample(
                         transformer(z_lq, return_dict=True))
