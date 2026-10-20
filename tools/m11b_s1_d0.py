@@ -138,8 +138,8 @@ def diagnose_frames(args: argparse.Namespace) -> dict:
     rows = []
     _prepare_folder(args.output_dir)
     for i in range(args.start, end + 1):
-        orig = _crop_rgb(orig_files[i], args.roi)
-        a1 = _crop_rgb(a1_files[i], args.roi)
+        orig = _crop_rgb(orig_files[i], getattr(args, "original_roi", None) or args.roi)
+        a1 = _crop_rgb(a1_files[i], getattr(args, "a1_roi", None) or args.roi)
         if orig.shape != a1.shape:
             raise ValueError(f"Frame {i}: A1/Original resolution mismatch")
         ya, yo = _luma(a1), _luma(orig)
@@ -156,7 +156,7 @@ def diagnose_frames(args: argparse.Namespace) -> dict:
             "luma_mean_a1": float(ya.mean()), "luma_mean_original": float(yo.mean()),
         }
         if gt_files is not None:
-            gt = _crop_rgb(gt_files[i], args.roi)
+            gt = _crop_rgb(gt_files[i], getattr(args, "gt_roi", None) or args.roi)
             if gt.shape != orig.shape:
                 raise ValueError(f"Frame {i}: GT resolution mismatch")
             yg = _luma(gt)
@@ -187,6 +187,11 @@ def diagnose_frames(args: argparse.Namespace) -> dict:
         "source_total_frames": total,
         "phase_formula": f"(original_output_index + {args.phase_offset}) % 4",
         "roi_native_output_pixels": args.roi,
+        "effective_source_rois": {
+            "a1": getattr(args, "a1_roi", None) or args.roi,
+            "original": getattr(args, "original_roi", None) or args.roi,
+            "gt": getattr(args, "gt_roi", None) or args.roi,
+        },
         "by_phase": by_phase,
         "periodicity": {
             "a1_minus_original_luma": _phase_spectrum(by_phase, "luma_delta_a1_minus_original"),
@@ -274,7 +279,10 @@ def parser() -> argparse.ArgumentParser:
     f.add_argument("--start", type=int, default=0, help="0-based output ordinal")
     f.add_argument("--end", type=int, default=None, help="Inclusive 0-based output ordinal")
     f.add_argument("--phase-offset", type=int, default=3)
-    f.add_argument("--roi", type=parse_roi, default=None, help="Native output-pixel x,y,w,h")
+    f.add_argument("--roi", type=parse_roi, default=None, help="Default native output-pixel x,y,w,h applied to all sources")
+    f.add_argument("--a1-roi", type=parse_roi, default=None, help="Override ROI for A1 input (e.g., extracted montage ROI needs none)")
+    f.add_argument("--original-roi", type=parse_roi, default=None, help="Override ROI for Original Decoder input")
+    f.add_argument("--gt-roi", type=parse_roi, default=None, help="Override ROI for GT input")
     f.add_argument("--low-sigma", type=float, default=8.0)
     f.add_argument("--high-sigma", type=float, default=1.5)
     f.add_argument("--snapshots", type=lambda s: [int(v) for v in s.split(",") if v.strip()], default=[245, 248])
