@@ -23,14 +23,13 @@ def _lowpass(video: torch.Tensor, kernel: int = 7) -> torch.Tensor:
         raise ValueError("Lowpass kernel must be odd and positive")
     b, t, c, h, w = video.shape
     images = video.reshape(b*t, c, h, w)
-    result = F.avg_pool2d(images, kernel, stride=1, padding=kernel//2)
-    # Restrict interpretation to interior pixels when possible: reflect pad
-    # preserves constant-image luminance at video borders.
-    if kernel > 1:
-        result = F.avg_pool2d(
-            F.pad(images, (kernel//2,)*4, mode="replicate"),
-            kernel_size=kernel, stride=1
-        )
+    if kernel == 1:
+        return video
+    # Replicate-pad avoids spurious low-frequency errors at ROI/image borders.
+    result = F.avg_pool2d(
+        F.pad(images, (kernel//2,)*4, mode="replicate"),
+        kernel_size=kernel, stride=1,
+    )
     return result.reshape(b,t,c,h,w)
 
 
