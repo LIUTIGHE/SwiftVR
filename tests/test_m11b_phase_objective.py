@@ -28,7 +28,7 @@ class PhaseObjectiveTests(unittest.TestCase):
     def test_phase0_specific_loss_and_decoder_gradient(self):
         pred=self.gt.clone()
         # With trim=3, T=1/5/9 corresponds to phase0.
-        pred[:,[1,5,9],:]+=0.05
+        pred[:,[1,5,9],:,:,::2]+=0.1
         pred.requires_grad_(True)
         terms=self.objective(pred)
         self.assertGreater(terms["phase_0_mse"].item(),terms["phase_3_mse"].item())
