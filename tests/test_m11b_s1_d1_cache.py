@@ -1,6 +1,8 @@
 """CPU contract tests for the M11B-S1-D1 paired restored-latent cache builder."""
 from __future__ import annotations
 import argparse
+import ast
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
+from tools import m11b_s1_d1_cache as cache_module
 from tools.m11b_s1_d1_cache import (
     _verify_cached, cache_plan, sample_file_name, validate_args,
 )
@@ -15,6 +18,22 @@ from swiftvr.training.forward import prepare_training_batch
 
 
 class M11BS1D1CacheTests(unittest.TestCase):
+    def test_encoding_block_is_executable_and_ordered(self):
+        # A past edit accidentally wrote literal backslash-n characters inside a
+        # comment, swallowing prepare_training_batch() and encode_reae_clip().
+        tree = ast.parse(inspect.getsource(cache_module.main))
+        call_lines = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                call_lines.setdefault(node.func.id, []).append(node.lineno)
+        for function in ("prepare_training_batch", "encode_reae_clip",
+                         "extract_transformer_sample"):
+            self.assertIn(function, call_lines, msg=f"{function} is not executable")
+        self.assertLess(call_lines["prepare_training_batch"][0],
+                        call_lines["encode_reae_clip"][0])
+        self.assertLess(call_lines["encode_reae_clip"][0],
+                        call_lines["extract_transformer_sample"][0])
+
     def test_sample_identity_path(self):
         self.assertEqual(sample_file_name(12, "legacy:sample"), sample_file_name(12, "legacy:sample"))
         self.assertNotEqual(sample_file_name(12, "legacy:sample"), sample_file_name(12, "ultra:sample"))
