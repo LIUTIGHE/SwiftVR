@@ -72,6 +72,31 @@ class M11BS1D0Tests(unittest.TestCase):
             self.assertTrue((root / "report" / "summary.json").is_file())
             self.assertTrue((root / "report" / "native_roi_000005_p0.png").is_file())
 
+    def test_mixed_montage_roi_and_full_original_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for sub in ("a1", "original"):
+                (root / sub).mkdir()
+            for index in range(9):
+                a1 = np.full((20, 22, 3), 120, dtype=np.uint8)
+                original = np.full((45, 50, 3), 100, dtype=np.uint8)
+                Image.fromarray(a1).save(root / "a1" / f"{index:08d}.png")
+                Image.fromarray(original).save(root / "original" / f"{index:08d}.png")
+            args = argparse.Namespace(
+                a1=root / "a1", original=root / "original", gt=None,
+                output_dir=root / "out", start=0, end=8, phase_offset=3,
+                roi=None, a1_roi=None, original_roi=(6, 8, 22, 20), gt_roi=None,
+                low_sigma=2.0, high_sigma=1.5, snapshots=[],
+            )
+            summary = diagnose_frames(args)
+            self.assertEqual(summary["effective_source_rois"]["original"], (6, 8, 22, 20))
+            self.assertIsNone(summary["effective_source_rois"]["a1"])
+            self.assertAlmostEqual(
+                summary["by_phase"]["0"]["luma_delta_a1_minus_original"],
+                20 / 255,
+                places=5,
+            )
+
     def test_reject_unmatched_frame_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
