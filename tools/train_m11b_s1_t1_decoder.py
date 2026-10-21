@@ -389,6 +389,7 @@ def main():
             barrier()
             save_checkpoint()
 
+        torch.cuda.synchronize(device)
         started=time.monotonic();log_started=started
         reduced_terms={};accum_steps_since_log=0
         optimizer.zero_grad(set_to_none=True)
@@ -414,15 +415,17 @@ def main():
                     reduced_terms[k]=reduced_terms.get(k,torch.zeros((),device=device))+v.detach()/a.gradient_accumulation_steps
                 micro_cursor+=1
                 last_loss=terms["loss"]
-            local_grad=sum(int(p.grad is not None and bool(torch.isfinite(p.grad).all())
-                               and bool(torch.count_nonzero(p.grad))) for p in params)
-            if local_grad==0:
-                raise RuntimeError("Smoke failed: no finite nonzero A1 gradients")
-            if any(p.grad is not None and not bool(torch.isfinite(p.grad).all()) for p in params):
-                raise FloatingPointError("A1 gradient contains NaN/Inf")
+            if not any(p.grad is not None for p in params):
+                raise RuntimeError("A1 has no gradients")
             if any(p.grad is not None for p in reae.parameters()):
                 raise RuntimeError("Frozen Original ReAE teacher unexpectedly has gradients")
-            norm=torch.nn.utils.clip_grad_norm_(params,a.max_grad_norm,error_if_nonfinite=True)
+            # clip_grad_norm_ checks non-finite total norm across all A1 parameters.
+            # Avoid a separate per-parameter CUDA synchronization in Python.
+            norm=torch.nn.utils.clip_grad_norm_(
+                params,a.max_grad_norm,error_if_nonfinite=True
+            )
+            if float(norm.detach().item()) <= 0:
+                raise RuntimeError("A1 gradient norm is zero; decoder training path inactive")
             optimizer.step();optimizer.zero_grad(set_to_none=True)
             step+=1;accum_steps_since_log+=1
             if step%a.log_every==0 or step==stop:
@@ -431,10 +434,15 @@ def main():
                 if world>1:
                     dist.all_reduce(values,op=dist.ReduceOp.SUM)
                     values/=world
+                # CUDA launches are asynchronous; synchronize before reporting a
+                # wall-clock update rate or elapsed time. Do not include validation
+                # and checkpoint I/O in the subsequent train-only interval.
+                torch.cuda.synchronize(device)
                 if rank==0:
+                    log_time=time.monotonic()
                     record={"step":step,"lr":lr,"rank0_grad_norm":float(norm.detach()),
-                            "elapsed_s":time.monotonic()-started,
-                            "updates_per_s":accum_steps_since_log/max(time.monotonic()-log_started,1e-9),
+                            "elapsed_s":log_time-started,
+                            "updates_per_s":accum_steps_since_log/max(log_time-log_started,1e-9),
                             "global_batch":lineage["global_batch"],
                             **dict(zip(names,[float(v) for v in values.cpu()]))}
                     append_jsonl(a.output_dir/"train_log.jsonl",record)
