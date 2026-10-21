@@ -41,7 +41,13 @@ def verified_cache_metadata(root: Path, *, model_root: Path, reae_root: Path,
         raise FileNotFoundError(root / "plan.json")
     # Completed metadata must incorporate the same immutable plan as the cache build.
     plan = json.loads((root / "plan.json").read_text())
+    if plan.get("kind") != "M11B-S1-D1-restored-latent-plan-v1":
+        raise ValueError(f"Invalid immutable D1 plan kind: {path}")
     for k, v in plan.items():
+        # Cache finalization intentionally advances the plan kind to
+        # 'M11B-S1-D1-restored-latent-v1' in completed metadata.
+        if k == "kind":
+            continue
         if m.get(k) != v:
             raise ValueError(f"Immutable D1 plan mismatch on {k}: {path}")
     return m
