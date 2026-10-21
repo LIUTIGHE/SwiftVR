@@ -19,6 +19,18 @@ from swiftvr.training.m11b_decoder_pairs import (
 
 
 class PhaseT1Tests(unittest.TestCase):
+    def test_validation_reports_a1_and_original_against_gt(self):
+        # Do not regress to logging loss alone in the 500-step quality pilot.
+        src = inspect.getsource(trainer.evaluate)
+        tree = ast.parse(src)
+        self.assertIn("a1_gt_metrics", src)
+        self.assertIn("original_gt_metrics", src)
+        self.assertIn("VideoMetricAccumulator", src)
+        self.assertGreaterEqual(sum(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update" for node in ast.walk(tree)
+        ), 2)
+
     def test_balanced_sampler_determinism_and_resume(self):
         args=dict(legacy=11,ultra=17,batch_size=2,rank=0,world=2,seed=20261021)
         s=list(trainer.BalancedBatchSampler(start=0,stop=13,**args))
