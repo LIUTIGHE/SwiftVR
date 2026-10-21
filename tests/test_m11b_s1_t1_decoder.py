@@ -70,7 +70,7 @@ class PhaseT1Tests(unittest.TestCase):
                 "source_checkpoint":str(model.resolve()),"base_checkpoint":str(base.resolve()),
                 "source_files":{str(file):sha256(file)}
             }
-            plan={k:v for k,v in metadata.items() if k not in ("complete","samples","sample_count","kind")}
+            plan={k:v for k,v in metadata.items() if k not in ("complete","samples","sample_count","kind")}\n            plan["kind"]="M11B-S1-D1-restored-latent-plan-v1"
             (cache/"metadata.json").write_text(json.dumps(metadata))
             (cache/"plan.json").write_text(json.dumps(plan))
             self.assertEqual(verified_cache_metadata(cache,model_root=model,reae_root=base)["sample_count"],1)
