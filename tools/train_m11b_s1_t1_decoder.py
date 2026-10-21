@@ -34,6 +34,7 @@ from swiftvr.models.m9_factorized_decoder import M9A1FactorizedReAEDecoder
 from swiftvr.training.forward import decode_reae_clip
 from swiftvr.training.m11b_decoder_pairs import M11BPairedLatentDataset
 from swiftvr.training.m11b_phase_objective import phase_objective
+from swiftvr.training.stage3 import VideoMetricAccumulator
 from tools.m11b_s1_d1_cache import sha256
 
 
@@ -240,6 +241,8 @@ def evaluate(decoder,reae,validation,perceptual,*,device,dtype,args,step):
     decoder.eval()
     loader=DataLoader(validation,batch_size=1,shuffle=False,num_workers=0)
     total={};count=0
+    a1_quality=VideoMetricAccumulator()
+    original_quality=VideoMetricAccumulator()
     for i, batch in enumerate(loader):
         z=batch["z_sr"].to(device=device,dtype=dtype)
         gt=batch["hr"].to(device=device,dtype=torch.float32)
@@ -247,6 +250,10 @@ def evaluate(decoder,reae,validation,perceptual,*,device,dtype,args,step):
             target=decode_reae_clip(reae,z,output_frames=13,clamp=False)
             pred=decoder(z,output_frames=13,clamp=False)
         metrics=phase_objective(pred,gt,target,lpips=perceptual,**phase_loss_kwargs(args))
+        # Compare both decoders against the SAME GT; clamp only for pixel
+        # metrics, while the training objective remains unclamped.
+        a1_quality.update(pred.float(),gt.float(),clamp=True)
+        original_quality.update(target.float(),gt.float(),clamp=True)
         for name,value in metrics.items():
             total[name]=total.get(name,0)+float(value.detach().item())
         count+=1
@@ -255,6 +262,8 @@ def evaluate(decoder,reae,validation,perceptual,*,device,dtype,args,step):
     decoder.train()
     result={name:value/count for name,value in total.items()}
     result.update({"step":step,"validation_samples":count,
+                   "a1_gt_metrics":a1_quality.compute(),
+                   "original_gt_metrics":original_quality.compute(),
                    "validation_kind":"matched_M11B_latent_GT_original_decoder",
                    "custom_video_quality_pass":False})
     atomic_json(args.output_dir/"validation"/f"step_{step:08d}.json",result)
