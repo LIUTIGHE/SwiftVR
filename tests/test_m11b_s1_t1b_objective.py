@@ -35,6 +35,18 @@ class T1BObjectiveTests(unittest.TestCase):
         a=t1b_objective(output,gt,original,variant="A")
         self.assertGreater(float(a["teacher_l1"]), 0.19)
 
+    def test_b_gt_lowfreq_anchor_rejects_teacher_brightness_bias(self):
+        # A can copy a constant offset present in Original. B's GT LF term
+        # must reject it even when student and Original HF are identical.
+        gt = self.gt
+        original = gt + 0.12
+        pred = original.clone().requires_grad_(True)
+        b = t1b_objective(pred, gt, original.detach(), variant="B")
+        self.assertLess(float(b["teacher_highfreq_l1"]), 1e-6)
+        self.assertGreater(float(b["gt_lowfreq_l1"]), 0.11)
+        b["loss"].backward()
+        self.assertGreater(float(pred.grad.abs().sum()), 0)
+
     def test_teacher_hf_supervision_reaches_all_four_phases(self):
         # Base constant GT; Original has distinct checkerboard texture on
         # every phase. B should respond to P0 AND P3 without phase filtering.
