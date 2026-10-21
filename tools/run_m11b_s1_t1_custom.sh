@@ -50,10 +50,10 @@ for scene in $SCENES; do
         --decoder-checkpoint "$DECODER" --upscale 3 \
         --clip-len 24 --dit-overlap 0 --dtype bfloat16 \
         --attention-backend sdpa --png 2>&1 | tee "$DEST/inference.log"
-      python - "$INPUT" "$CKPT" "$DECODER" "$DEST" "$scene" "$variant" <<'PY'
+      python - "$INPUT" "$CKPT" "$DECODER" "$DEST" "$scene" "$variant" "$BASE" <<'PY'
 import hashlib,json,sys
 from pathlib import Path
-src,dit,decoder,out,scene,variant=sys.argv[1:]
+src,dit,decoder,out,scene,variant,base=sys.argv[1:]
 out=Path(out)
 frames=sorted((out/"png").glob("*.png"))
 if len(frames)<8:
@@ -72,8 +72,11 @@ record={
     "kind":"M11B-S1-T1-custom-C24-v1","scene":scene,"variant":variant,
     "source_video":fingerprint(src),
     "transformer":fingerprint(Path(dit)/"transformer/diffusion_pytorch_model.safetensors"),
+    "transformer_config":fingerprint(Path(dit)/"transformer/config.json"),
     "decoder":fingerprint(Path(decoder)/"model.safetensors"),
-    "reae_source":"checkpoints_prompt_free_no_time",
+    "decoder_config":fingerprint(Path(decoder)/"config.json"),
+    "reae":fingerprint(Path(base)/"reae.safetensors"),
+    "inference_script_sha256":fingerprint("scripts/inference_custom_components.py")["sha256"],
     "inference":{"upscale":3,"clip_len":24,"dit_overlap":0,
                  "dtype":"bfloat16","attention_backend":"sdpa","png":True},
     "frame_count":len(frames),
@@ -97,7 +100,8 @@ runs={name:json.loads((root/name/"provenance.json").read_text())
       for name in ("e99","step250","step500")}
 baseline=runs["e99"]
 for name,record in runs.items():
-    for key in ("source_video","transformer","inference","frame_count"):
+    for key in ("source_video","transformer","transformer_config","reae",
+                "inference_script_sha256","inference","frame_count"):
         if record[key]!=baseline[key]:
             raise ValueError(f"Source/M11B/C24 provenance mismatch: {name} differs on {key}")
 print(f"[M11B-S1-T1] matched same-source, same-M11B, same-C24 frames={baseline['frame_count']} scene={sys.argv[2]}")
