@@ -311,6 +311,9 @@ def main():
             dtype=torch.float32).to(device).train()
         # Original decoder is the RGB texture reference, NOT the temporal truth.
         reae=ReAE(str(a.base_checkpoint/"reae.safetensors"))
+        # The full checkpoint must load strictly, but this stage only decodes.
+        # Drop the unused encoder before transferring the teacher to GPU.
+        reae.encoder=torch.nn.Identity()
         reae.requires_grad_(False)
         reae.to(device=device,dtype=dtype).eval()
         perceptual=None
