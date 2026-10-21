@@ -63,6 +63,10 @@ class T1BTrainerTests(unittest.TestCase):
         self.assertIn("original_gt_metrics",src)
         self.assertIn("t1b_objective",src)
         self.assertIn("VideoMetricAccumulator",src)
+        self.assertIn("a1_gt_lpips_eval",src)
+        self.assertIn("original_gt_lpips_eval",src)
+        self.assertIn("perceptual(pred, gt)",src)
+        self.assertIn("perceptual(target, gt)",src)
 
 
 if __name__ == "__main__":
