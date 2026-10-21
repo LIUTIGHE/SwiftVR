@@ -254,6 +254,11 @@ def evaluate(decoder,reae,validation,perceptual,*,device,dtype,args,step):
             target=decode_reae_clip(reae,z,output_frames=13,clamp=False)
             pred=decoder(z,output_frames=13,clamp=False)
         metrics=t1b_objective(pred,gt,target,gt_lpips=perceptual,**t1b_loss_kwargs(args))
+        if perceptual is not None:
+            # Validation-only LPIPS is measured for BOTH decoders even when
+            # gt_lpips_weight=0 during training. Keep the objective unmodified.
+            metrics["a1_gt_lpips_eval"] = perceptual(pred, gt)
+            metrics["original_gt_lpips_eval"] = perceptual(target, gt)
         # Compare both decoders against the SAME GT; clamp only for pixel
         # metrics, while the training objective remains unclamped.
         a1_quality.update(pred.float(),gt.float(),clamp=True)
@@ -283,7 +288,7 @@ def main():
     local_rank=int(os.environ.get("LOCAL_RANK",0))
     world=int(os.environ.get("WORLD_SIZE",1))
     if not torch.cuda.is_available():
-        raise RuntimeError("M11B-S1-T1 requires a CUDA GPU")
+        raise RuntimeError("M11B-S1-T1B requires a CUDA GPU")
     torch.cuda.set_device(local_rank)
     device=torch.device("cuda",local_rank)
     dtype=torch.bfloat16 if a.dtype=="bfloat16" else torch.float32
@@ -330,7 +335,9 @@ def main():
         reae.requires_grad_(False)
         reae.to(device=device,dtype=dtype).eval()
         perceptual=None
-        if a.gt_lpips_weight:
+        if a.lpips_weights is not None:
+            # Also used as a METRIC during val13 when the trainable objective
+            # has gt_lpips_weight=0. This preserves GT-LPIPS comparability.
             from swiftvr.training.m8_task import LocalLPIPS
             perceptual=LocalLPIPS(a.lpips_weights,frame_batch=a.lpips_frame_batch).to(device).eval()
         optimizer=torch.optim.AdamW(student.parameters(),lr=a.learning_rate,
@@ -415,7 +422,7 @@ def main():
                 latent=batch["z_sr"].to(device=device,dtype=dtype,non_blocking=True)
                 gt=batch["hr"].to(device=device,dtype=torch.float32,non_blocking=True)
                 if latent.shape[1:]!=(4,48,24,24) or gt.shape[1:]!=(13,3,384,384):
-                    raise ValueError("Formal T1 expects canonical T13/384x384 paired views")
+                    raise ValueError("Formal T1B expects canonical T13/384x384 paired views")
                 with torch.no_grad(),torch.autocast("cuda",dtype=dtype,enabled=dtype==torch.bfloat16):
                     teacher=decode_reae_clip(reae,latent,output_frames=13,clamp=False)
                 context=ddp.no_sync() if world>1 and micro<a.gradient_accumulation_steps-1 else nullcontext()
