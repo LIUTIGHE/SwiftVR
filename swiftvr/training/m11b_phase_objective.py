@@ -104,4 +104,7 @@ def phase_objective(
     return {"loss":loss,"gt_l1":gt_l1,"teacher_l1":teacher_l1,
             "highfreq_gt_l1":highfreq,"luma_temporal_gt":luma_temporal,
             "phase_highfreq_imbalance":phase_balance,"gt_lpips":lp,
+            "phase_0_hf_l1":phase_values[0],"phase_1_hf_l1":phase_values[1],
+            "phase_2_hf_l1":phase_values[2],"phase_3_hf_l1":phase_values[3],
+            "phase_0_minus_3_hf_l1":phase_values[0]-phase_values[3],
             **phase_metrics(p,g,trim=phase_trim)}
