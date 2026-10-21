@@ -32,6 +32,7 @@ class PhaseObjectiveTests(unittest.TestCase):
         pred.requires_grad_(True)
         terms=self.objective(pred)
         self.assertGreater(terms["phase_0_mse"].item(),terms["phase_3_mse"].item())
+        self.assertGreater(terms["phase_0_hf_l1"].item(),terms["phase_3_hf_l1"].item())
         self.assertGreater(terms["phase_highfreq_imbalance"].item(),0)
         terms["loss"].backward()
         self.assertIsNotNone(pred.grad)
