@@ -15,6 +15,7 @@ BASE="${BASE:-checkpoints_prompt_free_no_time}"
 CKPT="${CKPT:-outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000}"
 A1_INIT="${A1_INIT:-outputs/b2b/m9a1_factorized_m8a30k/checkpoints/epoch_099_step_00024552/tiny_decoder}"
 D1="${D1:-outputs/m11b/M11B-S1-D1}"
+LPIPS_WEIGHTS="${LPIPS_WEIGHTS:-outputs/local_weights/lpips_alex_complete.pt}"
 ROOT="${OUT_ROOT:-outputs/m11b/M11B-S1-T1B}"
 COMMON=(
   --variant "$VARIANT"
@@ -32,6 +33,7 @@ COMMON=(
   --temporal-weight 0.5
   --highpass-kernel 7
   --gt-lpips-weight 0
+  --lpips-weights "$LPIPS_WEIGHTS"
 )
 if [[ "$MODE" == smoke ]]; then
   OUT="$ROOT/smoke2_${VARIANT,,}_v1"
@@ -59,6 +61,7 @@ fi
 
 for p in "$CKPT/transformer/diffusion_pytorch_model.safetensors" \
          "$BASE/reae.safetensors" "$A1_INIT/model.safetensors" \
+         "$LPIPS_WEIGHTS" \
          "$D1/legacy_train_full/metadata.json" \
          "$D1/ultra_train_full/metadata.json" \
          "$D1/legacy_val13/metadata.json"; do
