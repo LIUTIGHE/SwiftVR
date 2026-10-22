@@ -188,22 +188,109 @@ def evaluate(scene:str,root:Path,bank:dict,
     with (compare_dir/"frames.csv").open("w",newline="") as handle:
         writer=csv.DictWriter(handle,fieldnames=list(rows[0]))
         writer.writeheader();writer.writerows(rows)
-    mean_by_phase=_phase_means(rows,[k for k in rows[0] if k not in ("output_frame","phase","tiny_frame")])
-    ratio={p:mean_by_phase[p]["hf_energy_current"]/max(mean_by_phase[p]["hf_energy_e99"],1e-12)
-           for p in mean_by_phase}
-    summary={
-        "kind":"M11B-custom-fourway-v1","scene":scene,
-        "decoder_checkpoint":str(info["decoder"]["path"]),
-        "frames":n,"roi":roi,"phase_formula":"(output_frame+3)%4",
-        "by_phase":mean_by_phase,
-        "hf_ratio_current_vs_e99_phase_means":ratio,
-        "tiny_alignment":"ordinal length-normalized, NOT timestamp aligned",
-        "caveat":"No GT. HF energy and reference disagreement do not establish actual image correctness.",
-        "fixed_references":["Original SwiftVR complete conditional model","M11B+E99","External TinyCNN AISR video"],
+
+    _finalize_analysis(scene, root, compare_dir, roi, n, rows)
+
+
+def _finalize_analysis(scene: str, root: Path, compare_dir: Path,
+                       roi: list[int], n: int, rows: list[dict]) -> None:
+    """Write final diagnostics only after all rows and snapshots are validated.
+
+    This works with both in-memory rows and rows reconstructed from an already
+    complete frames.csv after a late CPU summary-writing failure. It never
+    loads a model or changes existing PNG inference output.
+    """
+    import math
+
+    required = ["output_frame", "phase", "tiny_frame"]
+    for method in ("original", "e99", "current", "tiny"):
+        required += [f"hf_energy_{method}", f"luma_mean_{method}"]
+    for method in ("e99", "original", "tiny"):
+        required += [
+            f"hf_mae_current_vs_{method}",
+            f"lf_mae_current_vs_{method}",
+            f"luma_delta_current_vs_{method}",
+        ]
+    if len(rows) != n:
+        raise ValueError(f"Cannot finalize {scene}: expected {n} aligned rows, got {len(rows)}")
+    clean = []
+    for i, row in enumerate(rows):
+        if not set(required).issubset(row):
+            raise ValueError(f"Cannot finalize {scene}: missing diagnostic fields on row {i}")
+        if int(row["output_frame"]) != i or int(row["phase"]) != (i + 3) % 4:
+            raise ValueError(f"Cannot finalize {scene}: frame/phase mismatch on row {i}")
+        if int(row["tiny_frame"]) < 0:
+            raise ValueError(f"Cannot finalize {scene}: invalid TinyCNN index on row {i}")
+        normalized = {
+            "output_frame": i,
+            "phase": (i + 3) % 4,
+            "tiny_frame": int(row["tiny_frame"]),
+        }
+        for field in required[3:]:
+            value = float(row[field])
+            if not math.isfinite(value):
+                raise ValueError(f"Cannot finalize {scene}: non-finite {field} on frame {i}")
+            normalized[field] = value
+        clean.append(normalized)
+
+    for frame in {0, 1, 12, n // 2, 245, 248} & set(range(n)):
+        path = compare_dir / f"native_fourway_{frame:06d}_p{(frame+3)%4}.png"
+        if not path.is_file():
+            raise FileNotFoundError(f"Cannot finalize {scene}: missing saved comparison {path}")
+
+    provenance = json.loads((root / "provenance.json").read_text())
+    if provenance.get("kind") != "M11B-custom-current-C24-v1":
+        raise ValueError("Cannot finalize unverified current-decoder provenance")
+    by_phase = _phase_means(clean, required[3:])
+    ratio = {
+        p: by_phase[p]["hf_energy_current"] / max(by_phase[p]["hf_energy_e99"], 1e-12)
+        for p in by_phase
     }
-    atomic_json(compare_dir/"summary.json",summary)
-    print(json.dumps({"scene":scene,"frames":n,"hf_ratio_current_vs_e99":ratio,
-                      "summary":str(compare_dir/"summary.json")},indent=2))
+    summary = {
+        "kind": "M11B-custom-fourway-v1",
+        "scene": scene,
+        "decoder_checkpoint": str(provenance["decoder"]["path"]),
+        "frames": n,
+        "roi": roi,
+        "phase_formula": "(output_frame+3)%4",
+        "by_phase": by_phase,
+        "hf_ratio_current_vs_e99_phase_means": ratio,
+        "tiny_alignment": "ordinal length-normalized, NOT timestamp aligned",
+        "caveat": "No GT. HF energy and reference disagreement do not establish actual image correctness.",
+        "fixed_references": [
+            "Original SwiftVR complete conditional model",
+            "M11B+E99",
+            "External TinyCNN AISR video",
+        ],
+    }
+    atomic_json(compare_dir / "summary.json", summary)
+    print(json.dumps({
+        "scene": scene,
+        "frames": n,
+        "hf_ratio_current_vs_e99": ratio,
+        "summary": str(compare_dir / "summary.json"),
+    }, indent=2))
+
+
+def _recover_completed_analysis(scene: str, root: Path, bank: dict,
+                                compare_dir: Path) -> None:
+    """Finalize a complete CSV after an interrupted summary write, CPU only.
+
+    Do not delete or overwrite a partially completed diagnostic. A missing
+    or incomplete CSV fails closed and asks for a manual audit instead.
+    """
+    entry = next(c for c in bank["clips"] if c["name"] == scene)
+    path = compare_dir / "frames.csv"
+    if not path.is_file():
+        raise RuntimeError(
+            f"Incomplete custom comparison at {compare_dir}: frames.csv missing. "
+            "Preserve files; inspect or rename the partial comparison directory "
+            "before explicitly re-running CPU evaluation."
+        )
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    _finalize_analysis(scene, root, compare_dir, entry["roi"],
+                       int(entry["frames"]), rows)
 
 
 def run(args):
@@ -255,6 +342,11 @@ def run(args):
         analysis=root/"comparison"
         if (analysis/"summary.json").is_file():
             print(f"[custom-val] already complete, preserved: {analysis}")
+        elif analysis.exists():
+            # Late failures may leave a COMPLETE frames.csv and native PNGs
+            # but no summary.json. Reuse those artifacts without GPU inference,
+            # CPU re-decoding or deletion. Refuse genuinely partial reports.
+            _recover_completed_analysis(scene, root, info, analysis)
         else:
             evaluate(scene,root,info,e99_root,analysis,video=args.video)
     return 0
