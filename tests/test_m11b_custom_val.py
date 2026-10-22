@@ -6,6 +6,7 @@ identity contracts and lossless five-way A/B native ROI assembly.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 
 from PIL import Image
 
-from tools.m11b_custom_val import _png_files,load_bank
+from tools.m11b_custom_val import _png_files, load_bank, _recover_completed_analysis
 from tools.train_with_custom_val import cli_arguments,milestones,verified_checkpoint
 from tools.compare_m11b_t1b_ab import run as ab_run
 
@@ -66,6 +67,61 @@ class CustomValContracts(unittest.TestCase):
                 f.write(b"changed")
             with self.assertRaisesRegex(ValueError,"changed"):
                 load_bank(root)
+
+    def test_late_summary_failure_recovers_csv_without_reinference(self):
+        # Regression: prior evaluate() referenced nonlocal 'info' after writing
+        # frames.csv, leaving complete PNGs but missing summary.json.
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/"Wetland1"
+            comp=root/"comparison"
+            comp.mkdir(parents=True)
+            original=Path(d)/"frozen_A1_decoder"
+            (root/"provenance.json").write_text(json.dumps({
+                "kind":"M11B-custom-current-C24-v1",
+                "decoder":{"path":str(original),"sha256":"tested"}
+            }))
+            fields=["output_frame","phase","tiny_frame"]
+            for method in ("original","e99","current","tiny"):
+                fields += [f"hf_energy_{method}",f"luma_mean_{method}"]
+            for method in ("e99","original","tiny"):
+                fields += [f"hf_mae_current_vs_{method}",
+                           f"lf_mae_current_vs_{method}",
+                           f"luma_delta_current_vs_{method}"]
+            with (comp/"frames.csv").open("w",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=fields)
+                writer.writeheader()
+                for i in range(8):
+                    writer.writerow({**{name:.05 for name in fields[3:]},
+                                     "output_frame":i,
+                                     "phase":(i+3)%4,"tiny_frame":i})
+            for i in (0,1,4):
+                Image.new("RGB",(8,64),"cyan").save(
+                    comp/f"native_fourway_{i:06d}_p{(i+3)%4}.png")
+            bank={"clips":[{"name":"Wetland1","frames":8,"roi":[0,0,4,4]}]}
+            self.assertFalse((comp/"summary.json").exists())
+            _recover_completed_analysis("Wetland1",root,bank,comp)
+            report=json.loads((comp/"summary.json").read_text())
+            self.assertEqual(report["decoder_checkpoint"],str(original))
+            self.assertEqual(report["frames"],8)
+            self.assertEqual([report["by_phase"][str(p)]["count"] for p in range(4)],
+                             [2,2,2,2])
+            self.assertTrue((comp/"native_fourway_000001_p0.png").is_file())
+            self.assertTrue((comp/"frames.csv").is_file())
+
+    def test_late_recovery_fails_closed_on_incomplete_csv(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/"Wetland1"
+            comp=root/"comparison"
+            comp.mkdir(parents=True)
+            (root/"provenance.json").write_text(json.dumps({
+                "kind":"M11B-custom-current-C24-v1",
+                "decoder":{"path":"student"}
+            }))
+            (comp/"frames.csv").write_text("output_frame,phase,tiny_frame\\n0,3,0\\n")
+            bank={"clips":[{"name":"Wetland1","frames":8,"roi":[0,0,4,4]}]}
+            with self.assertRaisesRegex(ValueError,"expected 8 aligned rows"):
+                _recover_completed_analysis("Wetland1",root,bank,comp)
+            self.assertFalse((comp/"summary.json").exists())
 
     def test_checkpoint_must_be_complete(self):
         with tempfile.TemporaryDirectory() as d:
