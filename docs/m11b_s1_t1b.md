@@ -117,7 +117,123 @@ Metrics: paired GT PSNR/SSIM/MAE/RMSE for BOTH A1 and Original, validation-only 
 
 **Interpretation priority:** does A substantially lower teacher RGB/HF error? Does B preserve/recover teacher highpass energy on P0 **without flattening P3**? Are brightness and temporal errors smaller for B? Does GT PSNR/SSIM/LPIPS stay tolerable? The validation highpass is a 7×7 average-filter difference and therefore **not numerically interchangeable** with custom-video D0's Gaussian highpass (sigma1.5).
 
-## Stage 3 — independent C24 Wetland1/Mangrove1 gate
+
+## Stage 3 — COMPLETED pilots, current full-origin C24 comparison
+
+**User report (2026-10-22):** both 250-update pilots A and B finished. Their val13 logs and custom-video results have not yet been provided; this is **training completion only**, NOT A/B image-quality PASS.
+
+The new evaluator uses the already-existing fixed Original SwiftVR + TinyCNN reference bank (made by `tools/visual_check_m8_task.sh prepare`) and the *already rendered* M11-B+E99 full-origin PNGs from T1. Only T1B-A and T1B-B require new M11-B inference.
+
+**Four compared methods and exact meaning:**
+- `Original SwiftVR` = complete original conditional SwiftVR from `checkpoints`, pre-rendered in `reference.json`, NOT the frozen Original ReAE decoder paired with M11-B.
+- `E99` = M11-B bootstrap30k + M9-A1 E99 decoder, reference `outputs/m11b/M11B-S1-T1/custom_pilot500_v1/{Wetland1,Mangrove1}/e99/png`.
+- `Current` = fixed same M11-B bootstrap30k + T1B-A/B decoder, native C24 inference.
+- `TinyCNN` = external precomputed AISR baseline video `../data/yuv_S_10bit/AISR_pred/S5_{Wetland1,Mangrove1}_1920x1080p444_10bit_SR_YUV444_RC1.0.mp4`, reusing earlier bank frame-ordinal mapping; this is **not** the A1 tiny decoder.
+
+First, sync new files `tools/m11b_custom_val.py`, `tools/compare_m11b_t1b_ab.py`, `tests/test_m11b_custom_val.py` (and `tools/train_with_custom_val.py` for future runs). Locate the bank on the offline server:
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+find outputs/custom -name reference.json -type f -print
+```
+
+The default is `outputs/custom/p1_reference_v1/reference.json`, but override the root if the bank was saved under a different name. Do **not** create a fresh bank or run Original SwiftVR if a valid bank already exists. The evaluator checks original bank file sizes/mtimes, immutable E99/source movie/transformer/ReAE SHA256, matching C24 inference and exact full-frame geometry; it fails closed on misaligned assets.
+
+```bash
+python -m py_compile \
+  tools/m11b_custom_val.py tools/compare_m11b_t1b_ab.py \
+  tools/train_with_custom_val.py
+python -m unittest discover -s tests -p 'test_m11b_custom_val.py' -v
+
+export CUDA_VISIBLE_DEVICES=7
+BANK=outputs/custom/p1_reference_v1  # replace with ACTUAL reference.json parent
+ROOT=outputs/m11b/M11B-S1-T1B
+
+python tools/m11b_custom_val.py \
+  --decoder-checkpoint "$ROOT/pilot250_a_v1/checkpoints/step_00000250/tiny_decoder" \
+  --reference-bank "$BANK" \
+  --output-root "$ROOT/custom_pilot250/a"
+
+python tools/m11b_custom_val.py \
+  --decoder-checkpoint "$ROOT/pilot250_b_v1/checkpoints/step_00000250/tiny_decoder" \
+  --reference-bank "$BANK" \
+  --output-root "$ROOT/custom_pilot250/b"
+
+python tools/compare_m11b_t1b_ab.py \
+  --root-a "$ROOT/custom_pilot250/a" \
+  --root-b "$ROOT/custom_pilot250/b" \
+  --output "$ROOT/custom_pilot250/ab_comparison"
+```
+
+The evaluator runs each source video from **frame0** to the full 249 frames and holds `--upscale 3 --clip-len 24 --dit-overlap 0 --dtype bfloat16 --attention-backend sdpa --png` fixed. The two runs need only new T1B-A/B decode; they never invoke `scripts/inference.py` to reconstruct Original SwiftVR or regenerate E99/TinyCNN. It saves native full-size PNG sequences and four-way native 960×960 ROI panels for selected frames, plus `frames.csv` and `summary.json`. A/B aggregation produces five-column native ROI frames for Wetland1 global245/P0 and 248/P3, plus Mangrove1 global12/124/245/248, with a per-phase comparison JSON. No GT is available, so raw HF energy and HF deviation are diagnostics, **not objective image quality**.
+
+Optional: `--video` on each `m11b_custom_val.py` command saves a full-resolution lossless FFV1 `native_fourway.mkv` per scene, greatly increasing disk usage; off by default. Full PNG output is always retained.
+
+Review outputs:
+
+```text
+outputs/m11b/M11B-S1-T1B/custom_pilot250/
+  a/Wetland1/{png/,comparison/{frames.csv,summary.json,native_fourway_000245_p0.png,...}}
+  a/Mangrove1/{png/,comparison/...}
+  b/Wetland1/{png/,comparison/...}
+  b/Mangrove1/{png/,comparison/...}
+  ab_comparison/{summary.json,Wetland1_global_000245_p0_fiveway.png,
+                 Wetland1_global_000248_p3_fiveway.png,...}
+```
+
+**Decision gate**: compare texture preservation at P3/248, recovery at P0/245, and any four-phase flicker/brightness shift; inspect continuous original-speed videos where possible. Variant A may copy Original decoder luminance variation; B uses matched GT for low-frequency correction. A/B GT val13 and custom highpass energy quantify different properties; never promote from PSNR or HF energy alone.
+
+## Stage 4 — future training: automatically run two custom clips on milestone validation
+
+Do **not** run M11-B full-video inference while the optimizer model is still resident in GPU memory. The reusable driver `tools/train_with_custom_val.py` runs **train to milestone, clean process exit, render Current for both videos, strict exact resume**. Original SwiftVR, E99 and TinyCNN are cached and reused. The two full custom videos are a costly secondary validation; default val13 stays cheap and can run every 125 steps, while custom clips can be scheduled less frequently by choosing e.g. milestones 250,500.
+
+The new train run must use its own fresh directory, not retrofit an already-completed pilot250 run (which has no driver plan). Example variant B training configuration, stored as `outputs/m11b/t1b_future_config_b.json` (manually create if/when starting a *future* run):
+
+```json
+{
+  "variant": "B",
+  "base_checkpoint": "checkpoints_prompt_free_no_time",
+  "m11b_checkpoint": "outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000",
+  "a1_init": "outputs/b2b/m9a1_factorized_m8a30k/checkpoints/epoch_099_step_00024552/tiny_decoder",
+  "legacy_train": "outputs/m11b/M11B-S1-D1/legacy_train_full",
+  "ultra_train": "outputs/m11b/M11B-S1-D1/ultra_train_full",
+  "legacy_val": "outputs/m11b/M11B-S1-D1/legacy_val13",
+  "lpips_weights": "outputs/local_weights/lpips_alex_complete.pt",
+  "teacher_weight": 1.0,
+  "lowfreq_gt_weight": 1.0,
+  "temporal_weight": 0.5,
+  "highpass_kernel": 7,
+  "gt_lpips_weight": 0.0,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 8,
+  "num_workers": 2,
+  "dtype": "bfloat16",
+  "learning_rate": 1e-5,
+  "schedule_steps": 6000,
+  "warmup_steps": 100,
+  "save_every": 125,
+  "validate_every": 125,
+  "log_every": 10
+}
+```
+
+Launch a FRESH run (illustrative, not needed for completed pilot A/B):
+
+```bash
+python tools/train_with_custom_val.py \
+  --train-script tools/train_m11b_s1_t1b_decoder.py \
+  --train-config outputs/m11b/t1b_future_config_b.json \
+  --train-output outputs/m11b/M11B-S1-T1B/future_b_500_auto \
+  --custom-output outputs/m11b/M11B-S1-T1B/future_b_custom \
+  --reference-bank "$BANK" \
+  --milestones 250,500
+```
+
+Stages run at 250 then 500 and the current decoder is evaluated on both scenes after each stage. Trainer and code/config hashes, optimizer, per-rank RNG and step counters enforce exact resume within the same run; no new TinyCNN or Original SwiftVR inference is required. The driver stores its plan outside the fresh trainer output tree, rejects changing the plan mid-run, and refuses to overwrite existing custom frames.
+
+**Limitations:** the driver orchestrates consecutive child processes in one foreground command, not background/asynchronous training. Native full video custom validation still must run current M11-B forward for each checkpoint and does not eliminate this cost. A future optimized implementation might cache M11-B **inference video latents** separately, but this would require proving C24 equivalence and temporal alignment before changing semantics.
+
 
 Do not promote a variant based on val13 alone. Use the prior unchanged `scripts/inference_custom_components.py`, M11-B bootstrap30k, full-origin source videos, upscale3, C24 overlap0 BF16 SDPA, and A/B final decoder paths. Compare to exact E99 with full PNG sequences and native 960×960 ROI at Wetland1 frame245/P0 and frame248/P3, plus Mangrove1 249 frames. Preserve all existing E99/T1 and A/B outputs. A/B comparison/render commands will be added after their pilot validation gate, to avoid re-rendering until the source of learning is demonstrated.
 
