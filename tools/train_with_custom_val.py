@@ -93,12 +93,12 @@ def run(args):
         "base":str(args.base.resolve()),
         "video":args.video,
     }
-    state=run_dir/"custom_validation_plan.json"
+    # Keep orchestration metadata OUTSIDE the trainer output: trainer strictly\n    # requires a fresh, completely absent output on its first invocation.\n    state=custom_dir/"custom_validation_plan.json"
     if state.is_file():
         if json.loads(state.read_text())!=plan:
             raise ValueError("Cannot change auto-validation plan for ongoing training")
-    elif run_dir.exists():
-        raise ValueError(f"Nonempty/unplanned training output: {run_dir}")
+    elif run_dir.exists() or custom_dir.exists():
+        raise ValueError(f"Existing unplanned train/custom output: {run_dir}, {custom_dir}")
     else:
         # Preflight WITHOUT running another model: fail if fixed reference bank absent.
         if not (args.reference_bank/"reference.json").is_file():
@@ -106,7 +106,7 @@ def run(args):
         for scene in ("Wetland1","Mangrove1"):
             if not (args.e99_root/scene/"e99"/"provenance.json").is_file():
                 raise FileNotFoundError(f"Missing cached E99 full-origin reference: {scene}")
-        run_dir.mkdir(parents=True)
+        custom_dir.mkdir(parents=True)
         state.write_text(json.dumps(plan,sort_keys=True,indent=2)+"\n")
     previous=0
     for step in args.milestones:
