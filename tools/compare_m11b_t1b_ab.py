@@ -60,7 +60,7 @@ def run(args):
         # Native 960x960 content never resized. Captions remain attached to
         # each method's own quadrant; panels are composed from A/B validated
         # complete fourway PNGs.
-        for frame in ((245,248) if scene=="Wetland1" else (12,120,245,248)):
+        for frame in ((245,248) if scene=="Wetland1" else (12,124,245,248)):
             if frame >= int(sa["frames"]):
                 continue
             n=f"native_fourway_{frame:06d}_p{(frame+3)%4}.png"
