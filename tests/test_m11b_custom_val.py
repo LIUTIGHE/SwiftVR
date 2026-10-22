@@ -117,7 +117,7 @@ class CustomValContracts(unittest.TestCase):
                 "kind":"M11B-custom-current-C24-v1",
                 "decoder":{"path":"student"}
             }))
-            (comp/"frames.csv").write_text("output_frame,phase,tiny_frame\\n0,3,0\\n")
+            (comp/"frames.csv").write_text("output_frame,phase,tiny_frame\n0,3,0\n")
             bank={"clips":[{"name":"Wetland1","frames":8,"roi":[0,0,4,4]}]}
             with self.assertRaisesRegex(ValueError,"expected 8 aligned rows"):
                 _recover_completed_analysis("Wetland1",root,bank,comp)
