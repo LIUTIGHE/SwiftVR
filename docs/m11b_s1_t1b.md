@@ -124,6 +124,18 @@ Metrics: paired GT PSNR/SSIM/MAE/RMSE for BOTH A1 and Original, validation-only 
 
 The new evaluator uses the already-existing fixed Original SwiftVR + TinyCNN reference bank (made by `tools/visual_check_m8_task.sh prepare`) and the *already rendered* M11-B+E99 full-origin PNGs from T1. Only T1B-A and T1B-B require new M11-B inference.
 
+**One-command shortcut:** after syncing `tools/run_m11b_t1b_custom_ab.sh` along with the new evaluator/comparison files, just run:
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+export CUDA_VISIBLE_DEVICES=7
+BANK=outputs/custom/p1_reference_v1 \
+  bash tools/run_m11b_t1b_custom_ab.sh
+```
+
+Use `BANK=/actual/bank/root` if `find outputs/custom -name reference.json` reveals a different directory. This runs both scenes for A/B, validates completed assets, and writes the A/B report automatically. Set `CUSTOM_VIDEO=1` to additionally write large lossless FFV1 videos; full native PNGs and selected native ROI comparisons are always kept. A partially completed model inference is not silently overwritten.
+
 **Four compared methods and exact meaning:**
 - `Original SwiftVR` = complete original conditional SwiftVR from `checkpoints`, pre-rendered in `reference.json`, NOT the frozen Original ReAE decoder paired with M11-B.
 - `E99` = M11-B bootstrap30k + M9-A1 E99 decoder, reference `outputs/m11b/M11B-S1-T1/custom_pilot500_v1/{Wetland1,Mangrove1}/e99/png`.
