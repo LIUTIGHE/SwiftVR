@@ -74,7 +74,7 @@ def load_bank(root:Path) -> dict:
     return info
 
 
-def scene_reference(bank:dict,scene:str,bank_root:Path,e99_root:Path,base:Path,dit:Path):
+def scene_reference(bank:dict,scene:str,e99_root:Path,base:Path,dit:Path):
     entry=next(item for item in bank["clips"] if item["name"]==scene)
     prov=json.loads((e99_root/scene/"e99"/"provenance.json").read_text())
     if prov["kind"]!="M11B-S1-T1-custom-C24-v1":
@@ -85,7 +85,7 @@ def scene_reference(bank:dict,scene:str,bank_root:Path,e99_root:Path,base:Path,d
         raise ValueError(f"E99 M11-B checkpoint identity mismatch: {scene}")
     if prov["reae"]["sha256"]!=file_sha(base/"reae.safetensors"):
         raise ValueError(f"E99 ReAE checkpoint identity mismatch: {scene}")
-    if prov["inference"]!=bank["inference"] | {"png":True}:
+    if prov["inference"] != (bank["inference"] | {"png": True}):
         raise ValueError(f"Original and E99 C24 settings differ: {scene}")
     return entry,prov
 
@@ -106,7 +106,7 @@ def _read_roi(src, index:int, roi:list[int]):
     return frame[y:y+h,x:x+w,:3]
 
 
-def evaluate(scene:str,root:Path,bank_root:Path,info:dict,bank:dict,
+def evaluate(scene:str,root:Path,bank:dict,
              e99_root:Path,compare_dir:Path,video:bool=False):
     entry=next(c for c in bank["clips"] if c["name"]==scene)
     roi=entry["roi"]
@@ -212,7 +212,7 @@ def run(args):
     e99_root=args.e99_root.resolve()
     info=load_bank(bank_root)
     for scene in args.scenes:
-        entry,e99=scene_reference(info,scene,bank_root,e99_root,base,dit)
+        entry,e99=scene_reference(info,scene,e99_root,base,dit)
         ckpt=args.decoder_checkpoint.resolve()
         if not (ckpt/"model.safetensors").is_file() or not (ckpt/"config.json").is_file():
             raise FileNotFoundError(f"Missing A1 decoder checkpoint: {ckpt}")
@@ -256,7 +256,7 @@ def run(args):
         if (analysis/"summary.json").is_file():
             print(f"[custom-val] already complete, preserved: {analysis}")
         else:
-            evaluate(scene,root,bank_root,info,info,e99_root,analysis,video=args.video)
+            evaluate(scene,root,info,e99_root,analysis,video=args.video)
     return 0
 
 
