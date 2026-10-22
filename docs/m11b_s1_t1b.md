@@ -194,6 +194,17 @@ outputs/m11b/M11B-S1-T1B/custom_pilot250/
                  Wetland1_global_000248_p3_fiveway.png,...}
 ```
 
+**2026-10-22 late-summary recovery patch:** Initial A/B `m11b_custom_val.py` run could finish Current full-origin PNG inference and `comparison/frames.csv`, then crash with `NameError: name 'info' is not defined` while assembling the summary. PR #4 now reads the decoder ID from the verified `provenance.json`; an existing comparison folder with a complete 249-row `frames.csv` and all expected native snapshot PNGs is finalized **in place**. It does not call GPU inference or overwrite the source frames. Re-sync `tools/m11b_custom_val.py` and `tests/test_m11b_custom_val.py`, run the test and reissue the SAME command:
+
+```bash
+cd /data1/a/SwiftVR
+python -m py_compile tools/m11b_custom_val.py tests/test_m11b_custom_val.py
+python -m unittest discover -s tests -p 'test_m11b_custom_val.py' -v
+BANK=outputs/custom/p1_reference_v1 bash tools/run_m11b_t1b_custom_ab.sh
+```
+
+Do NOT delete `custom_pilot250/a/Wetland1/png` or the existing A/B run directories. If the CSV or a required snapshot is incomplete, recovery fails closed with an explicit reason; preserve the partial files for auditing instead of silently regenerating them.
+
 **Decision gate**: compare texture preservation at P3/248, recovery at P0/245, and any four-phase flicker/brightness shift; inspect continuous original-speed videos where possible. Variant A may copy Original decoder luminance variation; B uses matched GT for low-frequency correction. A/B GT val13 and custom highpass energy quantify different properties; never promote from PSNR or HF energy alone.
 
 ## Stage 4 — future training: automatically run two custom clips on milestone validation
