@@ -93,7 +93,9 @@ def run(args):
         "base":str(args.base.resolve()),
         "video":args.video,
     }
-    # Keep orchestration metadata OUTSIDE the trainer output: trainer strictly\n    # requires a fresh, completely absent output on its first invocation.\n    state=custom_dir/"custom_validation_plan.json"
+    # Keep orchestration metadata OUTSIDE the trainer output: trainer strictly
+    # requires a fresh, completely absent output on its first invocation.
+    state=custom_dir/"custom_validation_plan.json"
     if state.is_file():
         if json.loads(state.read_text())!=plan:
             raise ValueError("Cannot change auto-validation plan for ongoing training")
