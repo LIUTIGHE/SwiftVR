@@ -261,3 +261,82 @@ Stages run at 250 then 500 and the current decoder is evaluated on both scenes a
 Do not promote a variant based on val13 alone. Use the prior unchanged `scripts/inference_custom_components.py`, M11-B bootstrap30k, full-origin source videos, upscale3, C24 overlap0 BF16 SDPA, and A/B final decoder paths. Compare to exact E99 with full PNG sequences and native 960×960 ROI at Wetland1 frame245/P0 and frame248/P3, plus Mangrove1 249 frames. Preserve all existing E99/T1 and A/B outputs. A/B comparison/render commands will be added after their pilot validation gate, to avoid re-rendering until the source of learning is demonstrated.
 
 **Reject** a variant if it reduces per-phase deviation only by suppressing good-phase texture. Original ReAE's own temporal artifacts are NOT GT and must not be blindly copied. Evaluate subjective temporal brightness flicker, especially P0/P3 and chunk boundaries. No model, quality or runtime pass should be assumed before these full-origin tests.
+
+
+## Stage 5 — A/B 250-step custom result and controlled continuation (2026-10-23)
+
+User reports both complete 249-frame five-way comparisons look perceptually very similar to E99. Their `ab_comparison/summary.json` shows the following mean-highpass-energy ratios (current/E99, not PSNR or GT):
+
+| Scene | A P0/P1/P2/P3 | B P0/P1/P2/P3 |
+|---|---|---|
+| Wetland1 (full 249) | .895 / .872 / .924 / .938 | .819 / .777 / .840 / .854 |
+| Mangrove1 (full 249) | .931 / .926 / .943 / .950 | .857 / .847 / .869 / .879 |
+
+A retains systematically more of E99's HF response and has smaller absolute HF disagreement from E99, across all eight pairs. This is MUCH less HF suppression than the old T1 GT-heavy objective (~50% retained on full Mangrove1), corroborating that objective choice matters. However no new weak-phase fix is established: Wetland1 **P0/P3 HF energy ratio** is E99 .765, A .730, B .734. A/B do not preferentially restore P0; strong P3 remains stronger. **No paired custom GT**: neither "more HF" nor "smaller disagreement with E99" by itself proves greater correctness or subjective quality.
+
+**Critical baseline distinction**: the `Original SwiftVR` fourway panel is the original complete conditional model, *not* the actual T1B frozen training Teacher. T1B teacher is `M11-B bootstrap30k + Original ReAE decoder` on the SAME restored latent; it is incorrect to infer the attainable teacher gap from `original_swiftvr_hf_energy`. For a rigorous upper target, separately render/cache M11-B + Original decoder (the `--decoder-type original` option of `scripts/inference_custom_components.py`) once in C24 full-origin mode, or reuse an existing proven D0 teacher reference.
+
+### Is 250 steps too few?
+
+250 updates × batch8 = 2,000 sample presentations (~5.6% of 35,984 training views), with replacement and 50:50 domain balance. LR warmup ends at 100/6000 scheduled steps, so step250 is early. **Training is plausibly underdone, not yet proven insufficient**; but the fact A/B both slightly lower E99 HF and do not fix weak-phase P0 does not guarantee that running to 1000 will help. Check **val13 teacher RGB and HF errors** at 0/125/250 before assigning additional GPU budget.
+
+```bash
+cd /data1/a/SwiftVR
+python - <<'PY'
+import json
+from pathlib import Path
+base=Path("outputs/m11b/M11B-S1-T1B")
+for variant in ("a", "b"):
+    print(f"\n--- T1B-{variant.upper()} paired val13 ---")
+    root=base/f"pilot250_{variant}_v1"/"validation"
+    for step in (0,125,250):
+        j=json.loads((root/f"step_{step:08d}.json").read_text())
+        keys=("teacher_l1","teacher_highfreq_l1","gt_lowfreq_l1",
+              "gt_luma_temporal","a1_gt_lpips_eval")
+        print(step, {k:round(j[k],6) for k in keys if k in j})
+        print("  original/student HF phases:",
+              [(p,round(j[f"phase_{p}_original_hf_energy"],5),
+                 round(j[f"phase_{p}_pred_hf_energy"],5)) for p in range(4)])
+PY
+```
+
+**Next gate**: extend **A first** from *its own* step250 to 500 (then decide whether to continue to 1000). Do **not** restart from E99, swap initialization, edit trainer/objective files, or use the fresh-run-only `tools/run_m11b_s1_t1b.sh pilot A`. The existing `tools/train_m11b_s1_t1b_decoder.py` exact resume supports a larger `--max-steps` while keeping `--schedule-steps=6000`, code hashes, optimizer, RNG and batch sampler consistent. Command:
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+export CUDA_VISIBLE_DEVICES=7
+RUN=outputs/m11b/M11B-S1-T1B/pilot250_a_v1
+CKPT=outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000
+A1_INIT=outputs/b2b/m9a1_factorized_m8a30k/checkpoints/epoch_099_step_00024552/tiny_decoder
+
+python tools/train_m11b_s1_t1b_decoder.py \
+  --variant A \
+  --base-checkpoint checkpoints_prompt_free_no_time \
+  --m11b-checkpoint "$CKPT" --a1-init "$A1_INIT" \
+  --legacy-train outputs/m11b/M11B-S1-D1/legacy_train_full \
+  --ultra-train outputs/m11b/M11B-S1-D1/ultra_train_full \
+  --legacy-val outputs/m11b/M11B-S1-D1/legacy_val13 \
+  --path-root . --lpips-weights outputs/local_weights/lpips_alex_complete.pt \
+  --teacher-weight 1.0 --lowfreq-gt-weight 1.0 \
+  --temporal-weight 0.5 --highpass-kernel 7 --gt-lpips-weight 0 \
+  --batch-size 1 --gradient-accumulation-steps 8 --num-workers 2 \
+  --dtype bfloat16 --learning-rate 1e-5 \
+  --warmup-steps 100 --schedule-steps 6000 \
+  --save-every 125 --validate-every 125 --log-every 10 \
+  --output-dir "$RUN" \
+  --resume "$RUN/checkpoints/step_00000250" \
+  --max-steps 500
+```
+
+If all source fingerprints match, this writes step375 and step500 val13/checkpoints to the SAME run while preserving step250. After the 500 gate, use the existing `tools/m11b_custom_val.py` to render only the Current A500 and compare with bank/E99 (not the old 250 output root):
+
+```bash
+BANK=outputs/custom/p1_reference_v1
+python tools/m11b_custom_val.py \
+  --decoder-checkpoint "$RUN/checkpoints/step_00000500/tiny_decoder" \
+  --reference-bank "$BANK" \
+  --output-root outputs/m11b/M11B-S1-T1B/custom_pilot500_a
+```
+
+Compare the SAME full-origin ROI with existing A250 and E99; ask whether P0 hf ratio moves *toward the matched Original ReAE* without P3 degrading and whether overall brightness/temporal stability remains acceptable. If val13 teacher HF error has plateaued and custom video is unchanged, do not automatically extend to 1000; diagnose student decoder representational ceiling, teacher HF objective and T13-trained/C24-inferred temporal differences. A/B forward Teacher-vs-E99 supervision must be judged with *matched* Original ReAE outputs, not the full original SwiftVR baseline.
