@@ -20,10 +20,10 @@ Ownership: **LIUTIGHE/SwiftVR fork only**; upstream **H-oliday/SwiftVR is read-o
 - M11-B + compressed M9-A1 Decoder **E99** loses much more detail in a phase-dependent manner (Wetland1 global245/P0 weak, global248/P3 relatively strong).
 - Therefore, the **new severe phase-dependent quality loss is primarily attributable to replacing Original ReAE Decoder with compressed A1**, rather than being an intrinsic failure of the M11-B compressed Transformer. This is strong controlled comparative evidence, not an exact mathematical decomposition of every error.
 
-**Three independent sources of quality:**
-1. Transformer capacity / distillation gap: Original full SwiftVR vs M11-B + Original decoder.
-2. Decoder compression gap: M11-B + Original decoder vs SAME M11-B + E99/A1 decoder.
-3. Temporal decoder/system artifact: two-frame luminance variation present even with Original decoder and Original full SwiftVR. Do not equate this with four-phase detail collapse.
+**Three separable observed effects (not proven independent causal mechanisms):**
+1. Transformer compression quality gap: Original full SwiftVR vs M11-B + Original decoder.
+2. Decoder replacement quality gap: M11-B + Original decoder vs SAME M11-B + E99/A1 decoder.
+3. Shared temporal **system** symptom: two-frame luminance fluctuation present in both Original SwiftVR and M11-B + Original decoder. Its exact source remains undetermined; the Encoder, Decoder, latent distribution, and streaming protocol may all be involved. Do not equate this with A1 four-phase detail collapse.
 
 V1 **does not** prove that further training will close all transformer gaps, eliminate ReAE flicker, or deliver original throughput. Any parameter/MAC ratio is **not** an end-to-end speedup.
 
