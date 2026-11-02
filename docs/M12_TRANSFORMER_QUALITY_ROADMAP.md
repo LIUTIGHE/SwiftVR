@@ -1,110 +1,141 @@
-# M12 Roadmap — Transformer Quality Recovery With Original ReAE Kept Intact
+# M12 Roadmap — 500–600G System Milestone, Flicker, and Final Quality Recovery
 
-**Status:** plan only (2026-11-02). No new GPU results, code changes or checkpoints are implied by this document.
-**Scope:** work **only** in the `LIUTIGHE/SwiftVR` fork on `research/m12-transformer-quality-recovery`. Do not touch upstream `H-oliday/SwiftVR`. M11-B 30k stays immutable.
+**Status:** revised research scope, 2026-11-02; plan only. This change does not run experiments, prove quality, modify a checkpoint or change training code.
+**Repository:** `LIUTIGHE/SwiftVR` fork ONLY, branch `research/m12-transformer-quality-recovery`, PR to the fork's own `main`. NEVER edit, push or PR upstream `H-oliday/SwiftVR`.
+**Previous milestone:** `docs/M11B_TRANSFORMER_V1_MILESTONE.md` and merged PR #4.
 
-## 1. Research question and end condition
+## 1. The actual end goal and order of work
 
-**Can we improve M11-B's remaining visual gap to full Original SwiftVR, at an explicit inference-compute budget, while preserving its recovered fine-detail consistency?**
+Our goal is **acceptable visual detail and temporal stability while reaching a WHOLE-SYSTEM 500–600 GFLOPs per emitted RGB frame at the canonical 1080p-class output geometry**. FLOPs are the present primary engineering budget; throughput and CUDA latency are secondary measurements, not a requirement to prematurely discard a good candidate. Use **1 MAC = 2 FLOPs** consistently; explicitly state the 1920×1088 internal compute geometry. The 720p→2160p full-origin visual tests are a separate, more expensive workload and must NEVER inherit the 1080p-class GFLOPs label.
 
-User-provided strong visual result: same full-origin Wetland1/Mangrove1, **M11-B+Original ReAE** is only slightly worse than Original SwiftVR; severe four-phase texture collapse comes from subsequent A1 compression, not the M11-B transformer. Two-frame luminance flicker exists even with Original ReAE and is an **independent issue**.
+**Stage order is not "stop decoder compression, improve Transformer first".** Instead:
+1. **Freeze M11-B bootstrap30k as the current compressed Transformer anchor.**
+2. **Investigate the existing two-frame luminance flicker early** to locate its likely source/interaction and avoid repeating it in decoder distillation; do not assume a particular layer caused it.
+3. **Actively compress / adapt the ReAE decoder** while M11-B stays frozen, prioritizing visually faithful high-frequency detail and avoiding any *additional* temporal artifacts. First test the ALREADY TRAINED Slim100 before building a new network.
+4. **Reach and record a stable 500–600G full-system candidate** with an explicit quality gate. Flicker can be corrected either during decoder adaptation or via a small targeted correction, depending on the diagnostic; do not force a large detour for exhaustive root-cause proofs.
+5. **Only then refine remaining Transformer fine detail and, if needed, jointly adapt Transformer and compressed Decoder** within the same deployment budget.
 
-**Stop condition** for this track: either (a) M11-B quality improves visibly on both fixed custom clips, including previously weak detail frames, without a major motion/temporal regression, at a declared GFLOPs and actual latency; or (b) controlled longer training shows a plateau and a single teacher-target recovery experiment fails, so deeper capacity change is warranted. Do not continually invent defensive micro-ablations.
+The user-observed controlled comparison was: M11-B30k + Original ReAE is only slightly worse than full Original SwiftVR, and severe phase-dependent texture collapse is introduced by M9-A1 compression. Meanwhile **both full Original SwiftVR and M11-B+Original show a two-frame luminance oscillation**. These are separate observations: the fact that both exhibit flicker does NOT prove the Decoder alone caused it; encoder/latent, temporal upsampling, streaming state and interaction may matter.
 
-### Fixed axes
+### Strict baseline labels
 
-- Reference full system: Original SwiftVR, separate original DiT checkpoint and decoder.
-- V1 compressed Transformer: M11-B bootstrap30k (`outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000`).
-- **Decoder always Original ReAE**, specifically the one in `checkpoints_prompt_free_no_time/reae.safetensors`, for every M12 Transformer candidate and its M11-B baseline.
-- The model being optimized is **Transformer only**; avoid reintroducing A1 decoder ambiguities.
-- Maintain single-frame source origin and C24 zero-overlap streaming. Only trained model changes, not inference alignment/protocol or the external TinyCNN baseline.
-- Record **both** all-parameters/active-parameters, theoretical MAC and *measured* CUDA end-to-end latency. Sparse MoE total width is not automatically a speed improvement due to routing/gather/scatter.
+| Label | Transformer | Decoder | Meaning |
+|---|---|---|---|
+| Full Original SwiftVR | original pretrained | original ReAE from full Original model | quality / existing flicker reference |
+| M11-B30k + Original | frozen M11-B30k | original ReAE from `checkpoints_prompt_free_no_time` | best quality seen under Transformer compression; **not** final compute target |
+| M11-B30k + E99 | frozen M11-B30k | M9-A1 E99 | proven lower-compute decoder path with severe four-phase texture loss |
+| M11-B30k + Slim100 | frozen M11-B30k | existing Slim100 teacher-distilled ReAE-family decoder | **new priority candidate, NOT yet validated** |
+| TinyCNN | external AISR | external | external quality/compute reference, not an A1 variant |
 
-## 2. Underused mature methods: ranked, not an unbounded survey
+## 2. Budget opportunity overlooked in earlier discussions
 
-### Priority 1 — Direct teacher endpoint / feature distillation and restoration-target fine-tuning
+The historical repository already contains the **structurally slimmed ReAE decoder** (`swiftvr/models/reae_slim_decoder.py`) and a `Slim100` checkpoint with four stage widths `[256,128,64,64]`. This retains ReAE-family temporal TGrow and causal layout while reducing stage channels, unlike the more aggressive M9-A1 topology. Source: `docs/shared_video_autoencoder.md`, `tools/train_reae_slim_teacher_distill_ddp.py`.
 
-Existing M11-B training largely distills teacher **velocity** from Stage-A/TA caches; velocity/cosine loss is a surrogate for the final restored video. Such a surrogate can plateau while perceptual quality differs. More training of exactly the old surrogate need not close the remaining gap.
+Same-profile component costs at 1920×1088 (GMAC/output frame):
 
-First inspect what *actual* M11-B and Original SwiftVR teacher targets are already cached. **Do not rebuild all caches before checking**. If equivalent teacher/student ReAE latent coordinates are verified, cache aligned Original SwiftVR **restored latent / x0** targets for a representative fixed training subset; train M11-B with its existing velocity target and a small endpoint latent term, with optional frozen Original ReAE-decoded feature/pixel supervision on matched video frames. If latent coordinates or conditioning differ, do not force an invalid `L1(z_student,z_teacher)`; use aligned decoded RGB/feature targets instead, and state conditioning differences.
+| Component | GMAC/frame | Evidence |
+|---|---:|---|
+| M11-B30k Transformer (activated) | 145.5955968 | M11 runtime MAC gate |
+| Frozen ReAE Encoder | ~42.278 | fixed previous encoder profile |
+| Original ReAE Decoder | ~343.108 | historical decoder MAC audit |
+| M9-A1 compact Decoder | ~75.9504 | previous M11 full-system budget |
+| **Slim100 Decoder** | **98.2228992** | `profile_reae_slim_macs.py` analytical |
+| Aggressive Slim Decoder | 86.79211008 | historical analytical option |
 
-A minimal first objective (illustrative only; choose 2-3 established terms, not a 12-loss cocktail):
+Derived end-to-end **MAC sum** (not new integrated profiler proof):
+- M11-B + Encoder + **Original Decoder** ≈ **1061.96 GFLOPs/frame**.
+- M11-B + Encoder + **A1 Decoder** ≈ **527.65 GFLOPs/frame**, but unacceptable texture loss.
+- M11-B + Encoder + **Slim100 Decoder** ≈ **572.19 GFLOPs/frame**, **already INSIDE target budget by estimate**.
+- M11-B + Encoder + **Aggressive Slim Decoder** ≈ **549.33 GFLOPs/frame**, an alternative only if needed after Slim100.
 
-```text
-L_M12 = lambda_velocity * L_velocity(student, existing teacher cache)
-      + lambda_endpoint * L_endpoint(z_student, z_original_teacher)
-      + lambda_quality * L_quality(OriginalDecoder(z_student), reference target)
+For the target 500–600G, a decoder ideally fits **~62.13–112.13 GMAC/frame** (given the fixed M11-B and Encoder costs). Slim100 fits without further Transformer changes.
+
+**Do not infer Slim100 quality on M11-B from earlier validation**: `docs/shared_video_autoencoder.md` reports Slim100 ~36.65 dB / .9715 SSIM *versus Original ReAE teacher* on historical restoration latents and reports a visual artifact audit, but this does not establish full-origin 2160p quality/temporal behavior using M11-B30k `z_SR`. Check local file existence before invoking a test.
+
+**Immediate low-cost decisive experiment:** evaluate pre-existing Slim100 as a drop-in M11-B decoder, not another training sweep:
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+export CUDA_VISIBLE_DEVICES=6
+
+BASE=checkpoints_prompt_free_no_time
+M11B=outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000
+SLIM100=outputs/stage_b1_reae_slim100_teacher_distill/checkpoints/epoch_050_step_00012400/tiny_decoder
+test -f "$SLIM100/model.safetensors"
+test -f "$SLIM100/config.json"
+
+# One scene first; full original clip from frame zero, matched C24 parameters.
+python scripts/inference_custom_components.py \
+  --input ../data/yuv_S_10bit/720p_mp4/S5_Wetland1_1920x1080p444_10bit.mp4 \
+  --output outputs/m11b/M12_Slim100_C24/Wetland1/png \
+  --base-checkpoint "$BASE" \
+  --transformer-checkpoint "$M11B" --transformer-type moe \
+  --decoder-type slim --decoder-checkpoint "$SLIM100" \
+  --upscale 3 --clip-len 24 --dit-overlap 0 \
+  --dtype bfloat16 --attention-backend sdpa --png
 ```
 
-Use direct GT/degraded-input anchors where available to avoid copying teacher artifacts blindly. Consider standard pre-trained feature/perceptual (LPIPS) only if needed for detail; avoid pure pixel L1 dominating again as in T1. Regressing the original teacher's **decoded** temporal brightness pattern may preserve its flicker, so do not frame this as a flicker fix.
+Only if the first scene looks competitive, run **Mangrove1** using the same command with scene/input/output substitutions. Preserve all existing reference PNGs. The existing Original SwiftVR / M11-B+Original / TinyCNN bank can be reused for native ROI comparisons; focus Wetland1 245/P0 and 248/P3 plus playback for luminance jumps. Do not resize ROI for detail judgment. Use `tools/profile_reae_slim_macs.py` and the existing full-system profiling conventions to **validate the combined compute estimate before claiming the budget milestone**.
 
-**Why this is the main next experiment:** it directly optimizes the missed *actual* target while retaining well-initialized M11-B weights, avoids architectural proliferation and reuses established data/provenance infrastructure.
+## 3. Brightness flicker: early diagnosis, not a detached late-stage project
 
-### Priority 2 — Matched continuation / curriculum / data distribution
+**Observed:** Original SwiftVR and M11-B+Original each show two-frame luma fluctuations; the A1 four-phase texture collapse is another failure.
 
-- Inspect actual M11-B 0→30k learning curve, optimizer/schedule and the *existing* output/velocity training teacher, rather than assuming 30k has converged. Compare 15k/30k if still available, then extend **one** controlled quality-recovery run for a modest next budget.
-- Do not turn 30k → 500k without intermediate inspection. Maintain exact-resume hashes; if optimizer/loss/schedule changes, start a **new run initialized from 30k**, identify it as fine-tuning, and do NOT fake checkpoint exact resume.
-- Current paired-data caches: Legacy 15,896 views, UltraVideo 20,088 views (35,984 total); earlier materialization/velocity caches may cover different domains, so inspect rather than assume a drop-in new subset. A 50:50 sampler mixes domains by design, not necessarily the best distribution for Wetland1/Mangrove1.
-- Data expansion is a subsequent lever if a concrete failure mode is visible: add high-quality complex natural textures, camera motion, exposure changes and real-degradation pairs; assess whether synthetic-to-real mismatch, frame clip scale or color processing is driving loss. A targeted subset beats indiscriminate enlargement.
-- Keep evaluation cheap: val13 and training trajectories on a modest cadence, Wetland1/Mangrove1 at meaningful checkpoints only (e.g. before/after a main 2–5k recovery experiment); reuse the Original/E99/TinyCNN fixed bank. Avoid GPU-heavy complete videos at every 125 updates.
+Make one targeted, non-exhaustive attribution pass:
+- Use the SAME full-origin input, phase/time-index convention and native ROI. Measure low-frequency luminance magnitude and two-frame periodicity, particularly across C24 boundaries. Do not call raw consecutive-frame difference a flicker score when real illumination/motion changes.
+- Where an available clean paired video exists, compare **GT-relative low-frequency luma residual**. A small static or smoothly evolving ROI can complement this; do not infer causality from raw high-frequency energy.
+- If feasible, decode the SAME clean-video ReAE encoder latents with Original Decoder once. Flicker in this path would implicate the shared ReAE encoding/decoding temporal path; absent flicker shifts attention toward restored-latent distribution / Transformer–Decoder interaction. It does not individually prove that a single TGrow layer is guilty.
+- Inspect temporal growth, causal warm-up, state reset and phase alignment **only to the extent required by the observation**. We already have TGrow/phase diagnostic code; reuse it, do not invent dozens of new tests.
 
-### Priority 3 — Capacity expansion only if the training targets plateau
+Decision: if flicker can be removed without reducing texture, prefer a narrowly targeted **low-frequency/color gain correction** or a **small decoder temporal fine-tune**. For learned correction, use GT-relative temporal luma residual where paired GT exists and strong texture-preserving anchor; do not directly smooth RGB across moving frames or impose equal output brightness on naturally changing content. If brightness fix requires disrupting high-frequency quality, postpone deployment of the fix and continue decoder fidelity work; do not block the entire system budget milestone with a long root-cause detour.
 
-M11-B V1 depth20, hidden1024, 12 routed experts×576, top2 plus shared. It has a demonstrated quality gap despite ~527.65 GFLOPs/frame measured for **M11-B+encoder+A1** under canonical 1080p-class setup, not yet the exact M11-B+Original runtime. If output-based recovery fails and the loss floor suggests undercapacity:
-- Consider **single controlled wider/deeper student** with transparent budget (e.g. compare fixed ≤530G vs deliberately relaxed higher-cost branch); avoid a large architecture grid.
-- Wider FFN/expert or network depth changes need new initialization/transfer and are not exact optimizer resume.
-- Measure actual latency, peak VRAM and effective MoE utilization; macro FLOPs alone is insufficient.
-- As an orthogonal established compression path, evaluate **weight/activation quantization of a high-quality reference** before another destructive pruning/decoder rebuild. Quantization could reduce bandwidth/storage, but its throughput gains depend on available hardware kernels and are not guaranteed.
+## 4. Decoder compression: next model decisions
 
-### Separate track — Two-frame luminance flicker
+**Priority 1: reuse Slim100** (Section 2). It is a mature, already-trained structure with original-family temporal path. Perform one full-origin matched visual run. If good enough, report the **M11-B30k + Slim100 candidate** and move to targeted flicker repair / validation. Do not replace it with an A1 phase-specific loss cocktail merely because A1 was the latest branch.
 
-The unchanged Original ReAE decoder / streaming protocol also shows a two-frame luminance oscillation. Longer Transformer training may compensate indirectly, but because the artifact survives with the full Original SwiftVR Transformer, **there is no evidence Transformer capacity alone fixes it**.
+**Priority 2: adapt Slim100 to M11-B's actual latent distribution** if it is close but slightly softer. Prior Slim100 teacher distillation was on historical Stage-A `z_SR`, not proven on M11-B `z_SR`. Reuse cached M11-B train/val pairs and teacher Original Decoder outputs if their provenance is verified. Fine-tune Slim100 on M11-B restoration latents, preserving original-family temporal structure and high-frequency response. Use **one established teacher-distillation objective** (e.g. RGB/feature/perceptual teacher anchor with GT-relative low-frequency temporal correction), no arbitrary energy maximization. Include any flicker correction only after measured temporal behavior. A meaningful bounded pilot, one native Wetland/Mangrove gate.
 
-Treat after M12 visual quality recovery as a **small ReAE temporal-decoder correction**:
-- Compare per-frame low-frequency luminance residual relative to paired GT and causal state (not raw interframe frame differences, which punish real lighting/motion).
-- Prefer a tiny phase-aware luminance gain/bias/low-frequency correction or bounded temporal decoder fine-tuning over shrinking/replacing the full decoder.
-- Preserve the Original ReAE high-frequency path. Verify causal inference chunk boundaries and true motion/brightness changes.
-- Do not train A1/T1B to imitate the Original ReAE's brightness oscillation and then claim that this eliminates flicker.
+**Priority 3: only if Slim100 fails materially**, consider the earlier 86.79-GMAC aggressive Slim variant or controlled structured reduction/fine-tuning of expensive original ReAE stages. Prefer architecture-preserving structured slimming + distillation / recovery over a new temporal decoder topology. One new decoder candidate, not a grid.
 
-Literature that motivates *categories*, **not automatically a drop-in implementation**:
-- DiffVSR (ICCV 2025): staged progressive learning separates degradation, content and temporal learning burden. https://openaccess.thecvf.com/content/ICCV2025/html/Li_DiffVSR_Revealing_an_Effective_Recipe_for_Taming_Robust_Video_Super-Resolution_ICCV_2025_paper.html
-- Improved Video VAE (CVPR 2025): group causal convolutions address temporal compression phase imbalances and flicker in video decoders; the ReAE implementation and temporal topology must be checked first. https://openaccess.thecvf.com/content/CVPR2025/papers/Wu_Improved_Video_VAE_for_Latent_Video_Diffusion_Model_CVPR_2025_paper.pdf
-- Q-VDiT (ICML 2025) and QuantSparse (ICLR 2026): established quantization / distillation alternatives for video DiT; not evidence of free speedups in SwiftVR. https://proceedings.mlr.press/v267/feng25q.html and https://proceedings.iclr.cc/paper_files/paper/2026/hash/94359ca6e248af69b8b6854668ae9782-Abstract-Conference.html
+**Stop condition for budget stage**: a 500–600G candidate with acceptable native fine detail and manageable temporal artifacts on Wetland1/Mangrove1, and a profiler report with explicit model identities and 1080p-class geometry. If neither existing Slim nor one adapted variant can preserve quality, record a clear capacity/decoder-training limitation before revisiting architecture. Do not require beating Original SwiftVR in both quality and FPS before recording a valid compute milestone.
 
-## 3. Concrete M12 experimental sequence — four meaningful decisions
+## 5. Final quality optimization after the whole-system budget gate
 
-| Stage | Work | Check / decision |
+With **compact Decoder and compute budget locked**, assess remaining Transformer detail gap (compared fairly with Original Decoder and the compressed decoder variants). Then explore the proven standard recovery tools:
+- **Output/endpoint or feature distillation** in addition to existing TA/Stage-A velocity supervision; first verify teacher/student latent-coordinate and conditioning alignment; otherwise distill in an aligned decoded RGB/feature domain. Do not blindly copy teacher flicker.
+- One bounded fine-tune of M11-B from 30k to correct remaining detail, then selectively expand image/video data (textures, motion, realistic degradations) **only if** actual native-video failure motivates it.
+- **Selective joint Transformer + compressed decoder adaptation** if fixing one block in isolation cannot recover details; maintain same inference architecture and 500–600G profile.
+- Only then consider budget reallocation or quantization as an alternative; quantization usually reduces precision/storage/bandwidth, **not MAC-count FLOPs under this profiling convention**. It may aid deployment speed later, but does not count as a 500–600G MAC budget reduction by itself.
+
+This retains the valuable mature endpoint/feature KD ideas from the previous M12 draft but **corrects their order**. A long Transformer-only quality sweep is no longer the immediate next experiment.
+
+## 6. Compact experiment sequence and gates
+
+| Gate | Action | Success / next decision |
 |---|---|---|
-| M12-0: package baseline | Inspect trained M11-B30k run config, teacher cache provenance, current inference scripts; if necessary record current matched M11-B+Original vs full Original SwiftVR native samples and actual latency | **No new architecture/training.** Lock exact baseline inputs and compute. |
-| M12-1: one quality-recovery run | Fine-tune M11-B30k with output/endpoint-aligned Original teacher guidance plus conservative existing velocity objective; stage as **fresh run initialized from 30k** if any settings differ | Compare a small but meaningful budget (around 2–5k updates, not 500k); look at paired loss trend and same two custom videos. |
-| M12-2: if learning continues | Extend only the best version and selectively diversify texture/motion/degradation data | Main quality gain visible on Wetland1 **and** non-regression on Mangrove1; no major new temporal artifacts. |
-| M12-3: if plateau | One budget-relaxed Transformer or quantization of a high-quality checkpoint, chosen based on whether capacity or deployment FLOPs/VRAM is the bottleneck | State target GFLOPs/latency and compare to M12-1, avoiding dozens of grid runs. |
+| M12-0: flicker & compute | One focused two-frame luma/source check with Original and M11-B+Original; verify 1080p-class MAC component budget | Record likely artifact locus and safe loss target, without claiming a unique root cause |
+| M12-1: Slim100 drop-in | Frozen M11-B30k + existing Slim100 checkpoint; full Wetland1 then Mangrove1; matched bank comparisons | If fidelity acceptable, candidate ~572G → confirm integrated compute |
+| M12-2: preserve detail & correct flicker | If necessary, short Slim100 fine-tune on exact M11-B restored latents, small temporal/luma correction or one architecture-preserving slimmer decoder | Stable 500–600G candidate; no A1 four-phase texture collapse; record residual two-frame flicker |
+| M12-3: final detail recovery | Once system compute gate is reached, output-aware M11-B recovery + optional selective joint decoder adaptation / data expansion | Move toward Original SwiftVR detail without leaving budget |
 
-Then, and only then, pursue the separate ReAE **two-frame flicker** correction track, unless temporal defect actively prevents quality selection.
+Do not turn the gate table into mandatory weeks of experiments: if pre-existing Slim100 already meets quality and cost, record it and skip optional decoder sweeps. Visual failures drive next work, not fear of hypothetical reviewer objections.
 
-## 4. Training and validation implementation rules
+## 7. Implementation, server and new-chat handoff constraints
 
-1. **Do not modify a source file participating in an active checkpoint fingerprint**, especially `tools/train_b2b_moe_ta_distill_ddp_cache_safe.py` / relevant objective/teacher cache modules; a GitHub PR does not require immediate sync to an occupied school GPU server.
-2. Reuse existing trainer/cache contracts where practical; only add a new trainer when the actual objective/gradient/data interfaces materially differ. No arbitrary file renaming or deleting old experiments.
-3. For the M12-1 run, *first* prove teacher/output alignment and end-to-end gradient reaches only the intended Transformer. Then run one short GPU smoke, then proceed to the bounded quality recovery. This is a correctness gate, not a request for hundreds of adversarial microtests.
-4. Save at moderate cadence and keep enough checkpoints to compare the actual learning trend. Use fresh run directories; preserve M11-B baseline and prior T1 data.
-5. Do **not** place two full restored 249-frame 2160p videos inside every val13 step. Run custom full-origin comparisons less frequently and outside the training GPU process when needed; reuse bank identity and exact frame origins.
-6. Any result table must distinguish frozen teacher (Original complete SwiftVR vs M11-B+Original ReAE), latent targets, decoder version, source GT availability, MAC convention, measured runtime and source code hash.
-7. A simple, measurable success on the two representative videos is more useful than a long speculative sweep.
+1. Read `docs/M11B_TRANSFORMER_V1_MILESTONE.md`, `docs/m11_transformer_budget_gate.md`, `docs/shared_video_autoencoder.md`, `swiftvr/models/reae_slim_decoder.py`, then this document. Keep checkpoint and baseline names exact. Check actual trained checkpoint presence; docs only give a historical path.
+2. Preserve `M11-B 30k` and **Original ReAE** reference; create fresh outputs only. All decoder training is from a fresh run if optimizer, source hashes or objectives change; no spoofing checkpoint resume lineages.
+3. If running on the shared school GPU server, DO NOT replace files participating in active source-hash checkpoint validation or change git branches during live training. Remote GitHub doc edits do not update the offline server.
+4. Reuse `scripts/inference_custom_components.py --decoder-type slim`, existing ReAE Slim profiler, source bank, prior A1 / original references. Do not create duplicate new scripts for one-off comparisons.
+5. Keep the distinction between M11-B+Original vs complete Original SwiftVR, especially when assigning a Teacher.
+6. Evaluate actual native frames and temporal playback; where GT is available report GT-aligned PSNR/SSIM/LPIPS. Native clips without GT are **not** quantitative image-quality proof. The external TinyCNN uses historical length-normalized ordinal alignment, not verified PTS alignment.
+7. In M12, the **target is total ~500–600 GFLOPs/frame** at the canonical 1080p-class output. End-to-end latency/throughput measured alongside but **secondary** to matching the compute band and usable quality.
+8. Keep PR #5 document edits and future commits **only on LIUTIGHE/SwiftVR**; no actions against `H-oliday/SwiftVR`, no upstream PR. Avoid deleting legacy trials or force-pushing.
 
-## 5. First instructions for a new chat / Codex agent
+## 8. What remains unproven
 
-- Read `docs/M11B_TRANSFORMER_V1_MILESTONE.md` plus this document and `docs/m11_transformer_budget_gate.md`.
-- Summarize existing M11-B training objective and teacher-cache coverage from **real code/config**, not assumed from this planning document.
-- Decide exactly **one** supervised teacher endpoint route with matching latent/decoder provenance; if in doubt show the specific mismatch rather than guessing.
-- Make a compact plan: (1) aligned-target check, (2) one smoke/gradient gate, (3) bounded fine-tuning on M11-B+Original, (4) full-origin Wetland1/Mangrove1 visual gate.
-- Avoid premature continuation of A1/T1/T1B, long 500k schedules or numerous phase-conditioned texture losses.
-- All commits/PRs go to **LIUTIGHE/SwiftVR only**, branch `research/m12-transformer-quality-recovery`, targeting **fork main**, never upstream.
-
-## 6. What remains unknown
-
-- Actual Original vs M11-B end-to-end matched CUDA latency and FFN router overhead at each resolution.
-- Whether the Original SwiftVR *teacher latents* share exact encoder, condition, timestamp and scale coordinates with M11-B restored latents. Must check before direct latent KD.
-- What the recent long T1B-A continuation finally produced (reported to show little numerical effect, no terminal val record here).
-- Whether M11-B+Original brightness flicker is fully decoder-caused versus a decoder/latent interaction. Current comparison supports keeping the issues separate but does not isolate root cause.
-- Whether any new objective will improve real-custom video quality without GT; success must be confirmed in real native-resolution visual playback.
+- Where the two-frame flicker originates (Decoder temporal topology, encoder / streaming state, latent distribution or interaction). The current controlled comparison does not identify a unique cause.
+- Whether the historical Slim100 checkpoint exists in the active runtime and generalizes to M11-B30k full-origin clips.
+- Whether a good 500–600G system can also remove the inherited two-frame brightness oscillation without harming detail; preserving/fixing it is a measurable quality goal, not an assumed property.
+- Whether output-aware Transformer fine-tuning / joint adaptation will yield visible quality improvement once the compact decoder is in use.
+- The final end-to-end latency and full-system profiler result for M11-B+Slim100, though component-level arithmetic places it within budget.
