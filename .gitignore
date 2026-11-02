@@ -1,0 +1,39 @@
+# Research-run outputs: keep local data, checkpoints, and results OUT of Git.
+# These patterns do not remove local files; Git tracks existing files as before.
+/outputs/
+/checkpoints/
+/checkpoints_*/
+/data/
+/datasets/
+/logs/
+/runs/
+/wandb/
+/tensorboard/
+/local_configs/
+
+# Local environments and compilation artifacts
+/.venv/
+/venv/
+/conda_envs/
+/miniforge3/
+/__pycache__/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local scratch (only root-level scratch, never source modules)
+/tmp/
+/scratch/
+/*.log
+/*.tmp
+*.safetensors.tmp
+*.pt.tmp
+*.pth.tmp
+
+# Editors and local host configuration
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,4 @@
+# Optional evaluation dependencies; keep separate from the training runtime.
+# Pinned for reproducible LPIPS / DISTS / MUSIQ definitions and weights.
+pyiqa==0.1.15
+tensorboard>=2.15,<3
