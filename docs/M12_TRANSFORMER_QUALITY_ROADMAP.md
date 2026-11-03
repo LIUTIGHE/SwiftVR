@@ -78,6 +78,63 @@ python scripts/inference_custom_components.py \
 
 Only if the first scene looks competitive, run **Mangrove1** using the same command with scene/input/output substitutions. Preserve all existing reference PNGs. The existing Original SwiftVR / M11-B+Original / TinyCNN bank can be reused for native ROI comparisons; focus Wetland1 245/P0 and 248/P3 plus playback for luminance jumps. Do not resize ROI for detail judgment. Use `tools/profile_reae_slim_macs.py` and the existing full-system profiling conventions to **validate the combined compute estimate before claiming the budget milestone**.
 
+### M12-1 executable four-way observation gate (2026-11-03)
+
+Implementation is now staged in PR #5, with **no training/model modifications**:
+- `tools/m12_slim100_fourway.py`: render Slim100 with **frozen M11-B** only if it is not already available under the exact recorded provenance; verify the reused M11-B+Original full-origin PNG reference; create a lossless native-ROI 2×2 FFV1 four-way video and selected native PNGs.
+- `tests/test_m12_slim100_fourway.py`: CPU functional check for 4-way order, real crop geometry, AISR ordinal frame map, and no overwrite.
+
+**Specified four-way order (do not substitute the old LQ four-way):**
+
+```text
+┌────────────────────────────────┬────────────────────────────────┐
+│ Original SwiftVR               │ AISR baseline / TinyCNN         │
+├────────────────────────────────┼────────────────────────────────┤
+│ M11-B 30k + Original ReAE      │ M11-B 30k + Slim100             │
+└────────────────────────────────┴────────────────────────────────┘
+```
+
+This uses the **existing reference bank** and the **already generated M11-B + Original Decoder outputs** from the prior three-way test. The previously provided output layout was `outputs/m11b/M11B30K_OriginalDecoder_Comparison/<scene>/M11B_Original/png`; if the actual saved reference is elsewhere, point `--m11b-original-root` to a directory with that same scene layout. Never regenerate Original SwiftVR or TinyCNN. If the bank or M11-B+Original reference is missing, the program fails before GPU inference rather than guessing.
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+export CUDA_VISIBLE_DEVICES=6
+
+python -m py_compile tools/m12_slim100_fourway.py
+python -m unittest discover -s tests -p 'test_m12_slim100_fourway.py' -v
+
+# First observe Wetland1 alone; if good, remove "--scenes Wetland1"
+# (or repeat with both scenes: completed Wetland1 will be reused).
+python tools/m12_slim100_fourway.py \
+  --reference-bank outputs/custom/p1_reference_v1 \
+  --m11b-original-root outputs/m11b/M11B30K_OriginalDecoder_Comparison \
+  --slim-root outputs/m11b/M12_Slim100_C24 \
+  --output-root outputs/m11b/M12_Slim100_C24/fourway \
+  --slim-checkpoint outputs/stage_b1_reae_slim100_teacher_distill/checkpoints/epoch_050_step_00012400/tiny_decoder \
+  --transformer-checkpoint outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000 \
+  --base-checkpoint checkpoints_prompt_free_no_time \
+  --scenes Wetland1
+```
+
+Then run the same full command WITHOUT `--scenes Wetland1` to include Mangrove1. Outputs, never replacing prior E99/T1/T1B:
+
+```text
+outputs/m11b/M12_Slim100_C24/
+  Wetland1/{png/,inference.log,provenance.json}
+  Mangrove1/{png/,inference.log,provenance.json}
+  fourway/
+    Wetland1/{native_fourway.mkv,native_fourway_000245_p0.png,
+              native_fourway_000248_p3.png,summary.json,ffmpeg.log}
+    Mangrove1/{native_fourway.mkv,native_fourway_*.png,summary.json,ffmpeg.log}
+```
+
+Four videos share a **common full input origin**, 249 output frames, exact native output geometry and fixed `(960,540,960,960)` ROI from the bank. The ROI panels are never spatially resized; FFV1 is lossless for the cropped **8-bit RGB** displays. AISR/TinyCNN uses the established length-normalized decoded ordinal index (not independently verified timestamps). This is a **visual/temporal quality check, not GT PSNR/SSIM**. Judge P0/245 texture vs P3/248, the spatial detail of Slim100 relative to M11-B+Original, and the inherited two-frame brightness oscillation at natural FPS. Original SwiftVR is the complete original model; M11-B+Original is a different Transformer with original-family ReAE.
+
+**Progress gate:** If Slim100 closely preserves Original Decoder texture and has no unacceptable added temporal instability, confirm system compute near ~572G using the existing independent profiler, then progress to temporal correction or targeted adaptation. If Slim100 reproduces A1-like loss, do *not* immediately repeat a long brute-force train; check the M11-B latent distribution gap and choose one bounded decoder adaptation.
+
+---
+
 ## 3. Brightness flicker: early diagnosis, not a detached late-stage project
 
 **Observed:** Original SwiftVR and M11-B+Original each show two-frame luma fluctuations; the A1 four-phase texture collapse is another failure.
