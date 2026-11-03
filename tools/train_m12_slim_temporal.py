@@ -187,8 +187,8 @@ def evaluate(student, reae, val, lpips, *, device, dtype, a, step):
         terms, pred, original = paired_loss(student, reae, z, gt, lpips, a)
         quality.update(pred.float(), gt.float(), clamp=True)
         original_quality.update(original.float(), gt.float(), clamp=True)
-        for name, val in terms.items():
-            totals[name] = totals.get(name, 0.0) + float(val.detach())
+        for name, value in terms.items():
+            totals[name] = totals.get(name, 0.0) + float(value.detach())
     student.train()
     result = {
         "step": step, "samples": len(val),
