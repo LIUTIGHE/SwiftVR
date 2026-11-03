@@ -72,6 +72,11 @@ A direct, read-only visual comparison of Original SwiftVR / M11-B+Original / Tin
 
 The old M11-B+E99/A1 ~527.648 GFLOPs/frame figure establishes the *cost feasibility* of aggressive decoder compression, **not acceptable decoder quality**. The heavier M11-B+Original path is the texture and temporal reference, not the expected final 500–600G deployment configuration.
 
+### M12-1 Slim100 outcome and M12-2 priority (user-reported 2026-11-03)
+
+Native four-way review of **M11-B30k + Slim100** against complete Original SwiftVR, external AISR/TinyCNN and **the same M11-B30k + Original ReAE**: Slim100 shows only modest per-frame texture loss, but the small Transformer and Decoder detail deficits **visibly accumulate**, and the most pressing defects are **brightness oscillation and mild temporal detail jitter**. This is a visual observation, **not evidence that Slim100 has passed a temporal-stability or paired-GT quality threshold**. Preserve M11-B30k + Slim100 as the primary ~572G (component-sum estimate) system candidate; do not restart A1 or widen the decoder grid prematurely. **First diagnose inherited vs Slim-added temporal error; then run one Slim100-only, teacher-detail-anchored and GT-relative temporal-luma adaptation** using already completed D1 M11-B latent/GT caches. The historic Slim100 teacher-temporal imitation objective can copy the Original ReAE's brightness oscillation; teacher temporal matching alone is insufficient as a flicker-removal target. Keep final Transformer detail recovery after the compact system's temporal/compute gate. Details: `docs/M12_TRANSFORMER_QUALITY_ROADMAP.md`.
+
+
 References inside repo: `docs/m11_transformer_budget_gate.md`, `docs/m11b_s1_d0.md`, `docs/m11b_s1_d1.md`, `docs/m11b_s1_t1.md`, `docs/m11b_s1_t1b.md`, `docs/REPOSITORY_LIFECYCLE.md`.
 
 ## Handoff to a new chat / coding agent
