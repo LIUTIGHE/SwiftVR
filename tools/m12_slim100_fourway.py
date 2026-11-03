@@ -43,7 +43,8 @@ def _contiguous_pngs(source: FrameSource, count: int) -> None:
     if source.kind != "images":
         raise ValueError(f"Expected native PNG sequence, got {source.path}")
     names = [p for p in source.files if p.suffix.lower() == ".png"]
-    if len(names) != count or sorted(int(p.stem) for p in names) != list(range(count)):
+    if (len(source.files) != count or len(names) != count
+            or sorted(int(p.stem) for p in names) != list(range(count))):
         raise ValueError(f"Noncontiguous or incomplete {count}-frame PNG sequence: {source.path}")
 
 
@@ -219,6 +220,7 @@ def main() -> None:
         "transformer_config": args.transformer_checkpoint / "transformer/config.json",
         "slim_decoder": args.slim_checkpoint / "model.safetensors",
         "slim_config": args.slim_checkpoint / "config.json",
+        "inference_script": ROOT / "scripts/inference_custom_components.py",
     }
     fingerprint = {
         name: {"path": str(path.resolve()), "sha256": _hash_file(path)}
