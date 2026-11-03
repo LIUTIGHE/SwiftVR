@@ -205,6 +205,71 @@ L = lambda_rgb * robust(S - T)
 
 **One smoke + one bounded pilot** on real D1 batches, fresh training output initialized from Slim100; preserve original Adam/RNG fingerprints and never pretend that it is an exact resume from historical Stage-B Slim training. Validate numerical finiteness and trainable Slim100 gradients, then evaluate on the same untouched full-origin two-video gate and existing quality references. Modest learning-rate/step budget informed by the old Slim trainer, not 500k updates. **Do not optimize an ungrounded 2-frame brightness correction by assuming a known fixed phase or forcing adjacent frames equal.**
 
+### M12-2 runnable implementation (new, not yet GPU-validated)
+
+Three new files in fork PR #5:
+- `swiftvr/training/m12_slim_objective.py`: teacher RGB Charbonnier + high-frequency teacher L1 + optional **local** AlexNet LPIPS + paired-GT **low-frequency luminance residual temporal L1**. The temporal term compares **prediction minus GT**, not prediction to the teacher's brightness oscillation. Adjacent temporal pairs are selectively masked when a conservative GT color-histogram cut gate detects a discontinuity. It is NOT a proven cut detector; check masked-pair fraction and genuine high-motion samples.
+- `tools/train_m12_slim_temporal.py`: **single CUDA GPU only**, immutable D1 paired-cache loader, balanced Legacy/Ultra sampling, frozen Original ReAE teacher, FP32 trainable Slim100, BF16 inference/autocast, exact source/data/optimizer/RNG checkpoint resume, 13-frame paired val13 and teacher/GT metrics.
+- `tests/test_m12_slim_temporal.py`: CPU checks for natural motion not being penalized by the GT-relative temporal term, teacher-only gradient direction, cut masking, historical data contract, and source safety.
+
+**No new Transformer inference/cache is required.** The first run is an A/B *before/after* quality gate, not a search over losses/weights. Run tests and a 2-update smoke, using separate never-reused output roots:
+
+```bash
+cd /data1/a/SwiftVR
+conda activate swiftvr
+python -m py_compile \
+  swiftvr/training/m12_slim_objective.py \
+  tools/train_m12_slim_temporal.py \
+  tests/test_m12_slim_temporal.py
+python -m unittest discover -s tests -p 'test_m12_slim_temporal.py' -v
+
+export CUDA_VISIBLE_DEVICES=6
+M11B=outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000
+SLIM=outputs/stage_b1_reae_slim100_teacher_distill/checkpoints/epoch_050_step_00012400/tiny_decoder
+D1=outputs/m11b/M11B-S1-D1
+BASE=checkpoints_prompt_free_no_time
+LPIPS=outputs/local_weights/lpips_alex_complete.pt
+
+COMMON=(
+  --m11b-checkpoint "$M11B" --slim-init "$SLIM"
+  --base-checkpoint "$BASE"
+  --legacy-train "$D1/legacy_train_full"
+  --ultra-train "$D1/ultra_train_full"
+  --legacy-val "$D1/legacy_val13"
+  --lpips-weights "$LPIPS" --path-root .
+  --dtype bfloat16 --batch-size 1 --gradient-accumulation-steps 8
+  --num-workers 2 --learning-rate 1e-5 --warmup-steps 50
+  --schedule-steps 2000 --save-every 125 --validate-every 125
+)
+
+python tools/train_m12_slim_temporal.py "${COMMON[@]}" \
+  --output-dir outputs/m11b/M12-S2-SlimTemporal/smoke2_v1 \
+  --smoke-steps 2
+# ONLY after the smoke's summary.json reports status=smoke_pass:
+python tools/train_m12_slim_temporal.py "${COMMON[@]}" \
+  --output-dir outputs/m11b/M12-S2-SlimTemporal/pilot500_v1 \
+  --max-steps 500
+```
+
+For an interrupted pilot, resume **only** from its own step checkpoint with **identical original arguments** plus `--resume`. Changing learning rate schedule, loss weights or source files invalidates resume; `max_steps`, `resume`, and `smoke_steps` are the only intentionally excluded lineage fields. Never force-bypass provenance.
+
+GPU acceptance: smoke must yield finite/nonzero Slim100 gradients and `m11b_updated=false`. Inspect `validation/step_00000000.json`, `step_00000125.json`, `step_00000250.json`, `step_00000375.json`, `step_00000500.json`. Val13 does NOT authorize a quality pass. The new checkpoint at `pilot500_v1/checkpoints/step_00000500/tiny_decoder` follows standard `SlimReAEDecoder.save_pretrained` config + weights and can be passed to `scripts/inference_custom_components.py --decoder-type slim` without modifying inference code.
+
+Then use **existing M12-1 four-way utility**, pointing at a fresh result directory and the new trained decoder checkpoint:
+
+```bash
+RUN=outputs/m11b/M12-S2-SlimTemporal/pilot500_v1
+OUT=outputs/m11b/M12_Slim100_Temporal500_C24
+python tools/m12_slim100_fourway.py \
+  --reference-bank outputs/custom/p1_reference_v1 \
+  --m11b-original-root outputs/m11b/M11B30K_OriginalDecoder_Comparison \
+  --slim-root "$OUT" --output-root "$OUT/fourway" \
+  --slim-checkpoint "$RUN/checkpoints/step_00000500/tiny_decoder" \
+  --transformer-checkpoint "$M11B" --base-checkpoint "$BASE"
+```
+
+The fourth panel represents **fine-tuned Slim100**, not the original Slim100 initial checkpoint. Compare its `native_fourway.mkv` with previously rendered pretraining M12-1 video, **especially Wetland1 frame173–248 high motion**, stable pre-cut and Mangrove1. Do NOT measure a flicker penalty across the real Wetland1 frame162→163 scene cut. If no tangible visual improvement, stop this loss rather than automatically extending to 500k.
+
 ### Stop criteria and downstream decisions
 
 - **Accept the M12-2 checkpoint** only if it decreases visible brightness jumping and detail jitter in actual-speed Wetland1/Mangrove1 playback **without perceptible new texture flattening**, with paired-val GT quality not collapsing, and the underlying decoder stays ~98.223 GMAC/frame (architecture unchanged).
@@ -212,7 +277,7 @@ L = lambda_rgb * robust(S - T)
 - If GT-relative temporal residual improves numerically but motion detail becomes smeared, reject the checkpoint; change the temporal reference/occlusion treatment rather than weight sweeping.
 - After a stable ~572G candidate and integrated compute report, perform M12-3 Transformer endpoint/feature quality restoration or minimal Transformer–Decoder co-adaptation only if the residual texture gap justifies it.
 
-**Engineering constraints:** add a dedicated M12-2 trainer only when the existing Slim and D1 loaders demonstrably cannot accommodate a new loss cleanly. No edits to historical `tools/train_reae_slim_teacher_distill_ddp.py` or to active source-hash resume code. No source modifications have been made to train this objective yet. PR #5 remains the M12 work branch, fork only.
+**Engineering constraints:** an independent minimal M12-2 trainer is now implemented in PR #5 because the legacy teacher-only Slim trainer cannot consume D1 paired M11-B latents + GT-relative temporal targets as-is. No edits were made to historical `tools/train_reae_slim_teacher_distill_ddp.py`, T1/T1B trainers, or to active source-hash resume code. PR #5 remains the M12 work branch, fork only.
 
 ---
 
