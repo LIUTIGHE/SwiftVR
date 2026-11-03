@@ -144,6 +144,14 @@ User's direct four-way review: **M11-B 30k + Slim100** is modestly softer than *
 2. **New Slim100-specific component** (brightness/texture deviations with the SAME M11-B latent), if present.
 3. **Moving detail instability**, potentially involving occlusion, geometric alignment and temporal decoder behavior. It is not the same as the earlier A1 P0/P3 four-phase texture loss.
 
+### Confirmed Wetland1 high-motion failure regime (user visual clarification, 2026-11-03)
+
+The 249-frame Wetland1 source has a **real shot cut near output frame 163**: a relatively steady, distant aerial view changes to a close, fast fly-over. The brightness drop around 162→163 is attributable at least in substantial part to the changed *scene contents*, so **exclude that cross-shot transition** from flicker loss, derivative statistics, and claims of decoder malfunction. Do not interpret a scene cut as a brightness-fluctuation failure by itself.
+
+In the subsequent **frame173–248 high-motion shot**, the already examined per-frame `frames.csv` shows persistent phase-correlated ROI luma variations in **both** M11-B+Original and M11-B+Slim100, while Slim100 has extra phase-dependent detail loss. The two are not identical errors; dynamic texture/ROI movement can alias into uncompensated frame luminance and HF statistics. Label this a **high-motion/scene-content-conditioned failure case**, not proof of decoder-only root cause or of a universal 2-frame oscillation.
+
+**Actionable M12-2 acceptance gate:** use stable pre-cut frames as a non-regression reference and the sustained post-cut fly-over as the *primary* hard case. Ignore the shot boundary itself when comparing consecutive frames or computing GT-relative temporal loss; ensure training pairs spanning independently detected cuts are masked, not smoothed. Motion-aware detail consistency (warped GT / occlusion masking) is only a follow-on if the first Slim100 adaptation preserves static texture but moving features still shimmer. Keep the initial implementation small: one focused short-section evaluation and one bounded training pilot, not a cut-detection research subproject.
+
 The phrase "two-frame brightness flicker" is an *observation*, not a proved **mathematical period-2** signal. Determine whether it is 2-period alternating frames or a 4-period two-bright/two-dark pattern, and inspect C24 chunk-boundary effects. Neither a phase spectrum nor a local TGrow weight statistic alone establishes causality.
 
 ### First gate: reuse the existing paired-output diagnostic, zero GPU inference
