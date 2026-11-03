@@ -1,6 +1,6 @@
 # M12 Roadmap — 500–600G System Milestone, Flicker, and Final Quality Recovery
 
-**Status:** revised research scope, 2026-11-02; plan only. This change does not run experiments, prove quality, modify a checkpoint or change training code.
+**Status:** M12-1 inference/comparison code prepared in Draft PR #5 (2026-11-03); school-server CPU/GPU tests and native-video quality review are still pending. No model weights, trainer, or historical checkpoints have been modified.
 **Repository:** `LIUTIGHE/SwiftVR` fork ONLY, branch `research/m12-transformer-quality-recovery`, PR to the fork's own `main`. NEVER edit, push or PR upstream `H-oliday/SwiftVR`.
 **Previous milestone:** `docs/M11B_TRANSFORMER_V1_MILESTONE.md` and merged PR #4.
 
