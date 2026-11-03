@@ -129,7 +129,11 @@ def identity_config(a):
         Path(__file__).resolve(),
         ROOT / "swiftvr/training/m12_slim_objective.py",
         ROOT / "swiftvr/training/m11b_decoder_pairs.py",
+        ROOT / "swiftvr/training/forward.py",
+        ROOT / "swiftvr/training/m8_task.py",
         ROOT / "swiftvr/models/reae_slim_decoder.py",
+        ROOT / "swiftvr/models/reae.py",
+        ROOT / "tools/m11b_s1_d1_cache.py",
         ROOT / "tools/train_m11b_s1_t1b_decoder.py",
     ]
     for path in paths:
