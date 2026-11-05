@@ -205,25 +205,28 @@ L = lambda_rgb * robust(S - T)
 
 **One smoke + one bounded pilot** on real D1 batches, fresh training output initialized from Slim100; preserve original Adam/RNG fingerprints and never pretend that it is an exact resume from historical Stage-B Slim training. Validate numerical finiteness and trainable Slim100 gradients, then evaluate on the same untouched full-origin two-video gate and existing quality references. Modest learning-rate/step budget informed by the old Slim trainer, not 500k updates. **Do not optimize an ungrounded 2-frame brightness correction by assuming a known fixed phase or forcing adjacent frames equal.**
 
-### M12-2 runnable implementation (new, not yet GPU-validated)
+### M12-2 runnable implementation: four-GPU DDP, full 6,000-step training
 
-Three new files in fork PR #5:
-- `swiftvr/training/m12_slim_objective.py`: teacher RGB Charbonnier + high-frequency teacher L1 + optional **local** AlexNet LPIPS + paired-GT **low-frequency luminance residual temporal L1**. The temporal term compares **prediction minus GT**, not prediction to the teacher's brightness oscillation. Adjacent temporal pairs are selectively masked when a conservative GT color-histogram cut gate detects a discontinuity. It is NOT a proven cut detector; check masked-pair fraction and genuine high-motion samples.
-- `tools/train_m12_slim_temporal.py`: **single CUDA GPU only**, immutable D1 paired-cache loader, balanced Legacy/Ultra sampling, frozen Original ReAE teacher, FP32 trainable Slim100, BF16 inference/autocast, exact source/data/optimizer/RNG checkpoint resume, 13-frame paired val13 and teacher/GT metrics.
-- `tests/test_m12_slim_temporal.py`: CPU checks for natural motion not being penalized by the GT-relative temporal term, teacher-only gradient direction, cut masking, historical data contract, and source safety.
+Implementation in **fork Draft PR #5**:
+- `swiftvr/training/m12_slim_objective.py`: Original decoder RGB/high-frequency/perceptual details plus **GT-relative** low-frequency luminance temporal error; a conservative GT histogram gate masks cross-shot pairs. No raw temporal RGB smoothing, no phase-constant correction.
+- `tools/train_m12_slim_temporal.py`: **single-node 4-GPU torchrun DDP**, with one Slim100 per GPU, rank-sharded 50:50 Legacy/Ultra cache sampling, `no_sync()` during gradient accumulation, rank0 val13 and output writing, rank-averaged metrics, checkpoint with all ranks' RNG and exact source/data/scheduler/world/batch resume fingerprint. The M11-B Transformer and ReAE Encoder are **NOT** instantiated or fine-tuned.
+- `tests/test_m12_slim_temporal.py`: CPU checks of the loss and per-rank sampler/DDP invariants. Server GPU smoke and training results remain **unverified** in this PR.
 
-**No new Transformer inference/cache is required.** The first run is an A/B *before/after* quality gate, not a search over losses/weights. Run tests and a 2-update smoke, using separate never-reused output roots:
+**Why extend from the old 500-step plan:** motion-conditioned brightness and high-frequency texture consistency is not a trivial teacher imitation loss. A premature 500-step visual gate risks stopping before the learned decoder adapts. At **4 GPUs × batch1 × accumulation8 = global batch32**, 6,000 optimizer steps sample about **192,000 video views** (Legacy/Ultra balanced by sampler). This is ~5.34× the 35,984-view dataset size in raw draws, **not 5.34 unique epochs**. Keep 1e-5 learning rate for cautious adaptation, 200-step warmup, 6,000-step cosine schedule. Keep all architecture/channel widths intact, so the **historically estimated** full-system cost remains ~572.19 GFLOPs per 1080p-class output frame.
+
+**Do not resume a prior single-GPU M12 run into a 4-GPU run.** World size and global batch are part of the immutable identity; a fresh 4-rank run is required. Similarly, because the trainer's source hash changed, a smoke or checkpoint produced from the previous single-GPU implementation must be treated as a separate experiment.
+
+Preflight (sync only **the new M12 files**; do not switch server branches during active experiments):
 
 ```bash
 cd /data1/a/SwiftVR
 conda activate swiftvr
-python -m py_compile \
-  swiftvr/training/m12_slim_objective.py \
-  tools/train_m12_slim_temporal.py \
-  tests/test_m12_slim_temporal.py
+python -m py_compile tools/train_m12_slim_temporal.py \
+  swiftvr/training/m12_slim_objective.py tests/test_m12_slim_temporal.py
 python -m unittest discover -s tests -p 'test_m12_slim_temporal.py' -v
 
-export CUDA_VISIBLE_DEVICES=6
+# Select your FOUR available GPUs. LOCAL_RANK 0..3 maps within this list.
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 M11B=outputs/b2b/m11b_stagea_ultra_bootstrap30k_v1/checkpoints/step_00030000
 SLIM=outputs/stage_b1_reae_slim100_teacher_distill/checkpoints/epoch_050_step_00012400/tiny_decoder
 D1=outputs/m11b/M11B-S1-D1
@@ -231,44 +234,60 @@ BASE=checkpoints_prompt_free_no_time
 LPIPS=outputs/local_weights/lpips_alex_complete.pt
 
 COMMON=(
-  --m11b-checkpoint "$M11B" --slim-init "$SLIM"
-  --base-checkpoint "$BASE"
+  --m11b-checkpoint "$M11B" --slim-init "$SLIM" --base-checkpoint "$BASE"
   --legacy-train "$D1/legacy_train_full"
   --ultra-train "$D1/ultra_train_full"
   --legacy-val "$D1/legacy_val13"
   --lpips-weights "$LPIPS" --path-root .
   --dtype bfloat16 --batch-size 1 --gradient-accumulation-steps 8
-  --num-workers 2 --learning-rate 1e-5 --warmup-steps 50
-  --schedule-steps 2000 --save-every 125 --validate-every 125
+  --num-workers 2 --learning-rate 1e-5 --warmup-steps 200
+  --schedule-steps 6000 --max-steps 6000
+  --save-every 1000 --validate-every 1000 --log-every 20
 )
 
-python tools/train_m12_slim_temporal.py "${COMMON[@]}" \
-  --output-dir outputs/m11b/M12-S2-SlimTemporal/smoke2_v1 \
+# Fresh 4-GPU DDP smoke; results in a NEW directory.
+torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+  tools/train_m12_slim_temporal.py "${COMMON[@]}" \
+  --output-dir outputs/m11b/M12-S2-SlimTemporal/ddp4_smoke2_v1 \
   --smoke-steps 2
-# ONLY after the smoke's summary.json reports status=smoke_pass:
-python tools/train_m12_slim_temporal.py "${COMMON[@]}" \
-  --output-dir outputs/m11b/M12-S2-SlimTemporal/pilot500_v1 \
-  --max-steps 500
 ```
 
-For an interrupted pilot, resume **only** from its own step checkpoint with **identical original arguments** plus `--resume`. Changing learning rate schedule, loss weights or source files invalidates resume; `max_steps`, `resume`, and `smoke_steps` are the only intentionally excluded lineage fields. Never force-bypass provenance.
-
-GPU acceptance: smoke must yield finite/nonzero Slim100 gradients and `m11b_updated=false`. Inspect `validation/step_00000000.json`, `step_00000125.json`, `step_00000250.json`, `step_00000375.json`, `step_00000500.json`. Val13 does NOT authorize a quality pass. The new checkpoint at `pilot500_v1/checkpoints/step_00000500/tiny_decoder` follows standard `SlimReAEDecoder.save_pretrained` config + weights and can be passed to `scripts/inference_custom_components.py --decoder-type slim` without modifying inference code.
-
-Then use **existing M12-1 four-way utility**, pointing at a fresh result directory and the new trained decoder checkpoint:
+Only after smoke outputs `status=smoke_pass`, `world_size=4`, `global_batch=32`, finite/nonzero gradients, and no DDP collective stalls:
 
 ```bash
-RUN=outputs/m11b/M12-S2-SlimTemporal/pilot500_v1
-OUT=outputs/m11b/M12_Slim100_Temporal500_C24
+torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+  tools/train_m12_slim_temporal.py "${COMMON[@]}" \
+  --output-dir outputs/m11b/M12-S2-SlimTemporal/ddp4_6k_v1
+```
+
+The script saves val13/checkpoints at **step0,1000,2000,3000,4000,5000,6000**. Treat step2k and step4k as **learning-trajectory observations**, not a hard stop just because quality is not yet final. End-of-run checkpoint: `outputs/m11b/M12-S2-SlimTemporal/ddp4_6k_v1/checkpoints/step_00006000/tiny_decoder`. Intermediate model selection must use paired-GT metric trends and actual temporal playback, not validation loss alone.
+
+To resume an **interrupted 4-GPU** long run from its own last saved checkpoint, use the same `COMMON` array / 4 GPUs / source files / world / optimizer schedule, plus:
+
+```bash
+RUN=outputs/m11b/M12-S2-SlimTemporal/ddp4_6k_v1
+RESUME="$RUN/checkpoints/step_00004000"  # example: ONLY if this path exists
+torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+  tools/train_m12_slim_temporal.py "${COMMON[@]}" \
+  --output-dir "$RUN" --resume "$RESUME"
+```
+
+Never use single-GPU checkpoint with multi-GPU optimizer state. Never override source-hash or world-size checks. Any change of loss weights or LR schedule starts a new run.
+
+**Final native-video quality gate** (only new trained decoder is inferred; baseline Original SwiftVR/AISR/M11-B+Original images reused unchanged):
+
+```bash
+RUN=outputs/m11b/M12-S2-SlimTemporal/ddp4_6k_v1
+OUT=outputs/m11b/M12_Slim100_Temporal6k_C24
 python tools/m12_slim100_fourway.py \
   --reference-bank outputs/custom/p1_reference_v1 \
   --m11b-original-root outputs/m11b/M11B30K_OriginalDecoder_Comparison \
   --slim-root "$OUT" --output-root "$OUT/fourway" \
-  --slim-checkpoint "$RUN/checkpoints/step_00000500/tiny_decoder" \
+  --slim-checkpoint "$RUN/checkpoints/step_00006000/tiny_decoder" \
   --transformer-checkpoint "$M11B" --base-checkpoint "$BASE"
 ```
 
-The fourth panel represents **fine-tuned Slim100**, not the original Slim100 initial checkpoint. Compare its `native_fourway.mkv` with previously rendered pretraining M12-1 video, **especially Wetland1 frame173–248 high motion**, stable pre-cut and Mangrove1. Do NOT measure a flicker penalty across the real Wetland1 frame162→163 scene cut. If no tangible visual improvement, stop this loss rather than automatically extending to 500k.
+Compare M12-1 **pretraining Slim100** vs M12-2 at native Wetland1 frame173–248 (high motion), frame0–160 (non-regression), and full Mangrove1 playback. Do not evaluate temporal derivative across real scene cut 162→163. Accept only if visible brightness/detail jitter decreases without extra texture flattening; keep the original 500–600G **compute** goal separate from elapsed training time or inference latency.
 
 ### Stop criteria and downstream decisions
 
