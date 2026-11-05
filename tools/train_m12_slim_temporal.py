@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M12-2 single-GPU Slim100 temporal/detail adaptation on immutable M11-B D1 pairs.
+"""M12-2 single-node DDP Slim100 temporal/detail adaptation on immutable M11-B D1 pairs.
 
 Frozen M11-B 30k is NOT instantiated: only its verified cached restored latents
 are used. Frozen Original ReAE is a detail reference; paired HR GT provides
@@ -8,6 +8,8 @@ the reference for temporal luminance. All prior T1/T1B trainers are untouched.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from datetime import timedelta
 import json
 import math
 import os
@@ -22,6 +24,8 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from safetensors.torch import load_file
 from torch.utils.data import ConcatDataset, DataLoader
 
@@ -115,7 +119,7 @@ def validate_args(a):
         raise ValueError("Resume must use an own-run checkpoint")
 
 
-def identity_config(a):
+def identity_config(a, world=1):
     paths = [
         a.base_checkpoint / "reae.safetensors",
         a.slim_init / "model.safetensors",
@@ -145,8 +149,8 @@ def identity_config(a):
     }
     payload.update({
         "kind": "M12-Slim100-temporal-GT-v1",
-        "world_size": 1,
-        "global_batch": a.batch_size * a.gradient_accumulation_steps,
+        "world_size": world,
+        "global_batch": world * a.batch_size * a.gradient_accumulation_steps,
         "source_sha256": {str(p): sha256(p) for p in paths},
         "transformer_trainable": False,
         "encoder_trainable": False,
@@ -209,16 +213,37 @@ def evaluate(student, reae, val, lpips, *, device, dtype, a, step):
 def main():
     a = parser().parse_args()
     validate_args(a)
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise RuntimeError("M12-2 pilot is single GPU; do not launch via torchrun")
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError("Invalid distributed rank/world")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
+    if not 0 <= local_rank < torch.cuda.device_count():
+        raise RuntimeError("LOCAL_RANK must select an available CUDA device")
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     dtype = torch.bfloat16 if a.dtype == "bfloat16" else torch.float32
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("GPU does not support BF16")
-    random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
+    if world > 1:
+        dist.init_process_group("nccl", timeout=timedelta(hours=4))
+    try:
+        run(a, rank=rank, local_rank=local_rank, world=world, device=device, dtype=dtype)
+    finally:
+        if world > 1 and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def run(a, *, rank, local_rank, world, device, dtype):
+    def barrier():
+        if world > 1:
+            dist.barrier()
+
+    random.seed(a.seed + rank)
+    np.random.seed(a.seed + rank)
+    torch.manual_seed(a.seed + rank)
     legacy = M11BPairedLatentDataset(a.legacy_train, model_root=a.m11b_checkpoint,
                                     reae_root=a.base_checkpoint, path_root=a.path_root)
     ultra = M11BPairedLatentDataset(a.ultra_train, model_root=a.m11b_checkpoint,
@@ -227,14 +252,15 @@ def main():
                                  reae_root=a.base_checkpoint, path_root=a.path_root)
     if len(val) != 13 or (legacy.meta["domain"], ultra.meta["domain"], val.meta["split"]) != ("legacy", "ultra", "val"):
         raise ValueError("Expected complete Legacy/Ultra and val13 D1 caches")
-    lineage = identity_config(a)
+    lineage = identity_config(a, world)
     a.output_dir.mkdir(parents=True, exist_ok=True)
     config_file = a.output_dir / "run_config.json"
     if a.resume:
         if json.loads(config_file.read_text()) != lineage:
             raise ValueError("Resume code/data/objective/schedule fingerprint mismatch")
-    else:
+    elif rank == 0:
         atomic_json(config_file, lineage)
+    barrier()
 
     student = SlimReAEDecoder.from_pretrained(a.slim_init, device="cpu", dtype=torch.float32)
     if tuple(student.channels) != SLIM100_CHANNELS:
@@ -263,8 +289,10 @@ def main():
         step, micro = int(state["step"]), int(state["micro_cursor"])
         if micro != step * a.gradient_accumulation_steps:
             raise ValueError("Inconsistent resume microstep cursor")
-        restore_rng(state["rng"], device)
+        restore_rng(state["rng_states"][rank], device)
 
+    ddp = (DDP(student, device_ids=[local_rank], broadcast_buffers=False,
+               find_unused_parameters=False) if world > 1 else student)
     stop = step + a.smoke_steps if a.smoke_steps else a.max_steps
     if stop <= step or stop > a.schedule_steps:
         raise ValueError("Stop outside existing schedule")
@@ -272,7 +300,7 @@ def main():
     sampler = BalancedBatchSampler(
         len(legacy), len(ultra), start=micro,
         stop=stop * a.gradient_accumulation_steps, batch_size=a.batch_size,
-        rank=0, world=1, seed=a.seed,
+        rank=rank, world=world, seed=a.seed,
     )
     worker_args = {"num_workers": a.num_workers}
     if a.num_workers:
@@ -282,31 +310,42 @@ def main():
     started = time.monotonic()
 
     def checkpoint():
-        folder = a.output_dir / "checkpoints" / f"step_{step:08d}"
-        if folder.exists():
-            raise FileExistsError(f"Refuse checkpoint overwrite: {folder}")
-        folder.mkdir(parents=True)
-        if any(t.is_floating_point() and t.dtype != torch.float32
-               for t in student.state_dict().values()):
-            raise RuntimeError("Trainable Slim100 master weights must remain FP32")
-        student.save_pretrained(folder / "tiny_decoder")
-        state = {
-            "step": step, "micro_cursor": micro, "optimizer": optimizer.state_dict(),
-            "rng": rng_state(device), "lineage": lineage,
-        }
-        tmp = folder / "training_state.tmp"
-        torch.save(state, tmp)
-        os.replace(tmp, folder / "training_state.pt")
-        atomic_json(folder / "metadata.json", {
-            "step": step, "phase": "M12-2", "decoder": "Slim100",
-            "m11b_checkpoint": str(a.m11b_checkpoint),
-            "teacher": str(a.base_checkpoint / "reae.safetensors"),
-            "quality_pass": False,
-        })
-        atomic_json(a.output_dir / "latest.json", {"step": step, "path": str(folder)})
+        states = [None] * world
+        if world > 1:
+            dist.all_gather_object(states, rng_state(device))
+        else:
+            states[0] = rng_state(device)
+        if rank == 0:
+            folder = a.output_dir / "checkpoints" / f"step_{step:08d}"
+            if folder.exists():
+                raise FileExistsError(f"Refuse checkpoint overwrite: {folder}")
+            folder.mkdir(parents=True)
+            if any(t.is_floating_point() and t.dtype != torch.float32
+                   for t in student.state_dict().values()):
+                raise RuntimeError("Trainable Slim100 master weights must remain FP32")
+            student.save_pretrained(folder / "tiny_decoder")
+            state = {
+                "step": step, "micro_cursor": micro, "optimizer": optimizer.state_dict(),
+                "rng_states": states, "lineage": lineage,
+            }
+            tmp = folder / "training_state.tmp"
+            torch.save(state, tmp)
+            os.replace(tmp, folder / "training_state.pt")
+            atomic_json(folder / "metadata.json", {
+                "step": step, "phase": "M12-2", "decoder": "Slim100",
+                "m11b_checkpoint": str(a.m11b_checkpoint),
+                "teacher": str(a.base_checkpoint / "reae.safetensors"),
+                "quality_pass": False,
+                "world_size": world,
+                "global_batch": lineage["global_batch"],
+            })
+            atomic_json(a.output_dir / "latest.json", {"step": step, "path": str(folder)})
+        barrier()
 
     if not a.resume and not a.smoke_steps:
-        evaluate(student, teacher, val, lpips, device=device, dtype=dtype, a=a, step=0)
+        if rank == 0:
+            evaluate(student, teacher, val, lpips, device=device, dtype=dtype, a=a, step=0)
+        barrier()
         checkpoint()
 
     optimizer.zero_grad(set_to_none=True)
@@ -315,16 +354,21 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = lr
         values = {}
-        for _ in range(a.gradient_accumulation_steps):
+        for micro_index in range(a.gradient_accumulation_steps):
             batch = next(loader)
             z = batch["z_sr"].to(device=device, dtype=dtype, non_blocking=True)
             gt = batch["hr"].to(device=device, dtype=torch.float32, non_blocking=True)
             if z.shape[1:] != (4, 48, 24, 24) or gt.shape[1:] != (13, 3, 384, 384):
                 raise ValueError("M12 requires canonical D1 T13 384x384 paired view")
-            terms, _, _ = paired_loss(student, teacher, z, gt, lpips, a)
-            (terms["loss"] / a.gradient_accumulation_steps).backward()
+            sync = (nullcontext() if world == 1 or
+                    micro_index == a.gradient_accumulation_steps - 1
+                    else ddp.no_sync())
+            with sync:
+                terms, _, _ = paired_loss(ddp, teacher, z, gt, lpips, a)
+                (terms["loss"] / a.gradient_accumulation_steps).backward()
             for name, value in terms.items():
-                values[name] = values.get(name, 0.0) + float(value.detach()) / a.gradient_accumulation_steps
+                values[name] = values.get(name, torch.zeros((), device=device)) + (
+                    value.detach() / a.gradient_accumulation_steps)
             micro += 1
         if any(p.grad is not None for p in teacher.parameters()):
             raise RuntimeError("Original ReAE unexpectedly received gradients")
@@ -336,25 +380,39 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         step += 1
         if step % a.log_every == 0 or step == stop:
-            record = {
-                "step": step, "lr": lr, "elapsed_s": time.monotonic() - started,
-                "grad_norm": float(grad_norm.detach()), **values,
-            }
-            append_jsonl(a.output_dir / "train_log.jsonl", record)
-            print("[M12-Slim train] " + json.dumps(record, sort_keys=True), flush=True)
+            names = list(values)
+            reduced = torch.stack([values[name] for name in names])
+            if world > 1:
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+                reduced /= world
+            if rank == 0:
+                record = {
+                    "step": step, "lr": lr, "elapsed_s": time.monotonic() - started,
+                    "grad_norm_rank0": float(grad_norm.detach()),
+                    "global_batch": lineage["global_batch"],
+                    **dict(zip(names, [float(v) for v in reduced.cpu()])),
+                }
+                append_jsonl(a.output_dir / "train_log.jsonl", record)
+                print("[M12-Slim train] " + json.dumps(record, sort_keys=True), flush=True)
         val_due = not a.smoke_steps and (step % a.validate_every == 0 or step == stop)
         if val_due:
-            evaluate(student, teacher, val, lpips, device=device, dtype=dtype, a=a, step=step)
+            barrier()
+            if rank == 0:
+                evaluate(student, teacher, val, lpips, device=device, dtype=dtype, a=a, step=step)
+            barrier()
         if step % a.save_every == 0 or step == stop or val_due:
             checkpoint()
 
-    atomic_json(a.output_dir / "summary.json", {
-        "status": "smoke_pass" if a.smoke_steps else "budget_completed",
-        "step": step, "legacy_samples": len(legacy), "ultra_samples": len(ultra),
-        "val_samples": len(val), "m11b_updated": False,
-        "encoder_updated": False, "decoder_updated": True,
-        "full_origin_custom_video_pass": False,
-    })
+    if rank == 0:
+        atomic_json(a.output_dir / "summary.json", {
+            "status": "smoke_pass" if a.smoke_steps else "budget_completed",
+            "step": step, "legacy_samples": len(legacy), "ultra_samples": len(ultra),
+            "val_samples": len(val), "world_size": world,
+            "global_batch": lineage["global_batch"],
+            "m11b_updated": False, "encoder_updated": False,
+            "decoder_updated": True, "full_origin_custom_video_pass": False,
+        })
+    barrier()
 
 
 if __name__ == "__main__":
