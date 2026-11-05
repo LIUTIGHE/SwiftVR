@@ -11,6 +11,7 @@ import torch
 
 from swiftvr.training.m12_slim_objective import m12_slim_objective, scene_pair_valid
 from tools import train_m12_slim_temporal as trainer
+from tools.train_m11b_s1_t1b_decoder import BalancedBatchSampler
 
 
 class M12ObjectiveTests(unittest.TestCase):
@@ -81,7 +82,7 @@ class M12ObjectiveTests(unittest.TestCase):
 
 
 class M12TrainerContractTests(unittest.TestCase):
-    def test_single_gpu_and_fixed_cache_defaults(self):
+    def test_compatible_one_gpu_default_parser_and_training_contract(self):
         args = trainer.parser().parse_args([
             "--m11b-checkpoint", "m11b",
             "--slim-init", "slim100",
@@ -96,6 +97,39 @@ class M12TrainerContractTests(unittest.TestCase):
         self.assertEqual(args.teacher_lpips_weight, 0.1)
         self.assertEqual(args.cut_hist_threshold, 0.65)
         self.assertEqual(args.save_every, 125)
+
+    def test_ddp_sampler_four_ranks_even_domains_and_unique_views(self):
+        sampler_args = dict(legacy=15896, ultra=20088, batch_size=1,
+                            start=0, stop=16, world=4, seed=20261103)
+        batches = [
+            [row[0] for row in BalancedBatchSampler(rank=rank, **sampler_args)]
+            for rank in range(4)
+        ]
+        # Every micro-step uses two Legacy and two Ultra samples, so a
+        # 4-GPU update with gradient accumulation 8 contains 16+16 views.
+        for microstep in range(16):
+            self.assertEqual(sum(batches[rank][microstep] < 15896 for rank in range(4)), 2)
+        for rank in range(4):
+            restored = [
+                row[0] for row in BalancedBatchSampler(
+                    rank=rank, **{**sampler_args, "start": 8}
+                )
+            ]
+            self.assertEqual(batches[rank][8:], restored)
+        self.assertEqual(4 * 1 * 8, 32)
+
+    def test_ddp_validation_checkpoint_and_world_fingerprint(self):
+        src = inspect.getsource(trainer)
+        self.assertIn('dist.init_process_group("nccl"', src)
+        self.assertIn("dist.all_gather_object(states, rng_state(device))", src)
+        self.assertIn("dist.all_reduce(reduced", src)
+        self.assertIn("ddp.no_sync()", src)
+        self.assertIn('"rng_states": states', src)
+        self.assertIn('restore_rng(state["rng_states"][rank], device)', src)
+        self.assertIn('if rank == 0:', src)
+        cfg = inspect.getsource(trainer.identity_config)
+        self.assertIn('"world_size": world', cfg)
+        self.assertIn('world * a.batch_size * a.gradient_accumulation_steps', cfg)
 
     def test_output_tree_guard(self):
         args = trainer.parser().parse_args([
